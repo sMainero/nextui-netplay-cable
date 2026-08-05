@@ -164,6 +164,28 @@ Unbinding the shortcuts via config is not a fix: `Config_readControls` reads
 sandbox via `DEVICE` or a different reported core name would relocate
 `states_dir` — same save-state loss as above.
 
+## Building
+
+The shim needs no NextUI checkout - only a cross-compiler and the vendored
+`libretro.h`. Mount the **pak root**, not `shim/`, because the makefile writes up
+to `../bin/`. `-u` keeps the container from leaving root-owned artifacts in the
+worktree:
+
+```sh
+cd Netplay.pak
+docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/w -w /w/shim \
+	ghcr.io/loveretro/tg5040-toolchain:latest make PLATFORM=tg5040
+docker run --rm -u "$(id -u):$(id -g)" -v "$PWD":/w -w /w/shim \
+	ghcr.io/loveretro/tg5050-toolchain:latest make PLATFORM=tg5050
+```
+
+`make native` builds for the host instead, which is all the test suites need.
+
+The result is about 20 KB per platform, linked against nothing but `libdl` and
+`libc`, exporting the 25 standard libretro entry points. For comparison, the
+binary-patching approach shipped a 705 KB `minarch.elf`, a 3.1 MB gambatte and a
+917 KB gpsp *per NextUI build*, in both patched and original copies.
+
 ## Layout
 
 ```
