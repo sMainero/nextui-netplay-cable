@@ -9,7 +9,9 @@
 
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "libretro.h"
 
@@ -42,9 +44,13 @@ static int16_t fe_input_state(unsigned p, unsigned d, unsigned i, unsigned id) {
 
 int main(int argc, char** argv) {
 	if (argc < 2) {
-		printf("usage: %s <shim.so>\n", argv[0]);
+		printf("usage: %s <shim.so> [frames] [ms_per_frame]\n", argv[0]);
 		return 2;
 	}
+	// Link tests need the loop to run long enough for a peer to connect and
+	// packets to cross; the passthrough test just wants a single frame.
+	int frames = (argc > 2) ? atoi(argv[2]) : 1;
+	int frame_ms = (argc > 3) ? atoi(argv[3]) : 0;
 
 	void* handle = dlopen(argv[1], RTLD_LAZY);
 	CHECK(handle != NULL, "dlopen(%s): %s", argv[1], dlerror());
@@ -122,7 +128,11 @@ int main(int argc, char** argv) {
 	      "av_info geometry not forwarded (got %ux%u)", av.geometry.base_width, av.geometry.base_height);
 	CHECK(av.timing.sample_rate == 44100.0, "av_info sample_rate not forwarded");
 
-	run();
+	for (int i = 0; i < frames; i++) {
+		run();
+		fflush(stdout);
+		if (frame_ms) usleep(frame_ms * 1000);
+	}
 
 	size_t sz = serialize_size();
 	CHECK(sz == 16, "serialize_size not forwarded (got %zu)", sz);

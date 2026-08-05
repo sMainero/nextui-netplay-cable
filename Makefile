@@ -23,6 +23,7 @@ shim:
 
 test:
 	@./shim/test/run.sh
+	@./shim/test/link.sh
 	@./launcher/test.sh
 
 ###########################################################
@@ -48,6 +49,7 @@ dist: $(addprefix check-shim-,$(PLATFORMS))
 	@cp launcher/minarch.elf launcher/launch-stub.sh \
 	    launcher/install-stubs.sh launcher/wrap-pak.sh \
 	    "$(STAGE)/$(PAK)/launcher/"
+	@cp launcher/session.conf.example "$(STAGE)/$(PAK)/"
 	@for p in $(PLATFORMS); do \
 		mkdir -p "$(STAGE)/$(PAK)/bin/$$p"; \
 		cp bin/$$p/netplay_shim.so "$(STAGE)/$(PAK)/bin/$$p/"; \

@@ -26,6 +26,7 @@ cd "$DIR" || exit 1
 export SDCARD_PATH PLATFORM SYSTEM_PATH
 
 FORCE="$DIR/state/force-shim"
+SESSION="$DIR/state/session"
 LOG="$LOGS_PATH/netplay.txt"
 
 mkdir -p "$DIR/state" "$LOGS_PATH"
@@ -34,9 +35,9 @@ mkdir -p "$DIR/state" "$LOGS_PATH"
 	echo "=== netplay shim test build - $(date 2>/dev/null) ==="
 	echo "platform=$PLATFORM system=$SYSTEM_PATH"
 
-	if [ -f "$FORCE" ]; then
+	if [ -f "$FORCE" ] || [ -f "$SESSION" ]; then
 		echo "--- disarming"
-		rm -f "$FORCE"
+		rm -f "$FORCE" "$SESSION"
 		./launcher/install-stubs.sh uninstall
 		# Staged per-core copies of the shim, recreated on demand at launch.
 		rm -rf "$DIR/cores"
@@ -45,13 +46,35 @@ mkdir -p "$DIR/state" "$LOGS_PATH"
 	else
 		echo "--- arming"
 		./launcher/install-stubs.sh install
-		: > "$FORCE"
+
+		# session.conf is user-supplied: drop one in the pak dir to test link
+		# play, leave it out to test passthrough. There is no UI yet, so this
+		# is how a session gets described.
+		if [ -f "$DIR/session.conf" ]; then
+			cp "$DIR/session.conf" "$SESSION"
+			echo
+			echo "link session:"
+			sed 's/^/    /' "$SESSION"
+		else
+			: > "$FORCE"
+			echo
+			echo "no session.conf - arming passthrough only"
+		fi
+
 		echo
 		./launcher/install-stubs.sh status
 		echo
-		echo "armed. Launch a supported game; it should play exactly as before."
-		echo "Check its own log for a line reading:"
-		echo "    [netplay-shim] wrapping <core> (session=none)"
+
+		if [ -f "$SESSION" ]; then
+			echo "armed for link. Start the same game on both devices."
+			echo "Expect in the game's own log:"
+			echo "    [netlink] connected as <role> (client_id N)"
+			echo "    [netplay-shim] netpacket session started"
+		else
+			echo "armed. Launch a supported game; it should play exactly as before."
+			echo "Expect in the game's own log:"
+			echo "    [netplay-shim] wrapping <core> (session=none)"
+		fi
 		echo "Relaunch this pak to disarm."
 	fi
 

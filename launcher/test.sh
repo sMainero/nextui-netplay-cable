@@ -28,7 +28,7 @@ chmod 755 "$NP/launcher"/*
 # A stand-in minarch that just reports the arguments and env it was handed.
 cat > "$SYSTEM_PATH/bin/minarch.elf" <<'EOF'
 #!/bin/sh
-echo "minarch core=$1 rom=$2 real=$NETPLAY_REAL_CORE"
+echo "minarch core=$1 rom=$2 real=$NETPLAY_REAL_CORE session=$NETPLAY_SESSION"
 EOF
 chmod 755 "$SYSTEM_PATH/bin/minarch.elf"
 
@@ -73,13 +73,13 @@ grep -q "skip FBN (fbneo)" "$ROOT/install.log" && ok "EXTRAS pak reported as unc
 echo
 echo "== launch with no session (must be byte-identical to stock)"
 OUT=$("$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
-check "routes to real core" "$OUT" "minarch core=$SYSTEM_PATH/cores/gpsp_libretro.so rom=/roms/game.gba real="
+check "routes to real core" "$OUT" "minarch core=$SYSTEM_PATH/cores/gpsp_libretro.so rom=/roms/game.gba real= session="
 
 echo
 echo "== launch with a session armed"
 OUT=$(NETPLAY_SESSION=/tmp/session "$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
 check "routes through shim" "$OUT" \
-	"minarch core=$NP/cores/gpsp_libretro.so rom=/roms/game.gba real=$SYSTEM_PATH/cores/gpsp_libretro.so"
+	"minarch core=$NP/cores/gpsp_libretro.so rom=/roms/game.gba real=$SYSTEM_PATH/cores/gpsp_libretro.so session=/tmp/session"
 [ -f "$NP/cores/gpsp_libretro.so" ] && ok "shim staged under the real core's filename" \
 	|| bad "shim not staged as gpsp_libretro.so"
 
@@ -93,7 +93,7 @@ echo
 echo "== missing shim falls back to stock"
 mv "$NP/bin/$PLATFORM/netplay_shim.so" "$NP/bin/$PLATFORM/hidden.so"
 OUT=$(NETPLAY_SESSION=/tmp/session "$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1 | tail -n 1)
-check "falls back" "$OUT" "minarch core=$SYSTEM_PATH/cores/gpsp_libretro.so rom=/roms/game.gba real="
+check "falls back" "$OUT" "minarch core=$SYSTEM_PATH/cores/gpsp_libretro.so rom=/roms/game.gba real= session=/tmp/session"
 mv "$NP/bin/$PLATFORM/hidden.so" "$NP/bin/$PLATFORM/netplay_shim.so"
 
 echo
@@ -106,7 +106,18 @@ echo "$OUT" | grep -q "core=$NP/cores/gpsp_libretro.so" \
 	&& ok "force file routes through shim" || bad "force file ignored: $OUT"
 rm -f "$NP/state/force-shim"
 OUT=$("$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
-check "clearing it restores stock" "$OUT" "minarch core=$SYSTEM_PATH/cores/gpsp_libretro.so rom=/roms/game.gba real="
+check "clearing it restores stock" "$OUT" "minarch core=$SYSTEM_PATH/cores/gpsp_libretro.so rom=/roms/game.gba real= session="
+
+echo
+echo "== session file is discovered without an env var"
+mkdir -p "$NP/state"
+printf 'role=host\nport=55437\n' > "$NP/state/session"
+OUT=$("$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
+echo "$OUT" | grep -q "core=$NP/cores/gpsp_libretro.so" \
+	&& ok "session file routes through shim" || bad "session file ignored: $OUT"
+echo "$OUT" | grep -q "session=$NP/state/session" \
+	&& ok "NETPLAY_SESSION exported to minarch" || bad "session not exported: $OUT"
+rm -f "$NP/state/session"
 
 echo
 echo "== uninstall"

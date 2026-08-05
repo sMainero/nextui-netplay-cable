@@ -29,9 +29,14 @@
 #include <string.h>
 
 #include "libretro.h"
+#include "netlink.h"
 
 #define SHIM_ENV_REAL_CORE "NETPLAY_REAL_CORE"
 #define SHIM_ENV_SESSION   "NETPLAY_SESSION"
+
+/* Bound on packets handed to the core per frame. Without a cap, a peer that
+ * has raced ahead can starve the frame. */
+#define MAX_PACKETS_PER_FRAME 64
 
 //////////////////////////////////////////////////////////////////////////////
 // logging - minarch redirects the emulator's stderr to $LOGS_PATH/<TAG>.txt
@@ -97,6 +102,13 @@ static int shim_owns_unserialize = 0;
 // No session file -> pure passthrough. Read once at load; the launcher decides
 // whether a session is armed before minarch ever starts.
 static int session_active = 0;
+
+// The core's netpacket interface, if it registered one. This is the whole point
+// of the shim for link play: the frontend never sees the request, so GB/GBA
+// link works on a completely stock minarch.
+static struct retro_netpacket_callback core_netpacket;
+static int  have_netpacket = 0;   // core registered an interface
+static int  netpacket_started = 0; // we have called its start()
 
 //////////////////////////////////////////////////////////////////////////////
 // loading
@@ -168,9 +180,17 @@ static void ensure_loaded(void) {
 	}
 
 	const char* session = getenv(SHIM_ENV_SESSION);
-	session_active = (session && session[0]);
+	session_active = (session && session[0] && NetLink_configure(session));
 
 	shim_log("wrapping %s (session=%s)\n", path, session_active ? "armed" : "none");
+
+	// Bring the link up now rather than at load_game: the host has to be
+	// listening before the client tries to connect, and connecting happens on
+	// the netlink thread, so nothing blocks here.
+	if (session_active && !NetLink_start()) {
+		shim_log("link failed to start - continuing without netplay\n");
+		session_active = 0;
+	}
 }
 
 #undef RESOLVE
@@ -183,10 +203,94 @@ static void ensure_loaded(void) {
 // are sound and netplay logic can be added behind them.
 //////////////////////////////////////////////////////////////////////////////
 
+// Bridges the core's send to the wire. Handed to the core in start().
+static void shim_netpacket_send(int flags, const void* buf, size_t len, uint16_t client_id) {
+	NetLink_send(flags, buf, len, client_id);
+}
+
+// The core may call this to read mid-frame rather than waiting for the next
+// poll. Receiving happens on the netlink thread, so there is nothing to pump
+// here - packets are already queued and will be delivered by deliver_packets().
+static void shim_netpacket_poll_receive(void) {
+}
+
 static bool shim_environment(unsigned cmd, void* data) {
-	// TODO(netplay): answer RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE here
-	// rather than forwarding it, so GB/GBA link works on a stock frontend.
+	if (cmd == RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE) {
+		// Only claim to support this when we can actually back it. With no
+		// session armed we forward to the frontend, which says no - so a
+		// disarmed launch leaves the core in exactly the state it would be in
+		// without the shim, rather than waiting on a session that never starts.
+		if (!session_active) {
+			return fe_environment ? fe_environment(cmd, data) : false;
+		}
+
+		// Answer this ourselves instead of forwarding. A stock minarch returns
+		// false here, which makes the core disable link support entirely.
+		if (!data) {
+			memset(&core_netpacket, 0, sizeof(core_netpacket));
+			have_netpacket = 0;
+			shim_log("core withdrew its netpacket interface\n");
+			return true;
+		}
+
+		const struct retro_netpacket_callback* cb = data;
+		if (!cb->start || !cb->receive) {
+			shim_log("core offered an unusable netpacket interface\n");
+			return false;
+		}
+
+		core_netpacket = *cb;
+		have_netpacket = 1;
+		shim_log("core registered netpacket interface (protocol=%s)\n",
+		         cb->protocol_version ? cb->protocol_version : "core version");
+		return true;
+	}
+
 	return fe_environment ? fe_environment(cmd, data) : false;
+}
+
+// Drive the core's netpacket callbacks to match the link state. Called once per
+// frame from retro_run, before the core runs.
+static void pump_netpacket(void) {
+	if (!have_netpacket || !session_active) return;
+
+	if (NetLink_consumeConnectEvent()) {
+		core_netpacket.start(NetLink_localClientId(),
+		                     shim_netpacket_send,
+		                     shim_netpacket_poll_receive);
+		netpacket_started = 1;
+
+		// Two players, and the peer is present the moment we are connected.
+		if (core_netpacket.connected) {
+			core_netpacket.connected(NetLink_remoteClientId());
+		}
+		shim_log("netpacket session started\n");
+	}
+
+	if (NetLink_consumeDisconnectEvent() && netpacket_started) {
+		// Order matters: the core wants to hear about the player leaving before
+		// the session ends. gpSP needs this to unstick its RFU state machine.
+		if (core_netpacket.disconnected) {
+			core_netpacket.disconnected(NetLink_remoteClientId());
+		}
+		if (core_netpacket.stop) {
+			core_netpacket.stop();
+		}
+		netpacket_started = 0;
+		shim_log("netpacket session stopped\n");
+	}
+
+	if (!netpacket_started) return;
+
+	uint8_t buf[NETLINK_MAX_PACKET];
+	size_t len;
+	int delivered = 0;
+	while (delivered < MAX_PACKETS_PER_FRAME && NetLink_popPacket(buf, sizeof(buf), &len)) {
+		core_netpacket.receive(buf, len, NetLink_remoteClientId());
+		delivered++;
+	}
+
+	if (core_netpacket.poll) core_netpacket.poll();
 }
 
 static void shim_video_refresh(const void* data, unsigned width, unsigned height, size_t pitch) {
@@ -258,6 +362,16 @@ void retro_init(void) {
 
 void retro_deinit(void) {
 	if (!core.handle) return;
+
+	// Tell the core the session is over before it tears itself down, otherwise
+	// it deinits holding a netpacket interface it thinks is still live.
+	if (netpacket_started) {
+		if (core_netpacket.disconnected) core_netpacket.disconnected(NetLink_remoteClientId());
+		if (core_netpacket.stop)         core_netpacket.stop();
+		netpacket_started = 0;
+	}
+	if (session_active) NetLink_stop();
+
 	core.deinit();
 }
 
@@ -289,9 +403,15 @@ void retro_reset(void) {
 
 void retro_run(void) {
 	if (!core.handle) return;
-	// TODO(netplay): gate frame advance on the peer while a session is running.
+
+	// Netpacket state and inbound packets are settled before the core runs, so
+	// a frame sees everything that arrived since the last one.
+	pump_netpacket();
+
+	// TODO(netplay): gate frame advance on the peer for input-lockstep netplay.
 	// Returning without running the core is a legal frame skip and keeps the
-	// frontend loop responsive; that is how a stall will be implemented.
+	// frontend loop responsive; that is how a stall will be implemented. Link
+	// play does not need it - the cores keep their own timing.
 	core.run();
 }
 

@@ -1,0 +1,10 @@
+# Copy to the pak root as session.conf, then launch the pak to arm it.
+#
+# Host device - leave peer unset:
+role=host
+port=55437
+
+# Client device - comment out the above and use these, with the host's IP:
+#role=client
+#port=55437
+#peer=192.168.1.42

@@ -20,6 +20,37 @@ static retro_input_state_t        cb_input_state;
 
 static unsigned char state_blob[16];
 
+//////////////////////////////////////////////////////////////////////////////
+// netpacket - what gpsp/gambatte use for link play
+//////////////////////////////////////////////////////////////////////////////
+
+static retro_netpacket_send_t         np_send;
+static uint16_t                       np_local_id;
+static int                            np_started;
+static unsigned                       np_seq;
+
+static void np_start(uint16_t client_id, retro_netpacket_send_t send_fn,
+                     retro_netpacket_poll_receive_t poll_fn) {
+	printf("core:np_start id=%u\n", client_id);
+	np_send = send_fn;
+	np_local_id = client_id;
+	np_started = 1;
+}
+
+static void np_receive(const void* buf, size_t len, uint16_t client_id) {
+	printf("core:np_recv from=%u len=%zu data=%.*s\n",
+	       client_id, len, (int)len, (const char*)buf);
+}
+
+static void np_stop(void) { printf("core:np_stop\n"); np_started = 0; np_send = NULL; }
+static void np_poll(void) { }
+static bool np_connected(uint16_t id)    { printf("core:np_connected id=%u\n", id); return true; }
+static void np_disconnected(uint16_t id) { printf("core:np_disconnected id=%u\n", id); }
+
+static const struct retro_netpacket_callback np_callback = {
+	np_start, np_receive, np_stop, np_poll, np_connected, np_disconnected, "faketest1"
+};
+
 void retro_set_environment(retro_environment_t cb) {
 	HIT("set_environment");
 	cb_environment = cb;
@@ -27,6 +58,13 @@ void retro_set_environment(retro_environment_t cb) {
 	// the environment path is exercised.
 	unsigned quirk = 0;
 	cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &quirk);
+
+	// Link-capable cores register here. A stock frontend returns false and the
+	// core disables link; the shim answers true instead.
+	if (cb(RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE, (void*)&np_callback))
+		printf("core:netpacket_accepted\n");
+	else
+		printf("core:netpacket_refused\n");
 }
 
 void retro_set_video_refresh(retro_video_refresh_t cb)           { HIT("set_video_refresh");      cb_video_refresh = cb; }
@@ -67,6 +105,14 @@ void retro_reset(void) { HIT("reset"); }
 
 void retro_run(void) {
 	HIT("run");
+
+	// Once linked, emit one identifiable packet per frame so the peer's log
+	// proves data crossed the wire.
+	if (np_started && np_send) {
+		char msg[32];
+		int n = snprintf(msg, sizeof(msg), "P%u-%u", np_local_id, np_seq++);
+		np_send(RETRO_NETPACKET_RELIABLE, msg, (size_t)n, RETRO_NETPACKET_BROADCAST);
+	}
 	cb_input_poll();
 	// The value the frontend returns has to survive the trip back through the
 	// shim's input_state wrapper.

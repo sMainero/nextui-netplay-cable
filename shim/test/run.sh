@@ -53,6 +53,11 @@ expect "fe:environment cmd=3"   # RETRO_ENVIRONMENT_GET_CAN_DUPE
 # The frontend's input value survived the round trip.
 expect "core:input_state=42"
 
+# With no session armed the shim must not claim netpacket support it cannot
+# back: the request forwards to the frontend, which refuses, leaving the core
+# exactly as it would be without the shim.
+expect "core:netpacket_refused"
+
 grep -q "RESULT: ok" "$OUT/trace" || { echo "  MISS assertions passed"; fail=1; }
 
 echo

@@ -28,7 +28,7 @@ seams netplay needs:
 
 | Seam | Replaces |
 |---|---|
-| `retro_set_environment` | answering `SET_NETPACKET_INTERFACE` ourselves — GB/GBA link on a stock frontend, no `ma_environment.c` patch |
+| `retro_set_environment` | answering `SET_NETPACKET_INTERFACE` ourselves — GB/GBA link on a stock frontend, no `ma_environment.c` patch (**done**) |
 | `retro_set_input_state` | `Netplay_getPlayerButtons` in `ma_input.c` |
 | `retro_run` | frame gating; returning without running the core is a legal frame skip that keeps the frontend responsive |
 | `retro_serialize` / `retro_unserialize` | rollback, plus detection of frontend-initiated loads (rewind, load state) that would silently desync |
@@ -191,8 +191,47 @@ only warnings in the log (`LEDS_applyRules called before PWR_init`) appear the
 same number of times in logs predating the shim, so they are existing NextUI
 startup noise. SRAM was written on exit.
 
-Not yet exercised on device: the tier 2 bind mount, and any netplay logic - the
-shim has so far only ever been a passthrough.
+Link play is verified host-side only: `shim/test/link.sh` runs two shim
+instances over loopback with a core that uses the netpacket interface, and
+asserts the interface is accepted, both sides start with the right client ids,
+packets cross in both directions, and teardown reaches the core.
+
+Not yet exercised on device: link play between two units, and the tier 2 bind
+mount. Input-lockstep netplay is not implemented at all.
+
+## Link play
+
+The core asks for a netpacket interface during `retro_set_environment`. A stock
+minarch returns false and the core disables link entirely; the shim answers it
+instead and provides the transport, so nothing about the frontend has to change.
+
+`netlink.c` is that transport: two players, direct TCP, host listens and client
+connects. Receiving runs on its own thread, which is what lets a link survive
+the frontend blocking on a menu, a sleep or a long save — the reason the patched
+minarch needed hooks in `Menu_loop` and the sleep path.
+
+Per frame, before the core runs, `retro_run` settles the session state and
+delivers queued packets. libretro assigns the host `client_id` 0, so with two
+players the remote is simply the other id. On teardown the core is told
+`disconnected` before `stop`, in that order, because gpSP needs the disconnect
+to unstick its RFU state machine.
+
+The shim only claims netpacket support when a session is armed. Disarmed, the
+request forwards to the frontend, which refuses — so the core ends up in exactly
+the state it would be in without the shim.
+
+A session is a file:
+
+```
+role=host|client
+port=55437
+peer=192.168.1.42    # clients only
+```
+
+`launcher/minarch.elf` finds it at `<pak>/state/session` and exports
+`NETPLAY_SESSION`. It has to discover the file rather than read an environment
+variable, because games launched from the game list are started by NextUI and
+there is no point in that path where anyone could set one.
 
 ## Building
 
