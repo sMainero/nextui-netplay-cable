@@ -15,14 +15,10 @@ TARGET  = netplay_shim.so
 INCDIR  = -Iinclude
 WARN    = -Wall -Wextra -Wno-unused-parameter
 
-###########################################################
-# host build - not installable, just proves the C is sound
-###########################################################
-
-native:
-	@mkdir -p ../bin/native
-	$(CC) shim.c -o ../bin/native/$(TARGET) \
-		-shared -fPIC $(INCDIR) $(WARN) -O2 -std=gnu99 -ldl
+# The device build is the point of this makefile; `native` is only ever asked
+# for explicitly. Without this, `make PLATFORM=tg5040` would silently build for
+# the host, because native happens to be defined first.
+.DEFAULT_GOAL := all
 
 ###########################################################
 # device build
@@ -32,7 +28,14 @@ ifeq (,$(PLATFORM))
 PLATFORM=$(UNION_PLATFORM)
 endif
 
-ifneq (,$(filter $(MAKECMDGOALS),all))
+# Validate for the device build only - `native` and `clean` need none of this.
+# MAKECMDGOALS is empty when `all` is reached as the default goal.
+DEVICE_BUILD := 1
+ifneq (,$(filter $(MAKECMDGOALS),native clean))
+DEVICE_BUILD :=
+endif
+
+ifeq (1,$(DEVICE_BUILD))
 ifeq (,$(PLATFORM))
 $(error please specify PLATFORM, eg. make PLATFORM=tg5040)
 endif
@@ -40,7 +43,7 @@ ifeq (,$(filter $(PLATFORM),$(SUPPORTED_PLATFORMS)))
 $(error invalid PLATFORM '$(PLATFORM)'. Supported: $(SUPPORTED_PLATFORMS))
 endif
 ifeq (,$(CROSS_COMPILE))
-$(error missing CROSS_COMPILE for this toolchain)
+$(error missing CROSS_COMPILE - run inside the NextUI toolchain container)
 endif
 endif
 
@@ -57,6 +60,15 @@ all:
 	@mkdir -p ../bin/$(PLATFORM)
 	$(CROSS_COMPILE)gcc shim.c -o $(PRODUCT) $(CFLAGS) $(LDFLAGS)
 	@echo "built $(PRODUCT)"
+
+###########################################################
+# host build - not installable, just proves the C is sound
+###########################################################
+
+native:
+	@mkdir -p ../bin/native
+	$(CC) shim.c -o ../bin/native/$(TARGET) \
+		-shared -fPIC $(INCDIR) $(WARN) -O2 -std=gnu99 -ldl
 
 clean:
 	rm -f ../bin/tg5040/$(TARGET) ../bin/tg5050/$(TARGET) ../bin/native/$(TARGET)
