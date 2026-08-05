@@ -37,9 +37,14 @@ if [ ! -x "$REAL_MINARCH" ] || [ -z "$CORE" ]; then
 fi
 
 # NETPLAY_SESSION is written by the pak app when a session is set up.
-# NETPLAY_FORCE_SHIM=1 routes through the shim with no session, which is how
-# passthrough gets verified on device.
-if [ -z "$NETPLAY_SESSION" ] && [ "$NETPLAY_FORCE_SHIM" != "1" ]; then
+#
+# The force flag routes through the shim with no session, which is how
+# passthrough gets verified on device. It has to be a file, not just an env var:
+# games launched from the game list are started by NextUI, so there is nowhere
+# for us to set a variable in that path.
+if [ -z "$NETPLAY_SESSION" ] &&
+   [ "$NETPLAY_FORCE_SHIM" != "1" ] &&
+   [ ! -f "$NP/state/force-shim" ]; then
 	exec "$REAL_MINARCH" "$CORE" "$@"
 fi
 

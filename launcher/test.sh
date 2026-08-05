@@ -97,6 +97,18 @@ check "falls back" "$OUT" "minarch core=$SYSTEM_PATH/cores/gpsp_libretro.so rom=
 mv "$NP/bin/$PLATFORM/hidden.so" "$NP/bin/$PLATFORM/netplay_shim.so"
 
 echo
+echo "== force-shim file routes without an env var"
+# Game-list launches are started by NextUI, so the force flag has to be a file.
+mkdir -p "$NP/state"
+: > "$NP/state/force-shim"
+OUT=$("$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
+echo "$OUT" | grep -q "core=$NP/cores/gpsp_libretro.so" \
+	&& ok "force file routes through shim" || bad "force file ignored: $OUT"
+rm -f "$NP/state/force-shim"
+OUT=$("$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
+check "clearing it restores stock" "$OUT" "minarch core=$SYSTEM_PATH/cores/gpsp_libretro.so rom=/roms/game.gba real="
+
+echo
 echo "== uninstall"
 "$NP/launcher/install-stubs.sh" uninstall > /dev/null 2>&1
 [ -e "$ROOT/Emus/$PLATFORM/GBA.pak" ] && bad "GBA stub dir left behind" || ok "GBA stub removed"

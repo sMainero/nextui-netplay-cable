@@ -8,3 +8,4 @@ bin/native/
 bin/*/netplay_shim.so
 cores/
 wrapped/
+dist/
