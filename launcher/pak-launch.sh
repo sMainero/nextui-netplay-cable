@@ -38,6 +38,8 @@ mkdir -p "$DIR/state" "$LOGS_PATH"
 		echo "--- disarming"
 		rm -f "$FORCE"
 		./launcher/install-stubs.sh uninstall
+		# Staged per-core copies of the shim, recreated on demand at launch.
+		rm -rf "$DIR/cores"
 		echo
 		echo "off. Launches are stock again."
 	else

@@ -164,6 +164,36 @@ Unbinding the shortcuts via config is not a fix: `Config_readControls` reads
 sandbox via `DEVICE` or a different reported core name would relocate
 `states_dir` — same save-state loss as above.
 
+## Status
+
+Passthrough is verified on a TrimUI Brick (tg5040), NextUI, gpSP/GBA. The stub
+installer covered the seven netplay-capable system paks (FC, GB, GBA, GBC, MD,
+PS, SFC) and removed all seven again on disarm.
+
+The load went through the shim:
+
+```
+[netplay-shim] wrapping /mnt/SDCARD/.system/tg5040/cores/gpsp_libretro.so (session=none)
+[INFO] core: gpsp version: gpSP (v1.1.0-69e86eb) tag: GBA
+       (valid_extensions: gba|bin|agb|gbz|u1 need_fullpath: 1)
+```
+
+`core: gpsp`, not `netplay_shim` — so the filename staging held and the derived
+paths were the stock ones:
+
+```
+/mnt/SDCARD/.userdata/tg5040/GBA-gpsp/minarch-brick.cfg
+/mnt/SDCARD/Saves/GBA/Advance Wars 2 - Black Hole Rising (USA).srm
+```
+
+`library_name`, `valid_extensions` and `need_fullpath` all arrived verbatim. The
+only warnings in the log (`LEDS_applyRules called before PWR_init`) appear the
+same number of times in logs predating the shim, so they are existing NextUI
+startup noise. SRAM was written on exit.
+
+Not yet exercised on device: the tier 2 bind mount, and any netplay logic - the
+shim has so far only ever been a passthrough.
+
 ## Building
 
 The shim needs no NextUI checkout - only a cross-compiler and the vendored
