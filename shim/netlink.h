@@ -59,6 +59,33 @@ bool NetLink_consumeDisconnectEvent(void);
 
 bool NetLink_send(int flags, const void* buf, size_t len, uint16_t client_id);
 
+/* Called once per frame from retro_run. When the frontend stops calling it -
+ * a menu, a sleep, a long save - we tell the peer, so it can stall its own core
+ * instead of running ahead and filling a buffer that nobody is draining.
+ *
+ * Deliberately not inferred from "no game data received": a turn-based game
+ * legitimately goes quiet while a player thinks, and pausing then would be
+ * wrong. Frontend liveness is the honest signal, and only we can observe it. */
+void NetLink_markFrame(void);
+
+/* Bracket the call into the core. Time spent inside it is not a frontend stall,
+ * however long it lasts: a link-capable core may legitimately block there
+ * waiting on its peer. Reporting that as a stall makes the peer pause, which
+ * removes the very data the blocked core is waiting for - a deadlock. */
+void NetLink_setCoreRunning(bool running);
+
+/* Why we are asking the peer to hold. Only a frontend that has stopped calling
+ * retro_run counts: a core blocked *inside* retro_run is working, not absent,
+ * and pausing its peer would starve it of what it is waiting for. */
+typedef enum {
+	NETLINK_PAUSE_FRONTEND = 0, /* menu, sleep, long save */
+} NetLinkPauseReason;
+
+/* True while the peer has told us it is stalled. The caller should skip running
+ * the core; returning from retro_run without advancing is a legal frame skip
+ * and keeps the frontend responsive. */
+bool NetLink_isPeerPaused(void);
+
 /* Copy the oldest queued packet out. False when the queue is empty. */
 bool NetLink_popPacket(void* out, size_t out_cap, size_t* out_len);
 

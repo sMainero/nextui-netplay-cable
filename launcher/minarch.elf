@@ -62,8 +62,20 @@ fi
 # core.name from basename(path) truncated at the last underscore, and core.name
 # feeds config_dir and states_dir - load it as anything else and the user's save
 # states move. Copying per core name is what keeps those paths identical.
+CORE_NAME="$(basename "$CORE")"
+
+# A pak-supplied core replaces the system one for this launch, without touching
+# anything in .system. Needed where the stock build lacks a feature: NextUI
+# builds gambatte without HAVE_NETWORK, so its Game Link support is compiled
+# out entirely and no amount of configuration will bring it back.
+REAL_CORE="$CORE"
+if [ -f "$NP/cores/override/$PLATFORM/$CORE_NAME" ]; then
+	REAL_CORE="$NP/cores/override/$PLATFORM/$CORE_NAME"
+	echo "[netplay] using pak core override for $CORE_NAME" >&2
+fi
+
 SHIM_DIR="$NP/cores"
-SHIM_AS="$SHIM_DIR/$(basename "$CORE")"
+SHIM_AS="$SHIM_DIR/$CORE_NAME"
 
 mkdir -p "$SHIM_DIR"
 if ! cp -f "$SHIM" "$SHIM_AS"; then
@@ -71,7 +83,7 @@ if ! cp -f "$SHIM" "$SHIM_AS"; then
 	exec "$REAL_MINARCH" "$CORE" "$@"
 fi
 
-NETPLAY_REAL_CORE="$CORE"
+NETPLAY_REAL_CORE="$REAL_CORE"
 export NETPLAY_REAL_CORE
 
 exec "$REAL_MINARCH" "$SHIM_AS" "$@"

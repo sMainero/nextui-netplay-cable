@@ -37,9 +37,20 @@ STAGE="$NP/wrapped"
 SD_EMUS="$SDCARD_PATH/Emus/$PLATFORM"
 MARKER="Installed by Netplay.pak"
 
-NETPLAY_CORES="fbneo fceumm snes9x mednafen_supafaust picodrive pcsx_rearmed gpsp gambatte"
+NETPLAY_CORES="fbneo fceumm snes9x snes9x2005 mednafen_supafaust picodrive pcsx_rearmed gpsp gambatte"
 
 log() { echo "[netplay-wrap] $*"; }
+
+# Report every supported core a launch.sh could select. Two shapes exist:
+# tg5040/tg5050 assign EMU_EXE at the top level, my282 selects it inside a case
+# statement over EMU_TAG, so the match cannot be anchored to line start.
+launch_cores() {
+	_found=""
+	for _e in $(sed -n 's/.*EMU_EXE=\([A-Za-z0-9_]*\).*/\1/p' "$1" | sort -u); do
+		core_is_supported "$_e" && _found="$_found $_e"
+	done
+	echo "$_found" | sed 's/^ *//'
+}
 
 core_is_supported() {
 	_exe="$1"
@@ -63,8 +74,7 @@ wrappable() {
 		grep -q "$MARKER" "$_launch" 2>/dev/null && continue
 		is_mounted "$_pak" && { echo "$_pak"; continue; }
 
-		_exe="$(sed -n 's/^EMU_EXE=\(.*\)$/\1/p' "$_launch" | head -n 1)"
-		core_is_supported "$_exe" && echo "$_pak"
+		[ -n "$(launch_cores "$_launch")" ] && echo "$_pak"
 	done
 }
 

@@ -5,6 +5,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "libretro.h"
@@ -61,7 +62,11 @@ void retro_set_environment(retro_environment_t cb) {
 
 	// Link-capable cores register here. A stock frontend returns false and the
 	// core disables link; the shim answers true instead.
-	if (cb(RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE, (void*)&np_callback))
+	// FAKE_CORE_NO_NETPACKET models gambatte, which carries its own link traffic
+	// over a socket it opens itself and never asks the frontend for netpacket.
+	if (getenv("FAKE_CORE_NO_NETPACKET"))
+		printf("core:netpacket_skipped\n");
+	else if (cb(RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE, (void*)&np_callback))
 		printf("core:netpacket_accepted\n");
 	else
 		printf("core:netpacket_refused\n");
@@ -73,7 +78,16 @@ void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { HIT("set_audi
 void retro_set_input_poll(retro_input_poll_t cb)                 { HIT("set_input_poll");         cb_input_poll = cb; }
 void retro_set_input_state(retro_input_state_t cb)               { HIT("set_input_state");        cb_input_state = cb; }
 
-void retro_init(void)   { HIT("init"); }
+void retro_init(void) {
+	HIT("init");
+	// Report what the frontend (or the shim) gives us for a core option, the way
+	// gpSP reads gpsp_serial to decide its link mode.
+	struct retro_variable var = { "gpsp_serial", NULL };
+	if (cb_environment(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+		printf("core:option gpsp_serial=%s\n", var.value);
+	else
+		printf("core:option gpsp_serial=<unset>\n");
+}
 void retro_deinit(void) { HIT("deinit"); }
 
 unsigned retro_api_version(void) { HIT("api_version"); return RETRO_API_VERSION; }
@@ -106,9 +120,32 @@ void retro_reset(void) { HIT("reset"); }
 void retro_run(void) {
 	HIT("run");
 
+	// FAKE_CORE_BLOCK_AT/_MS reproduce a link-capable core blocking inside
+	// retro_run while it waits on its peer, as gambatte's NetSerial does.
+	{
+		static int run_count = 0;
+		static int block_at = -1, block_ms = 0;
+		if (block_at == -2) { /* parsed */ }
+		else if (block_at == -1) {
+			block_at = getenv("FAKE_CORE_BLOCK_AT") ? atoi(getenv("FAKE_CORE_BLOCK_AT")) : -3;
+			block_ms = getenv("FAKE_CORE_BLOCK_MS") ? atoi(getenv("FAKE_CORE_BLOCK_MS")) : 0;
+		}
+		if (run_count++ == block_at) {
+			printf("core:block_begin\n"); fflush(stdout);
+			usleep(block_ms * 1000);
+			printf("core:block_end\n"); fflush(stdout);
+		}
+	}
+
 	// Once linked, emit one identifiable packet per frame so the peer's log
 	// proves data crossed the wire.
-	if (np_started && np_send) {
+	// FAKE_CORE_QUIET simulates a core that has registered the interface but is
+	// not transmitting - a game sitting in a menu, or waiting on the other
+	// player. The peer must keep it alive with heartbeats regardless.
+	static int quiet = -1;
+	if (quiet < 0) quiet = getenv("FAKE_CORE_QUIET") != NULL;
+
+	if (np_started && np_send && !quiet) {
 		char msg[32];
 		int n = snprintf(msg, sizeof(msg), "P%u-%u", np_local_id, np_seq++);
 		np_send(RETRO_NETPACKET_RELIABLE, msg, (size_t)n, RETRO_NETPACKET_BROADCAST);

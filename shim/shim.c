@@ -30,6 +30,7 @@
 
 #include "libretro.h"
 #include "netlink.h"
+#include "overlay.h"
 
 #define SHIM_ENV_REAL_CORE "NETPLAY_REAL_CORE"
 #define SHIM_ENV_SESSION   "NETPLAY_SESSION"
@@ -103,12 +104,79 @@ static int shim_owns_unserialize = 0;
 // whether a session is armed before minarch ever starts.
 static int session_active = 0;
 
+// Core options forced by the session, as `option.<key>=<value>` lines. gpSP's
+// link emulation is per-game (gpsp_serial: mul_poke, mul_aw1, mul_aw2, rfu) and
+// gambatte encodes a peer IP as twelve single-digit options, so the cap is not
+// merely generous - it has to hold a whole address plus mode and port.
+// does nothing on "auto" for a game it does not recognise, so a link session has
+// to be able to pin it - and both peers must agree.
+#define MAX_OPTION_OVERRIDES 24
+static struct { char key[64]; char value[64]; } option_override[MAX_OPTION_OVERRIDES];
+static int option_override_count = 0;
+static int option_update_pending = 0;
+
 // The core's netpacket interface, if it registered one. This is the whole point
 // of the shim for link play: the frontend never sees the request, so GB/GBA
 // link works on a completely stock minarch.
+// Last frame the core produced, kept so a paused session has something to show.
+// Skipping core.run() means video_refresh is never called, and minarch simply
+// re-presents whatever was on screen - a freeze indistinguishable from a crash.
+static void*    last_frame;
+static size_t   last_frame_cap;
+static unsigned last_frame_w, last_frame_h;
+static size_t   last_frame_pitch;
+static unsigned pixel_format = RETRO_PIXEL_FORMAT_RGB565;
+
+// Audio geometry, for feeding silence while paused rather than letting the
+// frontend's buffer run dry and crackle.
+static double av_fps = 60.0, av_sample_rate = 44100.0;
+
 static struct retro_netpacket_callback core_netpacket;
 static int  have_netpacket = 0;   // core registered an interface
 static int  netpacket_started = 0; // we have called its start()
+
+// The session file is read twice on purpose: netlink takes the transport keys,
+// this takes the option overrides. Keeping them separate beats threading core
+// option concerns through the network layer.
+static void load_option_overrides(const char* session_path) {
+	FILE* f = fopen(session_path, "r");
+	if (!f) return;
+
+	char line[256];
+	while (fgets(line, sizeof(line), f) && option_override_count < MAX_OPTION_OVERRIDES) {
+		char* nl = strpbrk(line, "\r\n");
+		if (nl) *nl = '\0';
+		if (strncmp(line, "option.", 7) != 0) continue;
+
+		char* eq = strchr(line, '=');
+		if (!eq) continue;
+		*eq = '\0';
+
+		const char* k = line + 7;
+		const char* v = eq + 1;
+		if (strlen(k) >= sizeof(option_override[0].key) ||
+		    strlen(v) >= sizeof(option_override[0].value)) {
+			shim_log("ignoring over-long option override '%s'\n", k);
+			continue;
+		}
+		strcpy(option_override[option_override_count].key, k);
+		strcpy(option_override[option_override_count].value, v);
+		shim_log("forcing core option %s=%s\n",
+		         option_override[option_override_count].key,
+		         option_override[option_override_count].value);
+		option_override_count++;
+	}
+	fclose(f);
+
+	if (option_override_count) option_update_pending = 1;
+}
+
+static const char* find_option_override(const char* key) {
+	for (int i = 0; i < option_override_count; i++) {
+		if (!strcmp(option_override[i].key, key)) return option_override[i].value;
+	}
+	return NULL;
+}
 
 //////////////////////////////////////////////////////////////////////////////
 // loading
@@ -181,6 +249,7 @@ static void ensure_loaded(void) {
 
 	const char* session = getenv(SHIM_ENV_SESSION);
 	session_active = (session && session[0] && NetLink_configure(session));
+	if (session_active) load_option_overrides(session);
 
 	shim_log("wrapping %s (session=%s)\n", path, session_active ? "armed" : "none");
 
@@ -246,6 +315,33 @@ static bool shim_environment(unsigned cmd, void* data) {
 		return true;
 	}
 
+	// Answer forced options ourselves. This replaces the patched minarch's
+	// minarch_setCoreOptionValue / forceCoreOptionUpdate: the core simply never
+	// sees the frontend's value for a key we are pinning.
+	// Track the format so the paused frame can be dimmed correctly.
+	if (cmd == RETRO_ENVIRONMENT_SET_PIXEL_FORMAT && data) {
+		pixel_format = *(const enum retro_pixel_format*)data;
+	}
+
+	if (cmd == RETRO_ENVIRONMENT_GET_VARIABLE && session_active && data) {
+		struct retro_variable* var = data;
+		const char* forced = var->key ? find_option_override(var->key) : NULL;
+		if (forced) {
+			var->value = forced;
+			return true;
+		}
+	}
+
+	if (cmd == RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE && session_active && data) {
+		bool fe_says = fe_environment ? fe_environment(cmd, data) : false;
+		if (option_update_pending) {
+			option_update_pending = 0;
+			*(bool*)data = true;
+			return true;
+		}
+		return fe_says;
+	}
+
 	return fe_environment ? fe_environment(cmd, data) : false;
 }
 
@@ -294,8 +390,113 @@ static void pump_netpacket(void) {
 }
 
 static void shim_video_refresh(const void* data, unsigned width, unsigned height, size_t pitch) {
-	// TODO(netplay): draw session status overlays into the frame here.
+	if (data && session_active) {
+		size_t need = pitch * height;
+		if (need > last_frame_cap) {
+			void* grown = realloc(last_frame, need);
+			if (grown) { last_frame = grown; last_frame_cap = need; }
+		}
+		if (last_frame && need <= last_frame_cap) {
+			memcpy(last_frame, data, need);
+			last_frame_w = width;
+			last_frame_h = height;
+			last_frame_pitch = pitch;
+		}
+	}
 	if (fe_video_refresh) fe_video_refresh(data, width, height, pitch);
+}
+
+// Present a dimmed copy of the last frame with a status line and a sweeping
+// bar beneath it, both anchored to the bottom so they never cover the action.
+static void present_paused_frame(unsigned frame_counter) {
+	if (!fe_video_refresh || !last_frame || !last_frame_w) return;
+
+	static void*  scratch;
+	static size_t scratch_cap;
+	size_t need = last_frame_pitch * last_frame_h;
+	if (need > scratch_cap) {
+		void* grown = realloc(scratch, need);
+		if (!grown) return;
+		scratch = grown;
+		scratch_cap = need;
+	}
+	memcpy(scratch, last_frame, need);
+
+	OVL_Target t = {
+		.pixels = scratch,
+		.width  = last_frame_w,
+		.height = last_frame_h,
+		.pitch  = last_frame_pitch,
+		.format = (OVL_Format)pixel_format,
+	};
+	OVL_dim(&t);
+
+	static const char* MSG = "Waiting for other player (menu open)...";
+
+	int scale = (last_frame_w >= 480) ? 2 : 1;
+	// Separate margins: the bottom one is visual breathing room, the side one
+	// only decides wrapping. Keeping the sides tight lets a GBA fit the message
+	// on one line - it is 233px against a 240px screen.
+	int margin_y = 4 * scale;
+	int margin_x = 2 * scale;
+	int avail    = (int)last_frame_w - margin_x * 2;
+
+	char lines[3][OVL_MAX_LINE];
+	int  nlines = OVL_wrap(MSG, scale, avail, lines, 3);
+	if (nlines <= 0) return;
+
+	int line_h = OVL_GLYPH_H * scale;
+	int leading = 2 * scale;
+	int bar_h  = 2 * scale;
+	int gap    = 3 * scale;
+
+	int block_h = nlines * line_h + (nlines - 1) * leading + gap + bar_h;
+	int top     = (int)last_frame_h - margin_y - block_h;
+	if (top < 0) top = 0;
+
+	// Centre on ink, not advance width, so a line ending in '.' is not pushed
+	// left by the blank columns a period reserves.
+	int widest = 0, widest_x = 0;
+	for (int i = 0; i < nlines; i++) {
+		int bearing, ink = OVL_textInk(lines[i], scale, &bearing);
+		if (ink > widest) {
+			widest = ink;
+			widest_x = ((int)last_frame_w - ink) / 2;
+		}
+	}
+	if (widest_x < 0) widest_x = 0;
+
+	int y = top;
+	for (int i = 0; i < nlines; i++) {
+		int bearing, ink = OVL_textInk(lines[i], scale, &bearing);
+		int x = ((int)last_frame_w - ink) / 2 - bearing;
+		if (x < 0) x = 0;
+		OVL_drawText(&t, x, y, lines[i], scale);
+		y += line_h + leading;
+	}
+
+	// The sweep sits directly beneath the text and spans the same width, so the
+	// two read as one element rather than unrelated marks.
+	int track_x = widest_x;
+	int span = widest / 4 ? widest / 4 : 1;
+	int head = (int)((frame_counter * 2) % (unsigned)(widest + span));
+	int from = head > span ? head - span : 0;
+	int to   = head < widest ? head : widest;
+
+	if (to > from)
+		OVL_fillRect(&t, track_x + from, top + block_h - bar_h, to - from, bar_h);
+
+	fe_video_refresh(scratch, last_frame_w, last_frame_h, last_frame_pitch);
+}
+
+// Silence for one frame. Without it the frontend's audio buffer drains and
+// crackles, which sounds like a fault rather than a pause.
+static void present_paused_audio(void) {
+	if (!fe_audio_sample_batch || av_fps <= 0.0) return;
+	size_t frames = (size_t)(av_sample_rate / av_fps);
+	if (!frames || frames > 4096) return;
+	static int16_t silence[4096 * 2];
+	fe_audio_sample_batch(silence, frames);
 }
 
 static void shim_audio_sample(int16_t left, int16_t right) {
@@ -389,6 +590,8 @@ void retro_get_system_info(struct retro_system_info* info) {
 void retro_get_system_av_info(struct retro_system_av_info* info) {
 	ensure_loaded();
 	core.get_system_av_info(info);
+	if (info->timing.fps > 0.0)         av_fps = info->timing.fps;
+	if (info->timing.sample_rate > 0.0) av_sample_rate = info->timing.sample_rate;
 }
 
 void retro_set_controller_port_device(unsigned port, unsigned device) {
@@ -408,11 +611,35 @@ void retro_run(void) {
 	// a frame sees everything that arrived since the last one.
 	pump_netpacket();
 
+	if (session_active) {
+		NetLink_markFrame();
+
+		// Peer's frontend is blocked - a menu, a sleep. Running ahead would only
+		// fill a queue it is not draining, so skip the frame. This is a legal
+		// dupe frame; the frontend loop keeps polling input and stays responsive.
+		if (NetLink_isPeerPaused()) {
+			// Input is polled only from inside core.run(). Skip that without
+			// doing this and PAD_poll never runs, so no button - including
+			// MENU - is ever seen and the frontend is frozen, not merely
+			// paused. minarch does the same at each of its own frame skips.
+			if (fe_input_poll) fe_input_poll();
+
+			static unsigned paused_frames;
+			present_paused_frame(paused_frames++);
+			present_paused_audio();
+			return;
+		}
+	}
+
 	// TODO(netplay): gate frame advance on the peer for input-lockstep netplay.
-	// Returning without running the core is a legal frame skip and keeps the
-	// frontend loop responsive; that is how a stall will be implemented. Link
-	// play does not need it - the cores keep their own timing.
+	// Returning without running the core is a legal frame skip; link play does
+	// not need it - the cores keep their own timing.
+	//
+	// Bracketed so a core that blocks in here waiting on its peer is not
+	// mistaken for a frontend that has gone away.
+	NetLink_setCoreRunning(true);
 	core.run();
+	NetLink_setCoreRunning(false);
 }
 
 size_t retro_serialize_size(void) {

@@ -8,3 +8,20 @@ port=55437
 #role=client
 #port=55437
 #peer=192.168.1.42
+
+# --- Game Boy / GBC link (gambatte) ---------------------------------------
+# Gambatte does not use the libretro netpacket interface; it opens its own TCP
+# socket, configured purely through core options. The pak ships a gambatte built
+# with HAVE_NETWORK=1 because NextUI's has Game Link compiled out entirely.
+#
+# Host:
+#   option.gambatte_gb_link_mode=Network Server
+#   option.gambatte_gb_link_network_port=12345
+#
+# Client (IP is set as four separate octet options):
+#   option.gambatte_gb_link_mode=Network Client
+#   option.gambatte_gb_link_network_port=12345
+#   option.gambatte_gb_link_network_server_ip_1=192
+#   option.gambatte_gb_link_network_server_ip_2=168
+#   option.gambatte_gb_link_network_server_ip_3=0
+#   option.gambatte_gb_link_network_server_ip_4=180

@@ -9,10 +9,10 @@
 #   make native               host build, for smoke testing the forwarding
 ###########################################################
 
-SUPPORTED_PLATFORMS = tg5040 tg5050
+SUPPORTED_PLATFORMS = tg5040 tg5050 my282
 
 TARGET  = netplay_shim.so
-SOURCES = shim.c netlink.c
+SOURCES = shim.c netlink.c overlay.c
 INCDIR  = -Iinclude
 WARN    = -Wall -Wextra -Wno-unused-parameter
 
@@ -48,10 +48,15 @@ $(error missing CROSS_COMPILE - run inside the NextUI toolchain container)
 endif
 endif
 
-# Matches workspace/tg5040/platform/makefile.env. No -flto: the shim is a thin
-# forwarding layer and LTO buys nothing here while making symbol export
-# behaviour harder to reason about.
-CFLAGS  = -mcpu=cortex-a53 -O2 -fomit-frame-pointer -fPIC
+# Per-platform arch flags, mirroring workspace/<PLATFORM>/platform/makefile.env.
+# my282 is a 32-bit Cortex-A7, not aarch64, so this cannot be one setting.
+# No -flto anywhere: the shim is a thin forwarding layer and LTO buys nothing
+# while making symbol export behaviour harder to reason about.
+ARCH_tg5040 = -mcpu=cortex-a53
+ARCH_tg5050 = -mcpu=cortex-a53
+ARCH_my282  = -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
+
+CFLAGS  = $(ARCH_$(PLATFORM)) -O2 -fomit-frame-pointer -fPIC
 CFLAGS += $(INCDIR) $(WARN) -std=gnu99
 LDFLAGS = -shared -ldl -lpthread
 

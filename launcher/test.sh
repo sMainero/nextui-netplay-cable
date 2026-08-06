@@ -62,11 +62,30 @@ FBN_BEFORE=$(cat "$ROOT/Emus/$PLATFORM/FBN.pak/launch.sh")
 
 export CORES_PATH="$SYSTEM_PATH/cores"
 
+# my282 selects the core inside a case statement rather than assigning EMU_EXE
+# at the top level. An anchored match finds nothing there and silently installs
+# no stubs at all, so keep a pak in that shape in the fixture.
+mkdir -p "$SYSTEM_PATH/paks/Emus/GBA282.pak"
+cat > "$SYSTEM_PATH/paks/Emus/GBA282.pak/launch.sh" <<'EOF'
+#!/bin/sh
+EMU_TAG=$(basename "$(dirname "$0")" .pak)
+case "$EMU_TAG" in
+	FC) EMU_EXE=fceumm ;;
+	GB|GBC) EMU_EXE=gambatte ;;
+	GBA282) EMU_EXE=gpsp ;;
+	*) exit 1 ;;
+esac
+exec minarch.elf "$CORES_PATH/${EMU_EXE}_libretro.so" "$1"
+EOF
+chmod 755 "$SYSTEM_PATH/paks/Emus/GBA282.pak/launch.sh"
+
 echo "== install"
 "$NP/launcher/install-stubs.sh" install > "$ROOT/install.log" 2>&1 || bad "installer exited non-zero"
 [ -f "$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" ] && ok "GBA stub installed"  || bad "GBA stub missing"
 [ -f "$ROOT/Emus/$PLATFORM/GB.pak/launch.sh" ]  && ok "GB stub installed"   || bad "GB stub missing"
 [ -f "$ROOT/Emus/$PLATFORM/VB.pak/launch.sh" ]  && bad "VB should be skipped (unsupported core)" || ok "VB skipped"
+[ -f "$ROOT/Emus/$PLATFORM/GBA282.pak/launch.sh" ] && ok "my282 case-statement pak detected" \
+	|| bad "my282 case-statement pak missed (anchored EMU_EXE match?)"
 check "EXTRAS pak untouched" "$(cat "$ROOT/Emus/$PLATFORM/FBN.pak/launch.sh")" "$FBN_BEFORE"
 grep -q "skip FBN (fbneo)" "$ROOT/install.log" && ok "EXTRAS pak reported as uncovered" || bad "no report for FBN"
 
@@ -107,6 +126,22 @@ echo "$OUT" | grep -q "core=$NP/cores/gpsp_libretro.so" \
 rm -f "$NP/state/force-shim"
 OUT=$("$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
 check "clearing it restores stock" "$OUT" "minarch core=$SYSTEM_PATH/cores/gpsp_libretro.so rom=/roms/game.gba real= session="
+
+echo
+echo "== a pak-supplied core replaces the system one"
+# NextUI builds gambatte without HAVE_NETWORK, so Game Link is compiled out and
+# no configuration can restore it. The pak ships its own build instead.
+mkdir -p "$NP/cores/override/$PLATFORM"
+echo "pretend network-enabled core" > "$NP/cores/override/$PLATFORM/gpsp_libretro.so"
+OUT=$(NETPLAY_SESSION=/tmp/session "$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
+echo "$OUT" | grep -q "real=$NP/cores/override/$PLATFORM/gpsp_libretro.so" \
+	&& ok "override core used as the real core" || bad "override ignored: $OUT"
+echo "$OUT" | grep -q "core=$NP/cores/gpsp_libretro.so" \
+	&& ok "shim still staged under the real core name" || bad "shim name wrong: $OUT"
+rm -rf "$NP/cores/override"
+OUT=$(NETPLAY_SESSION=/tmp/session "$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
+echo "$OUT" | grep -q "real=$SYSTEM_PATH/cores/gpsp_libretro.so" \
+	&& ok "falls back to the system core" || bad "no fallback: $OUT"
 
 echo
 echo "== session file is discovered without an env var"

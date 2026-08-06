@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/time.h>
 
 #include "libretro.h"
 
@@ -27,16 +28,48 @@ static int failures = 0;
 		}                                                   \
 	} while (0)
 
+static int env_calls = 0;
 static bool fe_environment(unsigned cmd, void* data) {
-	printf("fe:environment cmd=%u\n", cmd);
-	return false;
+	// Keep the trace bounded: a real core queries this constantly, and printing
+	// every call would dominate a benchmark.
+	if (++env_calls <= 8) printf("fe:environment cmd=%u\n", cmd);
+
+	switch (cmd) {
+	case RETRO_ENVIRONMENT_GET_CAN_DUPE:            // gambatte refuses to run without it
+		if (data) *(bool*)data = true;
+		return true;
+	case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
+		return true;
+	case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
+	case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
+		if (data) *(const char**)data = "/tmp";
+		return true;
+	case RETRO_ENVIRONMENT_SET_VARIABLES:
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS:
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_INTL:
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2_INTL:
+		return true;
+	default:
+		return false;
+	}
 }
+static int video_frames = 0, audio_batches = 0;
 static void fe_video_refresh(const void* d, unsigned w, unsigned h, size_t p) {
-	printf("fe:video_refresh %ux%u\n", w, h);
+	video_frames++;
+	if (video_frames <= 3) printf("fe:video_refresh %ux%u\n", w, h);
 }
 static void fe_audio_sample(int16_t l, int16_t r)                { printf("fe:audio_sample\n"); }
-static size_t fe_audio_sample_batch(const int16_t* d, size_t f)  { printf("fe:audio_sample_batch %zu\n", f); return f; }
-static void fe_input_poll(void)                                  { printf("fe:input_poll\n"); }
+static size_t fe_audio_sample_batch(const int16_t* d, size_t f) {
+	audio_batches++;
+	if (audio_batches <= 3) printf("fe:audio_sample_batch %zu\n", f);
+	return f;
+}
+static int input_polls = 0;
+static void fe_input_poll(void) {
+	input_polls++;
+	if (input_polls <= 3) printf("fe:input_poll\n");
+}
 static int16_t fe_input_state(unsigned p, unsigned d, unsigned i, unsigned id) {
 	printf("fe:input_state\n");
 	return 42; // must arrive at the core intact
@@ -116,9 +149,24 @@ int main(int argc, char** argv) {
 
 	init();
 
+	// HARNESS_ROM loads a real ROM so a core can be benchmarked at full tilt.
 	struct retro_game_info game;
 	memset(&game, 0, sizeof(game));
 	game.path = "/fake/rom.bin";
+	void* rom_buf = NULL;
+	const char* rom_path = getenv("HARNESS_ROM");
+	if (rom_path) {
+		FILE* rf = fopen(rom_path, "rb");
+		if (rf) {
+			fseek(rf, 0, SEEK_END); long n = ftell(rf); fseek(rf, 0, SEEK_SET);
+			rom_buf = malloc(n);
+			if (rom_buf && fread(rom_buf, 1, n, rf) == (size_t)n) {
+				game.path = rom_path; game.data = rom_buf; game.size = n;
+				printf("fe:rom %ld bytes\n", n);
+			}
+			fclose(rf);
+		}
+	}
 	CHECK(load_game(&game) == true, "load_game did not forward its return value");
 
 	struct retro_system_av_info av;
@@ -128,7 +176,25 @@ int main(int argc, char** argv) {
 	      "av_info geometry not forwarded (got %ux%u)", av.geometry.base_width, av.geometry.base_height);
 	CHECK(av.timing.sample_rate == 44100.0, "av_info sample_rate not forwarded");
 
+	// HARNESS_STALL_AT / HARNESS_STALL_MS reproduce a menu: the frontend simply
+	// stops calling retro_run while everything else stays alive.
+	int stall_at = getenv("HARNESS_STALL_AT") ? atoi(getenv("HARNESS_STALL_AT")) : -1;
+	int stall_ms = getenv("HARNESS_STALL_MS") ? atoi(getenv("HARNESS_STALL_MS")) : 0;
+
+	struct timeval t0, t1;
+	gettimeofday(&t0, NULL);
 	for (int i = 0; i < frames; i++) {
+		if (i == stall_at) {
+			printf("fe:stall_begin\n"); fflush(stdout);
+			usleep(stall_ms * 1000);
+			// Quit while still stalled, so the peer never gets a resume - the
+			// device case where a player opens the menu and then exits.
+			if (getenv("HARNESS_DIE_IN_STALL")) {
+				printf("fe:died_in_stall\n"); fflush(stdout);
+				_exit(0);
+			}
+			printf("fe:stall_end\n"); fflush(stdout);
+		}
 		run();
 		fflush(stdout);
 		if (frame_ms) usleep(frame_ms * 1000);
@@ -149,6 +215,14 @@ int main(int argc, char** argv) {
 	unload_game();
 	deinit();
 
+	gettimeofday(&t1, NULL);
+	{
+		double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_usec - t0.tv_usec) / 1e6;
+		if (secs > 0)
+			printf("fe:bench %d frames in %.2fs = %.1f fps (%.0f%% of 60fps realtime)\n",
+			       frames, secs, frames / secs, 100.0 * (frames / secs) / 60.0);
+	}
+	printf("fe:totals video=%d audio=%d input=%d\n", video_frames, audio_batches, input_polls);
 	printf(failures ? "\nRESULT: %d failure(s)\n" : "\nRESULT: ok (%d failures)\n", failures);
 	return failures ? 1 : 0;
 }

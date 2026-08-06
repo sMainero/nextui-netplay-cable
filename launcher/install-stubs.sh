@@ -28,9 +28,20 @@ MARKER="Installed by Netplay.pak"
 
 # Cores the netplay shim knows how to drive. Systems whose pak uses anything
 # else are left alone.
-NETPLAY_CORES="fbneo fceumm snes9x mednafen_supafaust picodrive pcsx_rearmed gpsp gambatte"
+NETPLAY_CORES="fbneo fceumm snes9x snes9x2005 mednafen_supafaust picodrive pcsx_rearmed gpsp gambatte"
 
 log() { echo "[netplay-stubs] $*"; }
+
+# Report every supported core a launch.sh could select. Two shapes exist:
+# tg5040/tg5050 assign EMU_EXE at the top level, my282 selects it inside a case
+# statement over EMU_TAG, so the match cannot be anchored to line start.
+launch_cores() {
+	_found=""
+	for _e in $(sed -n 's/.*EMU_EXE=\([A-Za-z0-9_]*\).*/\1/p' "$1" | sort -u); do
+		core_is_supported "$_e" && _found="$_found $_e"
+	done
+	echo "$_found" | sed 's/^ *//'
+}
 
 core_is_supported() {
 	_exe="$1"
@@ -60,8 +71,8 @@ do_install() {
 		_launch="$_pak/launch.sh"
 		[ -f "$_launch" ] || continue
 
-		_exe="$(sed -n 's/^EMU_EXE=\(.*\)$/\1/p' "$_launch" | head -n 1)"
-		core_is_supported "$_exe" || continue
+		_exe="$(launch_cores "$_launch")"
+		[ -n "$_exe" ] || continue
 
 		_target="$SD_EMUS/$_tag.pak"
 
@@ -82,7 +93,13 @@ do_install() {
 
 		echo "$_target" >> "$MANIFEST.new"
 		_n=$((_n + 1))
-		log "installed $_tag ($_exe)"
+		# A shared launcher (my282 pre-alignment) names every core it can select,
+		# so naming one here would be a guess. The stub does not care either way -
+		# it delegates, and the original picks the core at runtime.
+		case "$_exe" in
+			*\ *) log "installed $_tag (shared launcher)" ;;
+			*)    log "installed $_tag ($_exe)" ;;
+		esac
 	done
 
 	mv "$MANIFEST.new" "$MANIFEST"
@@ -102,8 +119,8 @@ report_uncovered() {
 		[ -f "$_launch" ] || continue
 		is_ours "$_launch" && continue
 
-		_exe="$(sed -n 's/^EMU_EXE=\(.*\)$/\1/p' "$_launch" | head -n 1)"
-		core_is_supported "$_exe" || continue
+		_exe="$(launch_cores "$_launch")"
+		[ -n "$_exe" ] || continue
 
 		[ "$_m" -eq 0 ] && log "not covered by stubs (pak owns its SD path):"
 		log "  skip $(basename "$_pak" .pak) ($_exe)"
