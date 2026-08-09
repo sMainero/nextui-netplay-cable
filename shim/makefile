@@ -9,7 +9,7 @@
 #   make native               host build, for smoke testing the forwarding
 ###########################################################
 
-SUPPORTED_PLATFORMS = tg5040 tg5050 my282
+SUPPORTED_PLATFORMS = tg5040 tg5050 my282 my355 h700
 
 TARGET  = netplay_shim.so
 SOURCES = shim.c netlink.c overlay.c
@@ -58,7 +58,10 @@ ARCH_my282  = -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
 
 CFLAGS  = $(ARCH_$(PLATFORM)) -O2 -fomit-frame-pointer -fPIC
 CFLAGS += $(INCDIR) $(WARN) -std=gnu99
-LDFLAGS = -shared -ldl -lpthread
+# --no-undefined: a symbol declared and called but never defined otherwise
+# links cleanly and dies at dlopen time on the device, which is a very
+# expensive way to find a typo.
+LDFLAGS = -shared -Wl,--no-undefined -ldl -lpthread
 
 PRODUCT = ../bin/$(PLATFORM)/$(TARGET)
 
@@ -74,7 +77,7 @@ all:
 native:
 	@mkdir -p ../bin/native
 	$(CC) $(SOURCES) -o ../bin/native/$(TARGET) \
-		-shared -fPIC $(INCDIR) $(WARN) -O2 -std=gnu99 -ldl -lpthread
+		-shared -Wl,--no-undefined -fPIC $(INCDIR) $(WARN) -O2 -std=gnu99 -ldl -lpthread
 
 clean:
 	rm -f ../bin/tg5040/$(TARGET) ../bin/tg5050/$(TARGET) ../bin/native/$(TARGET)

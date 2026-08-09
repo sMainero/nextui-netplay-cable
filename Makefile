@@ -3,7 +3,15 @@
 PAK        := Netplay.pak
 ARCHIVE    := dist/$(PAK).zip
 STAGE      := dist/stage
-PLATFORMS  := tg5040 tg5050 my282
+PLATFORMS  := tg5040 tg5050 my282 my355 h700
+
+# my355 and h700 are separate NextUI forks with their own pinned source trees,
+# so they cannot be built from a bare toolchain image the way the others were -
+# each needs its matching workspace mounted. build-platforms owns that pairing
+# (image digest + source commit per platform); going through it is what makes
+# a five-platform build reproducible rather than a guess about which aarch64
+# tree happens to be close enough.
+BUILDER    := $(HOME)/dev/sbcs/build-platforms
 
 help:
 	@echo "make shim    cross-build the shim for $(PLATFORMS) (needs docker)"
@@ -17,12 +25,11 @@ help:
 
 shim:
 	@for p in $(PLATFORMS); do \
-		echo "== $$p"; \
-		case $$p in my282) img=nextui-my282-toolchain:local ;; \
-		            *) img=ghcr.io/loveretro/$$p-toolchain:latest ;; esac; \
-		docker run --rm -u "$$(id -u):$$(id -g)" -v "$$PWD":/w -w /w/shim \
-			$$img make PLATFORM=$$p || exit 1; \
+		echo "== shim $$p"; \
+		$(MAKE) -s -C "$(BUILDER)" build PLATFORM=$$p PROJECT="$$PWD" \
+			CMD='sh -c "cd shim && make PLATFORM='$$p'"' >/dev/null || exit 1; \
 	done
+	@ls -la bin/*/netplay_shim.so | awk '{printf "   %-46s %s bytes\n", $$NF, $$5}'
 
 # Cores the pak ships in place of NextUI's.
 #
@@ -36,15 +43,27 @@ shim:
 GAMBATTE_SRC := dist/coresrc/gambatte
 GPSP_SRC     := dist/coresrc/gpsp
 
+# The `platform=` string is not our platform id - it selects a branch inside the
+# core's own Makefile, and an unrecognised one silently falls through to some
+# other target (snes9x picks *Windows*, and mgba stops with "no makefile
+# found"). gpsp knows tg5040/tg5050/my282 and nothing else, so the two newer
+# aarch64 targets borrow the tg5040 branch: it only sets CC/CXX/AR from
+# CROSS_COMPILE plus -shared -fPIC, with no CPU tuning of its own, so the
+# toolchain image decides the actual target. Determinism does not enter into it
+# - both these cores are link-cable only, where each device runs its own
+# console and no state is ever compared.
+core_platform = $(if $(filter my355 h700,$(1)),tg5040,$(1))
+
 define core_build
 	@for p in $(PLATFORMS); do \
 		echo "== $(1) $$p"; \
 		mkdir -p dist/cores/$$p; \
 		case $$p in my282) img=nextui-my282-toolchain:local ;; \
 		            *) img=ghcr.io/loveretro/$$p-toolchain:latest ;; esac; \
+		bp=$$p; case $$p in my355|h700) bp=tg5040 ;; esac; \
 		docker run --rm -u "$$(id -u):$$(id -g)" -v "$$PWD":/w -w /w/$(2) \
-			$$img sh -c "make $(3) platform=$$p clean >/dev/null 2>&1; \
-			make $(3) platform=$$p -j4 >/dev/null 2>&1 && \
+			$$img sh -c "make $(3) platform=$$bp clean >/dev/null 2>&1; \
+			make $(3) platform=$$bp -j4 >/dev/null 2>&1 && \
 			cp $(1)_libretro.so /w/dist/cores/$$p/" || exit 1; \
 	done
 endef
@@ -55,8 +74,11 @@ cores-gambatte:
 	@test -d "$(GAMBATTE_SRC)" || { echo "missing $(GAMBATTE_SRC)"; exit 1; }
 	$(call core_build,gambatte,$(GAMBATTE_SRC),-f Makefile.libretro HAVE_NETWORK=1)
 	@for p in $(PLATFORMS); do \
-		echo "   $$p: $$(strings -n 6 dist/cores/$$p/gambatte_libretro.so | grep -m1 '^v0\.5\.0')"; \
+		printf "   %-7s %s  link=%s\n" "$$p" \
+			"$$(strings -n 6 dist/cores/$$p/gambatte_libretro.so | grep -m1 '^v0\.5\.0')" \
+			"$$(strings -n 6 dist/cores/$$p/gambatte_libretro.so | grep -c gambatte_gb_link_mode)"; \
 	done
+	@echo "   (link=0 means HAVE_NETWORK did not take - stock NextUI gambatte reads 0)"
 
 cores-gpsp:
 	@test -d "$(GPSP_SRC)" || { echo "missing $(GPSP_SRC)"; exit 1; }
@@ -70,16 +92,15 @@ cores-gpsp:
 # minarch and unreachable from the shim - so the app carries its own copy.
 NEXTUI ?= ../../NextUI
 
+# NEXTUI=/opt/nextui-src is where build-platforms mounts the pinned tree for the
+# platform being built - not a path on this machine.
 app:
-	@test -d "$(NEXTUI)/workspace" || { echo "set NEXTUI=/path/to/NextUI"; exit 1; }
 	@for p in $(PLATFORMS); do \
 		echo "== app $$p"; \
-		case $$p in my282) img=nextui-my282-toolchain:local ;; \
-		            *) img=ghcr.io/loveretro/$$p-toolchain:latest ;; esac; \
-		docker run --rm -v "$$PWD":/w -v "$$(cd $(NEXTUI) && pwd)":/nextui:ro -w /w/app \
-			$$img sh -c "make PLATFORM=$$p NEXTUI=/nextui >/dev/null && \
-			chown $$(id -u):$$(id -g) ../bin/$$p/netplay.elf" || exit 1; \
+		$(MAKE) -s -C "$(BUILDER)" build PLATFORM=$$p PROJECT="$$PWD" \
+			CMD='sh -c "cd app && make PLATFORM='$$p' NEXTUI=/opt/nextui-src"' >/dev/null || exit 1; \
 	done
+	@ls -la bin/*/netplay.elf | awk '{printf "   %-46s %s bytes\n", $$NF, $$5}'
 
 test:
 	@./shim/test/run.sh
@@ -94,10 +115,15 @@ test:
 # and the shim sources, none of which belong on the device - and an exclusion
 # list silently ships whatever it forgets.
 #
-# Note this stages launcher/pak-launch.sh as launch.sh rather than the pak's
-# own launch.sh, which runs netplay.elf: that app installs patched system
-# binaries, which is precisely what the shim architecture replaces. netplay.elf
-# is deliberately not in this build.
+# Note this stages launcher/pak-launch.sh as launch.sh rather than the pak's own
+# launch.sh. Both run bin/$PLATFORM/netplay.elf; pak-launch.sh is the one that
+# sets SDCARD_PATH/SYSTEM_PATH/LOGS_PATH explicitly and creates the log dir, so
+# it works when the frontend has not exported them.
+#
+# (An older comment here said netplay.elf was excluded from this build. That
+# referred to a different, long-removed netplay.elf which installed patched
+# system binaries - the thing the shim architecture replaced. The current app is
+# shipped and is the pak's whole UI.)
 ###########################################################
 
 dist: $(addprefix check-shim-,$(PLATFORMS))
@@ -106,8 +132,8 @@ dist: $(addprefix check-shim-,$(PLATFORMS))
 
 	@cp pak.json "$(STAGE)/$(PAK)/"
 	@cp launcher/pak-launch.sh "$(STAGE)/$(PAK)/launch.sh"
-	@cp launcher/minarch.elf launcher/launch-stub.sh \
-	    launcher/install-stubs.sh launcher/wrap-pak.sh \
+	@cp launcher/minarch.elf launcher/launch-stub.sh launcher/adhoc-join.sh launcher/wifi-watchdog.sh \
+	    launcher/install-stubs.sh launcher/wrap-pak.sh launcher/bind-mount.sh launcher/pre-launch.sh \
 	    "$(STAGE)/$(PAK)/launcher/"
 	@cp launcher/session.conf.example "$(STAGE)/$(PAK)/"
 	@for p in $(PLATFORMS); do \

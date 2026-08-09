@@ -12,6 +12,7 @@ trap 'rm -rf "$ROOT"' EXIT
 export SDCARD_PATH="$ROOT"
 export PLATFORM=tg5040
 export SYSTEM_PATH="$ROOT/.system/$PLATFORM"
+export USERDATA_PATH="$ROOT/.userdata/$PLATFORM"
 
 NP="$ROOT/Tools/$PLATFORM/Netplay.pak"
 fail=0
@@ -20,8 +21,9 @@ bad()  { echo "  FAIL $1"; fail=1; }
 check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; fi; }
 
 # --- fake SD card ---------------------------------------------------------
-mkdir -p "$SYSTEM_PATH/bin" "$SYSTEM_PATH/cores" "$NP/launcher" "$NP/bin/$PLATFORM" "$NP/state"
-cp "$HERE/launch-stub.sh" "$HERE/install-stubs.sh" "$HERE/minarch.elf" "$HERE/wrap-pak.sh" "$NP/launcher/"
+mkdir -p "$USERDATA_PATH" "$SYSTEM_PATH/bin" "$SYSTEM_PATH/cores" "$NP/launcher" "$NP/bin/$PLATFORM" "$NP/state"
+cp "$HERE/launch-stub.sh" "$HERE/install-stubs.sh" "$HERE/minarch.elf" "$HERE/wrap-pak.sh" \
+   "$HERE/bind-mount.sh" "$HERE/pre-launch.sh" "$NP/launcher/"
 chmod 755 "$NP/launcher"/*
 : > "$NP/bin/$PLATFORM/netplay_shim.so"
 
@@ -44,6 +46,19 @@ minarch.elf "\$CORES_PATH/\${EMU_EXE}_libretro.so" "\$1"
 EOF
 	chmod 755 "$SYSTEM_PATH/paks/Emus/$tag.pak/launch.sh"
 done
+
+# Reports its $0-derived EMU_TAG, so the bind mount can be checked for keeping
+# $0 at the pak's real path. Kept separate from the paks above because three
+# tests compare their launch output byte for byte.
+mkdir -p "$SYSTEM_PATH/paks/Emus/MD.pak"
+cat > "$SYSTEM_PATH/paks/Emus/MD.pak/launch.sh" <<'EOF'
+#!/bin/sh
+EMU_EXE=picodrive
+EMU_TAG=$(basename "$(dirname "$0")" .pak)
+echo "tag=$EMU_TAG"
+minarch.elf "$CORES_PATH/${EMU_EXE}_libretro.so" "$1"
+EOF
+chmod 755 "$SYSTEM_PATH/paks/Emus/MD.pak/launch.sh"
 
 # An EXTRAS pak already sitting on the SD path - must be left alone. Bundles
 # its own core and locates it via CORES_PATH=$(dirname "$0"), like FBN/SUPA.
@@ -196,6 +211,67 @@ echo "$OUT" | grep -q "core=$NP/cores/fbneo_libretro.so" \
 	&& ok "wrapped pak routes through the shim" || bad "no shim routing: $OUT"
 echo "$OUT" | grep -q "real=$ROOT/Emus/$PLATFORM/FBN.pak/fbneo_libretro.so" \
 	&& ok "real core passed to the shim" || bad "wrong real core: $OUT"
+
+echo
+echo "== bind-mount: stage system paks, writing nothing to the Emus tree"
+GBA_BEFORE=$(cat "$SYSTEM_PATH/paks/Emus/GBA.pak/launch.sh")
+# Snapshot rather than assert emptiness: earlier install-stubs tests deliberately
+# leave a foreign pak behind, so what matters is that we add nothing of our own.
+EMUS_BEFORE=$(ls -R "$ROOT/Emus" 2>/dev/null)
+"$NP/launcher/bind-mount.sh" sync > "$ROOT/bmsync.log" 2>&1 || bad "sync exited non-zero"
+check "system pak untouched by staging" "$(cat "$SYSTEM_PATH/paks/Emus/GBA.pak/launch.sh")" "$GBA_BEFORE"
+check "launch.sh.old is the original, verbatim" "$(cat "$NP/mounts/GBA.pak/launch.sh.old")" "$GBA_BEFORE"
+grep -q "Installed by Netplay.pak" "$NP/mounts/GBA.pak/launch.sh" \
+	&& ok "staged launch.sh is ours" || bad "staged launch.sh not marked"
+[ -d "$NP/mounts/VB.pak" ] && bad "staged a pak whose core we cannot drive" || ok "unsupported core not staged"
+
+# The entire point of the rewrite: the Emus tree gains nothing.
+check "Emus tree untouched by the mount route" "$(ls -R "$ROOT/Emus" 2>/dev/null)" "$EMUS_BEFORE"
+
+echo
+echo "== bind-mount: what the mount would present"
+# cp -a of the staged dir over the pak's own path presents exactly what the bind
+# mount does, so $0 - and therefore EMU_TAG - resolves identically.
+cp -a "$NP/mounts/MD.pak/." "$SYSTEM_PATH/paks/Emus/MD.pak/"
+
+OUT=$("$SYSTEM_PATH/paks/Emus/MD.pak/launch.sh" /roms/g.md 2>&1)
+echo "$OUT" | grep -qx "tag=MD" && ok "EMU_TAG still resolves to MD under the mount" \
+	|| bad "EMU_TAG wrong: $OUT"
+
+OUT=$(NETPLAY_SESSION=/tmp/session "$SYSTEM_PATH/paks/Emus/MD.pak/launch.sh" /roms/g.md 2>&1)
+echo "$OUT" | grep -q "core=$NP/cores/picodrive_libretro.so" \
+	&& ok "mounted pak routes through the shim" || bad "no shim routing: $OUT"
+echo "$OUT" | grep -q "real=$SYSTEM_PATH/cores/picodrive_libretro.so" \
+	&& ok "real core passed to the shim" || bad "wrong real core: $OUT"
+
+echo
+echo "== bind-mount: staleness is detected"
+"$NP/launcher/bind-mount.sh" status 2>&1 | grep -q "stale" && bad "clean staging reported stale" || ok "fresh staging not stale"
+rm -rf "$SYSTEM_PATH/paks/Emus/GBA.pak"; mkdir -p "$SYSTEM_PATH/paks/Emus/GBA.pak"
+printf '#!/bin/sh\nEMU_EXE=gpsp\necho updated\n' > "$SYSTEM_PATH/paks/Emus/GBA.pak/launch.sh"
+chmod 755 "$SYSTEM_PATH/paks/Emus/GBA.pak/launch.sh"
+"$NP/launcher/bind-mount.sh" status 2>&1 | grep -q "stale    GBA" \
+	&& ok "pak updated underneath is reported stale" || bad "stale staging not detected"
+
+echo
+echo "== bind-mount: boot hook"
+"$NP/launcher/bind-mount.sh" hook-install > /dev/null 2>&1
+grep -q "Netplay.pak-on-boot" "$USERDATA_PATH/auto.sh" && ok "hook added to auto.sh" || bad "hook not added"
+"$NP/launcher/bind-mount.sh" hook-install > /dev/null 2>&1
+[ "$(grep -c "Netplay.pak-on-boot" "$USERDATA_PATH/auto.sh")" = "1" ] \
+	&& ok "hook install is idempotent" || bad "hook added twice"
+
+# Must not disturb hooks other paks registered the same way.
+echo 'test -f /other/on-boot && /other/on-boot # Other.pak-on-boot' >> "$USERDATA_PATH/auto.sh"
+"$NP/launcher/bind-mount.sh" hook-remove > /dev/null 2>&1
+grep -q "Netplay.pak-on-boot" "$USERDATA_PATH/auto.sh" && bad "our hook survived removal" || ok "hook removed"
+grep -q "Other.pak-on-boot" "$USERDATA_PATH/auto.sh" && ok "another pak's hook left alone" || bad "removed someone else's hook"
+
+echo
+echo "== bind-mount: boot never fails, however broken the staging"
+rm -rf "$NP/mounts"
+"$NP/launcher/bind-mount.sh" boot; rc=$?
+[ "$rc" = "0" ] && ok "boot exits 0 with no staging at all" || bad "boot exited $rc - would break a boot"
 
 echo
 [ "$fail" -eq 0 ] && echo "PASS" || echo "FAIL"

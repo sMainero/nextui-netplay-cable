@@ -104,8 +104,11 @@ do_sync() {
 			echo "#!/bin/sh"
 			echo "# $MARKER - wraps $_tag, original preserved as launch.sh.old"
 			echo "DIR=\"\$(dirname \"\$0\")\""
-			echo "PATH=\"$NP/launcher:\$PATH\""
-			echo "export PATH"
+			echo "NETPLAY_PAK=\"$NP\""
+			echo "export NETPLAY_PAK"
+			# Was PATH-only, so a wrapped EXTRAS pak never disabled power save
+			# and never re-joined the ad hoc network - the stub route did both.
+			echo "[ -f \"\$NETPLAY_PAK/launcher/pre-launch.sh\" ] && . \"\$NETPLAY_PAK/launcher/pre-launch.sh\""
 			echo "exec \"\$DIR/launch.sh.old\" \"\$@\""
 		} > "$_dst/launch.sh"
 		chmod 755 "$_dst/launch.sh"

@@ -71,8 +71,17 @@ static void fe_input_poll(void) {
 	if (input_polls <= 3) printf("fe:input_poll\n");
 }
 static int16_t fe_input_state(unsigned p, unsigned d, unsigned i, unsigned id) {
-	printf("fe:input_state\n");
-	return 42; // must arrive at the core intact
+	static int shown = 0;
+	if (shown++ < 3) printf("fe:input_state\n");
+	// HARNESS_BUTTONS gives each side a distinguishable input, so the test can
+	// tell whose input landed on which port.
+	static int buttons = -1;
+	if (buttons < 0) buttons = getenv("HARNESS_BUTTONS") ? atoi(getenv("HARNESS_BUTTONS")) : 42;
+	if (getenv("HARNESS_VARY_INPUT")) {
+		static int tick = 0;
+		return (int16_t)(buttons + (++tick & 7));
+	}
+	return (int16_t)buttons;
 }
 
 int main(int argc, char** argv) {

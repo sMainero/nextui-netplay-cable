@@ -1,0 +1,48 @@
+#!/bin/sh
+#
+# Everything that has to happen before a wrapped emulator pak runs, in one
+# place. Sourced, not executed - callers need the PATH change to survive.
+#
+# Three routes reach an emulator pak and all three need this identical
+# preamble:
+#
+#   launch-stub.sh   legacy override written into Emus/<PLATFORM>/<TAG>.pak
+#   bind-mount.sh    staged copy mounted over $SYSTEM_PATH/paks/Emus/<TAG>.pak
+#   wrap-pak.sh      staged copy mounted over an EXTRAS pak on the SD path
+#
+# It lived in the first of those and was about to be copied into the other two.
+# Three copies of "re-join the ad hoc network" is three places to fix it.
+#
+# Expects NETPLAY_PAK to be set by the caller.
+
+: "${SDCARD_PATH:=/mnt/SDCARD}"
+: "${PLATFORM:=tg5040}"
+: "${NETPLAY_PAK:=$SDCARD_PATH/Tools/$PLATFORM/Netplay.pak}"
+# Exported because the shim reads it to find cores/staged/ - a plain assignment
+# would be visible to this script and to nothing it runs.
+export NETPLAY_PAK
+
+# Nothing below costs anything without a session, so a stock launch is
+# untouched - which is the whole point of leaving the mounts up permanently.
+if [ -f "$NETPLAY_PAK/state/session" ]; then
+	# Wi-Fi power save parks the radio between beacons: tens of milliseconds of
+	# jitter on traffic as sparse as a few input bytes per frame. Re-applied
+	# here rather than only at arm time because it comes back whenever the
+	# interface reassociates. The app puts the prior value back on Turn off.
+	iw dev wlan0 set power_save off >/dev/null 2>&1
+
+	# The app joins the ad hoc network when you pick a peer, but the platform
+	# re-establishes its own WiFi once the app exits, so by the time a game
+	# launches the device is back on the house network with the session still
+	# pointing at the host's ad hoc address. Re-join here; a no-op when the
+	# session is not ad hoc, or when we are already associated.
+	if [ -x "$NETPLAY_PAK/launcher/adhoc-join.sh" ]; then
+		"$NETPLAY_PAK/launcher/adhoc-join.sh" "$NETPLAY_PAK/state/session"
+	fi
+fi
+
+# Put our minarch.elf shadow ahead of the real one. This is the entire
+# mechanism: the original pak calls `minarch.elf` unqualified, so PATH decides
+# which one runs, and ours loads the shim.
+PATH="$NETPLAY_PAK/launcher:$PATH"
+export PATH

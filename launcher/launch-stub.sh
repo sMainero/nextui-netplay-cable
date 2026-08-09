@@ -10,10 +10,10 @@
 # Identical for every system - the tag comes from our own path - so the
 # installer writes the same bytes to each one.
 #
-# This only works for paks that live in $SYSTEM_PATH. An EXTRAS pak already
-# occupies the SD path, so there is nothing to override; those are covered by
-# the bind-mount route instead (see bind-mount.sh). We do not modify paks we
-# do not own.
+# LEGACY. bind-mount.sh supersedes this: it mounts a staged copy over the pak
+# in place and writes nothing to the Emus tree at all. This route remains for
+# devices where mounting is unavailable, and so that an install predating the
+# mounts can still be uninstalled.
 
 DIR="$(dirname "$0")"
 TAG="$(basename "$DIR" .pak)"
@@ -29,9 +29,11 @@ if [ ! -f "$ORIGINAL" ]; then
 	exit 1
 fi
 
+# Shared with the bind-mount routes - see pre-launch.sh.
+NETPLAY_PAK="$SDCARD_PATH/Tools/$PLATFORM/Netplay.pak"
+export NETPLAY_PAK
+[ -f "$NETPLAY_PAK/launcher/pre-launch.sh" ] && . "$NETPLAY_PAK/launcher/pre-launch.sh"
+
 # The original recomputes EMU_TAG and CORES_PATH from its own $0, so running it
 # at its real location keeps every path it derives correct.
-PATH="$SDCARD_PATH/Tools/$PLATFORM/Netplay.pak/launcher:$PATH"
-export PATH
-
 exec "$ORIGINAL" "$@"

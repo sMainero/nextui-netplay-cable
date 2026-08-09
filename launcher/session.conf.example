@@ -9,6 +9,16 @@ port=55437
 #port=55437
 #peer=192.168.1.42
 
+# --- mode ------------------------------------------------------------------
+# Normally omitted. One armed session covers every system, so the shim decides
+# per launch from the core it wraps: gambatte and gpSP emulate a real cable and
+# get link, everything else gets shared screen (which needs only serialize and
+# unserialize, so it works for any core).
+#
+# Uncomment to force it for one of them:
+#mode=netplay   # shared screen: one game, inputs synced between both devices
+#mode=link      # link cable: two games, the cores exchange their own traffic
+
 # --- Game Boy / GBC link (gambatte) ---------------------------------------
 # Gambatte does not use the libretro netpacket interface; it opens its own TCP
 # socket, configured purely through core options. The pak ships a gambatte built

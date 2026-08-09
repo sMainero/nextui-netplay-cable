@@ -21,6 +21,10 @@
 #define NETLINK_DEFAULT_PORT 55437
 #define NETLINK_MAX_PACKET   2048
 
+/* Upper bound on a peer-declared state size. Generous - picodrive's is 678KB -
+ * but finite, so a malformed or hostile header cannot ask for a 4GB malloc. */
+#define NETLINK_MAX_STATE    (16u * 1024u * 1024u)
+
 typedef enum {
 	NETLINK_ROLE_NONE = 0,
 	NETLINK_ROLE_HOST,
@@ -85,6 +89,88 @@ typedef enum {
  * the core; returning from retro_run without advancing is a legal frame skip
  * and keeps the frontend responsive. */
 bool NetLink_isPeerPaused(void);
+
+/* --- shared-screen netplay ---------------------------------------------
+ *
+ * One instance per device running the same game in lockstep, each player
+ * owning a controller port. Only inputs cross the wire, buffered a few frames
+ * ahead so the peer's arrive before they are needed - which is what makes this
+ * tolerate latency that a synchronous link cable cannot.
+ */
+
+/* Inputs are addressed by frame number, so a late packet is still usable and a
+ * duplicate is harmless. */
+void NetLink_sendInput(uint32_t frame, uint32_t buttons);
+bool NetLink_getRemoteInput(uint32_t frame, uint32_t* buttons);
+void NetLink_resetSync(void);
+
+/* Both sides must start from bit-identical state, so the host ships one.
+ * Chunked: a save state is far larger than a packet. */
+bool NetLink_sendState(const void* data, size_t len);
+bool NetLink_takeState(void** data, size_t* len);  /* caller frees */
+
+/* Periodic agreement check. Without it a divergence is silent and the two
+ * games quietly tell different stories. */
+void NetLink_sendHash(uint32_t frame, uint32_t hash);
+/* Reserved frame number for the core-identity hash, so it cannot be confused
+ * with - or overwritten by - a divergence hash. */
+#define NETLINK_IDENTITY_FRAME 0xFFFFFFFFu
+
+bool NetLink_takeHash(uint32_t* frame, uint32_t* hash);
+bool NetLink_takeIdentity(uint32_t* identity);
+
+/* --- core sharing -------------------------------------------------------
+ *
+ * Two devices can only share a screen if their cores emulate identically, and
+ * across NextUI releases that is a coin toss: pcsx_rearmed changed behaviour
+ * seven times in six months. Rather than demand matching installs, the client
+ * can adopt the host's core file for the session.
+ *
+ * Viable because build provenance does not affect emulation - only source
+ * revision does. A tg5050-built fceumm and a tg5040-built one of the same
+ * revision produce identical state despite different toolchains, sizes and
+ * CRCs. Verified by loading three platforms' cores on one device.
+ *
+ * The hard limit is architecture: a 32-bit ARM device cannot load an AArch64
+ * object. That is checked before any transfer is attempted.
+ */
+#define NETLINK_MAX_CORE (24u * 1024u * 1024u)
+
+/* Identifies a build well enough to know whether two differ. Machine is the
+ * ELF e_machine, so an impossible pairing is refused rather than transferred
+ * and then failed at dlopen. */
+#define NETLINK_VERSION_LEN 32
+
+typedef struct {
+	uint32_t crc;      /* of the core file */
+	uint32_t size;
+	uint16_t machine;  /* ELF e_machine: 40 = ARM, 183 = AArch64 */
+	uint8_t  can_send; /* sharing enabled on this side */
+
+	/* library_version, e.g. "(SVN) afe65ef" - the source revision.
+	 *
+	 * A far better predictor than the CRC. Two platforms building the same
+	 * revision produce different files, and measurement says they emulate
+	 * identically: of six shipped fceumm builds the CRC gives six groups, the
+	 * version five, and actual behaviour three. Matching on CRC alone would
+	 * transfer 3MB between two builds that already agree. */
+	char     version[NETLINK_VERSION_LEN];
+
+	/* Whether the *other* device could load this file, encoded major*1000+minor:
+	 * core_glibc is what the core requires, runtime_glibc what the device
+	 * provides. A tg5050 build needs 2.33 where every other platform needs
+	 * 2.17, so the host's core is not automatically the loadable one. */
+	uint32_t core_glibc;
+	uint32_t runtime_glibc;
+} NetLinkCoreId;
+
+/* Set before NetLink_start; exchanged during the handshake. */
+void NetLink_setCoreId(const NetLinkCoreId* id);
+/* The peer's, once connected. False until the handshake completes. */
+bool NetLink_peerCoreId(NetLinkCoreId* out);
+
+bool NetLink_sendCore(const void* data, size_t len);
+bool NetLink_takeCore(void** data, size_t* len);   /* caller frees */
 
 /* Copy the oldest queued packet out. False when the queue is empty. */
 bool NetLink_popPacket(void* out, size_t out_cap, size_t* out_len);

@@ -95,7 +95,10 @@ unsigned retro_api_version(void) { HIT("api_version"); return RETRO_API_VERSION;
 void retro_get_system_info(struct retro_system_info* info) {
 	HIT("get_system_info");
 	memset(info, 0, sizeof(*info));
-	info->library_name     = "FakeCore";
+	// The shim picks shared-screen versus link-cable off this name, so tests
+	// need to be able to pose as a link core.
+	const char* name       = getenv("FAKE_CORE_NAME");
+	info->library_name     = (name && name[0]) ? name : "FakeCore";
 	info->library_version  = "9.9";
 	info->valid_extensions = "fake|bin";
 	info->need_fullpath    = true;
@@ -154,6 +157,21 @@ void retro_run(void) {
 	// The value the frontend returns has to survive the trip back through the
 	// shim's input_state wrapper.
 	printf("core:input_state=%d\n", (int)cb_input_state(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A));
+
+	// Shared-screen netplay must serve BOTH ports. Stock minarch returns 0 for
+	// anything above port 0, so a non-zero p1 can only have come from the peer.
+	{
+		static int shown = 0;
+		static unsigned input_sum = 2166136261u;
+		int p0 = cb_input_state(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+		int p1 = cb_input_state(1, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
+		if (shown < 400) printf("core:ports p0=%d p1=%d\n", p0, p1);
+		/* FNV over the input stream: identical only if both peers ran the same
+		 * frames with the same inputs, in the same order. */
+		input_sum ^= (unsigned)p0; input_sum *= 16777619u;
+		input_sum ^= (unsigned)p1; input_sum *= 16777619u;
+		if (++shown % 100 == 0) printf("core:inputsum frames=%d sum=%08x\n", shown, input_sum);
+	}
 
 	static const int16_t frame[240 * 160];
 	cb_video_refresh(frame, 240, 160, 240 * sizeof(int16_t));

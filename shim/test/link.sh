@@ -25,8 +25,8 @@ $CC harness.c   -o "$OUT/harness"          -I../include -O0 -std=gnu99 -ldl
 
 SHIM=../../bin/native/netplay_shim.so
 
-printf 'role=host\nport=%s\noption.gpsp_serial=mul_aw2\n' "$PORT" > "$OUT/host.session"
-printf 'role=client\nport=%s\npeer=127.0.0.1\n' "$PORT" > "$OUT/client.session"
+printf 'role=host\nport=%s\nmode=link\noption.gpsp_serial=mul_aw2\n' "$PORT" > "$OUT/host.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\n' "$PORT" > "$OUT/client.session"
 
 echo "== running host and client for ~3s"
 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/host.session" \
@@ -110,8 +110,8 @@ echo "== a stalled frontend must pause its peer, not overflow it"
 # The menu case seen on device: one side stops calling retro_run, the other keeps
 # running and fills a queue nobody drains. The peer should be told to hold.
 PORT3=$((PORT + 2))
-printf 'role=host\nport=%s\n'                  "$PORT3" > "$OUT/h3.session"
-printf 'role=client\nport=%s\npeer=127.0.0.1\n' "$PORT3" > "$OUT/c3.session"
+printf 'role=host\nport=%s\nmode=link\n'                  "$PORT3" > "$OUT/h3.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\n' "$PORT3" > "$OUT/c3.session"
 
 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h3.session" \
 	"$OUT/harness" "$SHIM" 600 15 > "$OUT/h3.log" 2>&1 &
@@ -160,8 +160,8 @@ echo "== a peer that quits while paused must not strand us"
 # The device bug: peer opens a menu (we pause), then quits. CMD_RESUME never
 # comes, so we waited forever with a dead UI.
 PORT4=$((PORT + 3))
-printf 'role=host\nport=%s\n'                  "$PORT4" > "$OUT/h4.session"
-printf 'role=client\nport=%s\npeer=127.0.0.1\n' "$PORT4" > "$OUT/c4.session"
+printf 'role=host\nport=%s\nmode=link\n'                  "$PORT4" > "$OUT/h4.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\n' "$PORT4" > "$OUT/c4.session"
 
 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h4.session" \
 	"$OUT/harness" "$SHIM" 700 15 > "$OUT/h4.log" 2>&1 &
@@ -194,8 +194,8 @@ echo "== a core blocked inside retro_run is not a stalled frontend"
 # as a frontend stall, that pauses the peer - removing the data the blocked core
 # is waiting for, so neither side can proceed.
 PORT5=$((PORT + 4))
-printf 'role=host\nport=%s\n'                  "$PORT5" > "$OUT/h5.session"
-printf 'role=client\nport=%s\npeer=127.0.0.1\n' "$PORT5" > "$OUT/c5.session"
+printf 'role=host\nport=%s\nmode=link\n'                  "$PORT5" > "$OUT/h5.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\n' "$PORT5" > "$OUT/c5.session"
 
 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h5.session" \
 	"$OUT/harness" "$SHIM" 500 15 > "$OUT/h5.log" 2>&1 &
@@ -227,8 +227,8 @@ echo "== menu still pauses the peer for a core that owns its own link"
 # gambatte never registers netpacket, but a menu on one device should still hold
 # the other - otherwise it sits blocked on a serial read with no idea why.
 PORT6=$((PORT + 5))
-printf 'role=host\nport=%s\n'                  "$PORT6" > "$OUT/h6.session"
-printf 'role=client\nport=%s\npeer=127.0.0.1\n' "$PORT6" > "$OUT/c6.session"
+printf 'role=host\nport=%s\nmode=link\n'                  "$PORT6" > "$OUT/h6.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\n' "$PORT6" > "$OUT/c6.session"
 
 FAKE_CORE_NO_NETPACKET=1 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h6.session" \
 	"$OUT/harness" "$SHIM" 500 15 > "$OUT/h6.log" 2>&1 &
@@ -247,14 +247,121 @@ expect "$OUT/h6.log" "peer paused: frontend"        "peer paused, with a reason"
 expect "$OUT/h6.log" "peer resumed"                 "peer released"
 
 echo
+echo "== shared-screen netplay: both ports served, from both devices"
+# One instance each, same game, inputs synced. Distinct from link play: the
+# cores exchange nothing themselves, the shim carries the inputs.
+PORT7=$((PORT + 6))
+printf 'role=host\nport=%s\nmode=netplay\n'                  "$PORT7" > "$OUT/h7.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=netplay\n' "$PORT7" > "$OUT/c7.session"
+
+HARNESS_BUTTONS=17 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h7.session" \
+	"$OUT/harness" "$SHIM" 400 10 > "$OUT/h7.log" 2>&1 &
+H7=$!
+sleep 0.5
+HARNESS_BUTTONS=34 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c7.session" \
+	"$OUT/harness" "$SHIM" 400 10 > "$OUT/c7.log" 2>&1 &
+C7=$!
+wait $H7 2>/dev/null || true
+wait $C7 2>/dev/null || true
+
+expect "$OUT/h7.log" "sent .* byte state"    "host shipped its state"
+expect "$OUT/c7.log" "adopted .* byte state" "client adopted it"
+
+# Host holds 17, client holds 34. Both must see the same pairing: p0 is the
+# host's input, p1 the client's, on both devices.
+for side in h7 c7; do
+	if grep -q "core:ports p0=17 p1=34" "$OUT/$side.log"; then
+		echo "  ok   $side sees p0=host p1=client"
+	else
+		echo "  MISS $side port mapping wrong"
+		grep -m2 "core:ports" "$OUT/$side.log" | sed 's/^/       /'
+		fail=1
+	fi
+done
+
+# Port 1 non-zero can only have come over the wire.
+grep -q "core:ports p0=17 p1=34" "$OUT/h7.log" && grep -q "core:ports p0=17 p1=34" "$OUT/c7.log" \
+	&& echo "  ok   second player arrived over the network" \
+	|| { echo "  MISS second player never arrived"; fail=1; }
+
+if grep -q "DESYNC" "$OUT/h7.log" "$OUT/c7.log"; then
+	grep -h "DESYNC" "$OUT/h7.log" "$OUT/c7.log" | sed 's/^/  WARN /'
+	fail=1
+else
+	echo "  ok   no divergence reported"
+fi
+
+echo
+echo "== a stall must not change an input already sent"
+# The Streets of Rage desync: a stall returned without advancing the frame, but
+# re-sampled and re-sent input for the same frame. If the peer had committed the
+# first value, the two sides ran that frame from different inputs.
+PORT8=$((PORT + 7))
+# input_delay=1 leaves almost no slack, so ordinary scheduling jitter produces
+# frequent input stalls on both sides - the condition the bug needs.
+printf 'role=host\nport=%s\nmode=netplay\ninput_delay=1\n'                  "$PORT8" > "$OUT/h8.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=netplay\ninput_delay=1\n' "$PORT8" > "$OUT/c8.session"
+
+# Stalls must happen *inside* retro_run - a frontend stall stops it being called
+# at all and never re-samples. A one-frame delay window plus inputs that change
+# every frame is what makes a re-sample produce a different value for a frame
+# the peer may already have committed.
+HARNESS_VARY_INPUT=1 HARNESS_BUTTONS=100 \
+	NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h8.session" \
+	"$OUT/harness" "$SHIM" 1500 2 > "$OUT/h8.log" 2>&1 &
+H8=$!
+sleep 0.5
+HARNESS_VARY_INPUT=1 HARNESS_BUTTONS=200 \
+	NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c8.session" \
+	"$OUT/harness" "$SHIM" 1500 2 > "$OUT/c8.log" 2>&1 &
+C8=$!
+wait $H8 2>/dev/null || true
+wait $C8 2>/dev/null || true
+
+# Compare the input checksum at the last frame count both sides reached.
+sed -n 's/.*core:inputsum frames=\([0-9]*\).*/\1/p' "$OUT/h8.log" | sort -n | uniq > "$OUT/h8.frames"
+sed -n 's/.*core:inputsum frames=\([0-9]*\).*/\1/p' "$OUT/c8.log" | sort -n | uniq > "$OUT/c8.frames"
+common=$(comm -12 "$OUT/h8.frames" "$OUT/c8.frames" | tail -1)
+if [ -n "$common" ]; then
+	hsum=$(grep "core:inputsum frames=$common " "$OUT/h8.log" | tail -1 | grep -oE "sum=[0-9a-f]+")
+	csum=$(grep "core:inputsum frames=$common " "$OUT/c8.log" | tail -1 | grep -oE "sum=[0-9a-f]+")
+	if [ "$hsum" = "$csum" ] && [ -n "$hsum" ]; then
+		echo "  ok   both ran identical inputs through $common frames ($hsum)"
+	else
+		echo "  MISS input streams diverged at frame $common (host $hsum, client $csum)"
+		fail=1
+	fi
+else
+	echo "  MISS no common frame count to compare"
+	fail=1
+fi
+
+# Pacing has to be in the log or a slow session cannot be attributed after the
+# fact - which is exactly the hole that made an on-device report undiagnosable.
+# The host must adopt the state it sends. A core whose freshly-booted state is
+# not a serialize/unserialize fixpoint leaves the two sides one byte apart from
+# frame 0 otherwise, and every divergence check then reports DESYNC for a
+# session running perfectly in step.
+if grep -q "DESYNC" "$OUT/c7.log" 2>/dev/null; then
+	echo "  MISS client reported DESYNC in a lockstep session"
+	grep -m2 DESYNC "$OUT/c7.log" | sed 's/^/       /'
+	fail=1
+else
+	echo "  ok   no false DESYNC across the handshake"
+fi
+
+expect "$OUT/h8.log" "pacing: .* fps.*stalled" "host reported pacing"
+expect "$OUT/c8.log" "pacing: .* fps.*stalled" "client reported pacing"
+
+echo
 echo "== one-sided traffic must not starve the heartbeat"
 # The regression that shipped: the heartbeat lived in the poll()-timeout branch,
 # so a peer sending steadily kept POLLIN set, the idle branch never ran, and the
 # quiet side got timed out mid-session. Both sides sending every frame - as the
 # test above does - hides it completely.
 PORT2=$((PORT + 1))
-printf 'role=host\nport=%s\n'                  "$PORT2" > "$OUT/h2.session"
-printf 'role=client\nport=%s\npeer=127.0.0.1\n' "$PORT2" > "$OUT/c2.session"
+printf 'role=host\nport=%s\nmode=link\n'                  "$PORT2" > "$OUT/h2.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\n' "$PORT2" > "$OUT/c2.session"
 
 # Host talks constantly; client stays silent for well over the 5s timeout.
 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h2.session" \
@@ -280,6 +387,50 @@ done
 flaps=$(grep -c "netpacket session started" "$OUT/c2.log" || true)
 [ "$flaps" -eq 1 ] && echo "  ok   session never flapped" \
 	|| { echo "  MISS session restarted $flaps times"; fail=1; }
+
+echo
+echo "== a session still waiting for its peer must present something"
+# The device bug: shared-screen netplay gates ahead of the first core.run(), so
+# there is no last frame to dim and the shim presented nothing at all. The
+# frontend kept showing black, which is indistinguishable from a hang - the game
+# "never loaded" while the menu still worked.
+PORT10=$((PORT + 9))
+printf 'role=host\nport=%s\nmode=netplay\n' "$PORT10" > "$OUT/w1.session"
+NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/w1.session" \
+	"$OUT/harness" "$SHIM" 120 15 > "$OUT/w1.log" 2>&1 || true
+
+w1_video=$(sed -n 's/.*fe:totals video=\([0-9]*\).*/\1/p' "$OUT/w1.log")
+w1_run=$(grep -c "core:run" "$OUT/w1.log" || true)
+[ "${w1_video:-0}" -ge 110 ] \
+	&& echo "  ok   kept presenting while waiting ($w1_video frames)" \
+	|| { echo "  MISS presented $w1_video of 120 - screen would be black"; fail=1; }
+# The frame it presents must be the waiting message, not a stale game frame.
+[ "${w1_run:-0}" -eq 0 ] \
+	&& echo "  ok   core never ran without a peer" \
+	|| { echo "  MISS core ran $w1_run times unsynced"; fail=1; }
+
+echo
+echo "== mode comes from the core, not the session"
+# A session is armed once and covers every system, so it cannot name a mode -
+# the core it ends up wrapping decides. No peer is needed to assert this: the
+# shim logs the decision as it loads.
+PORT9=$((PORT + 8))
+mode_case() { # <tag> <core name> <mode line, or empty> <expected mode> <expected source>
+	printf 'role=host\nport=%s\n' "$PORT9" > "$OUT/$1.session"
+	[ -n "$3" ] && echo "$3" >> "$OUT/$1.session"
+	FAKE_CORE_NAME="$2" NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
+		NETPLAY_SESSION="$OUT/$1.session" \
+		"$OUT/harness" "$SHIM" 5 15 > "$OUT/$1.log" 2>&1 || true
+	expect "$OUT/$1.log" "mode=$4 for .* ($5)" "$2${3:+ + $3} -> $4 ($5)"
+}
+
+# Name matching is case-insensitive and on a substring, so the real cores'
+# reported names ("Gambatte", "gpSP") land without pinning their exact casing.
+mode_case m1 FakeCore ''            shared-screen "from core"
+mode_case m2 Gambatte ''            link-cable    "from core"
+mode_case m3 gpSP     ''            link-cable    "from core"
+mode_case m4 FakeCore 'mode=link'   link-cable    "from session"
+mode_case m5 Gambatte 'mode=netplay' shared-screen "from session"
 
 echo
 if [ "$fail" -eq 0 ]; then
