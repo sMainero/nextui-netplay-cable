@@ -143,7 +143,9 @@ int main(int argc, char** argv) {
 
 	// These feed core.extensions / core.need_fullpath, and minarch strcpys
 	// valid_extensions unchecked.
-	CHECK(info.library_name && strcmp(info.library_name, "FakeCore") == 0,
+	const char* expected_core_name = getenv("HARNESS_EXPECT_CORE_NAME");
+	if (!expected_core_name) expected_core_name = "FakeCore";
+	CHECK(info.library_name && strcmp(info.library_name, expected_core_name) == 0,
 	      "library_name not forwarded verbatim (got %s)", info.library_name ? info.library_name : "(null)");
 	CHECK(info.valid_extensions && strcmp(info.valid_extensions, "fake|bin") == 0,
 	      "valid_extensions not forwarded verbatim");
@@ -162,6 +164,10 @@ int main(int argc, char** argv) {
 	struct retro_game_info game;
 	memset(&game, 0, sizeof(game));
 	game.path = "/fake/rom.bin";
+	static const unsigned char fake_rom[] = "netplay-test-rom-v1";
+	const char* fake_rom_id = getenv("HARNESS_ROM_ID");
+	game.data = fake_rom_id ? (const void*)fake_rom_id : fake_rom;
+	game.size = fake_rom_id ? strlen(fake_rom_id) : sizeof(fake_rom) - 1;
 	void* rom_buf = NULL;
 	const char* rom_path = getenv("HARNESS_ROM");
 	if (rom_path) {
@@ -193,6 +199,10 @@ int main(int argc, char** argv) {
 	struct timeval t0, t1;
 	gettimeofday(&t0, NULL);
 	for (int i = 0; i < frames; i++) {
+		if (getenv("HARNESS_DIE_AT") && i == atoi(getenv("HARNESS_DIE_AT"))) {
+			printf("fe:process_crash at=%d\n", i); fflush(stdout);
+			_exit(86);
+		}
 		if (i == stall_at) {
 			printf("fe:stall_begin\n"); fflush(stdout);
 			usleep(stall_ms * 1000);
@@ -210,16 +220,36 @@ int main(int argc, char** argv) {
 	}
 
 	size_t sz = serialize_size();
-	CHECK(sz == 16, "serialize_size not forwarded (got %zu)", sz);
-
 	unsigned char buf[16];
-	CHECK(serialize(buf, sizeof(buf)) == true, "serialize did not forward");
-	CHECK(buf[0] == 0xAB, "serialize did not write the core's bytes through");
-	CHECK(unserialize(buf, sizeof(buf)) == true, "unserialize did not forward");
+	if (getenv("HARNESS_EXPECT_NO_STATES") || getenv("NETPLAY_SESSION")) {
+		CHECK(sz == 0, "active session exposed save states (size %zu)", sz);
+		CHECK(serialize(buf, sizeof(buf)) == false, "active session allowed a save state");
+		CHECK(unserialize(buf, sizeof(buf)) == false, "active session allowed a state load");
+	} else {
+		CHECK(sz == 16, "serialize_size not forwarded (got %zu)", sz);
+		CHECK(serialize(buf, sizeof(buf)) == true, "serialize did not forward");
+		CHECK(buf[0] == 0xAB, "serialize did not write the core's bytes through");
+		if (getenv("HARNESS_EXPECT_NO_LOAD"))
+			CHECK(unserialize(buf, sizeof(buf)) == false,
+			      "active session allowed a frontend state load");
+		else
+			CHECK(unserialize(buf, sizeof(buf)) == true, "unserialize did not forward");
+	}
 
 	CHECK(get_region() == RETRO_REGION_NTSC, "get_region not forwarded");
-	CHECK(get_memory_size(RETRO_MEMORY_SAVE_RAM) == 16, "get_memory_size not forwarded");
-	CHECK(get_memory_data(RETRO_MEMORY_SAVE_RAM) != NULL, "get_memory_data not forwarded");
+	if (getenv("HARNESS_EXPECT_NO_PERSISTENCE")) {
+		CHECK(get_memory_size(RETRO_MEMORY_SAVE_RAM) == 0,
+		      "shared-screen guest exposed SRAM size");
+		CHECK(get_memory_data(RETRO_MEMORY_SAVE_RAM) == NULL,
+		      "shared-screen guest exposed SRAM data");
+		CHECK(get_memory_size(RETRO_MEMORY_RTC) == 0,
+		      "shared-screen guest exposed RTC size");
+		CHECK(get_memory_data(RETRO_MEMORY_RTC) == NULL,
+		      "shared-screen guest exposed RTC data");
+	} else {
+		CHECK(get_memory_size(RETRO_MEMORY_SAVE_RAM) == 16, "get_memory_size not forwarded");
+		CHECK(get_memory_data(RETRO_MEMORY_SAVE_RAM) != NULL, "get_memory_data not forwarded");
+	}
 
 	unload_game();
 	deinit();

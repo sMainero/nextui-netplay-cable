@@ -1,24 +1,27 @@
-.PHONY: dist shim cores app test clean help
+.PHONY: dist dist-base dist-compatibility dist-full shim cores core-sources compatibility compatibility-sources compatibility-armv7 compatibility-aarch64 check-compatibility check-netplay-cores cores-gambatte cores-gpsp app test clean help
 
 PAK        := Netplay.pak
-ARCHIVE    := dist/$(PAK).zip
-STAGE      := dist/stage
+BASE_ARCHIVE   := dist/Netplay.pak.zip
+COMPAT_ARCHIVE := dist/compatibility-cores.zip
+FULL_ARCHIVE   := dist/Netplay-Full.pak.zip
+BASE_STAGE     := dist/stage-base
+COMPAT_STAGE   := dist/stage-compatibility
+FULL_STAGE     := dist/stage-full
 PLATFORMS  := tg5040 tg5050 my282 my355 h700
 
-# my355 and h700 are separate NextUI forks with their own pinned source trees,
-# so they cannot be built from a bare toolchain image the way the others were -
-# each needs its matching workspace mounted. build-platforms owns that pairing
-# (image digest + source commit per platform); going through it is what makes
-# a five-platform build reproducible rather than a guess about which aarch64
-# tree happens to be close enough.
-BUILDER    := $(HOME)/dev/sbcs/build-platforms
+# build-platforms owns the image-digest/source-commit pairing for every target.
+# Keep the sibling checkout as the convenient default, but allow CI and other
+# workspaces to point at it without reproducing one developer's home directory.
+BUILDER    ?= $(abspath $(CURDIR)/../../build-platforms)
 
 help:
 	@echo "make shim    cross-build the shim for $(PLATFORMS) (needs docker)"
 	@echo "make cores   build the patched gambatte + gpsp cores (needs docker)"
+	@echo "make compatibility  build seven pinned cores for ARMv7 + AArch64"
+	@echo "make core-sources  fetch pinned core sources and apply tracked patches"
 	@echo "make app     build the session-setup app (needs docker + NEXTUI)"
 	@echo "make test    run the host test suites"
-	@echo "make dist    stage and zip $(ARCHIVE)"
+	@echo "make dist    create Netplay.pak.zip, compatibility-cores.zip and Netplay-Full.pak.zip"
 	@echo "make clean   remove dist/"
 
 ###########################################################
@@ -27,7 +30,7 @@ shim:
 	@for p in $(PLATFORMS); do \
 		echo "== shim $$p"; \
 		$(MAKE) -s -C "$(BUILDER)" build PLATFORM=$$p PROJECT="$$PWD" \
-			CMD='sh -c "cd shim && make PLATFORM='$$p'"' >/dev/null || exit 1; \
+			CMD='sh -c "cd shim && make PLATFORM='$$p'"' || exit 1; \
 	done
 	@ls -la bin/*/netplay_shim.so | awk '{printf "   %-46s %s bytes\n", $$NF, $$5}'
 
@@ -40,35 +43,105 @@ shim:
 #             a packet queue deep enough for TCP's bursty delivery.
 #
 # Both are the same upstream sources NextUI uses; only the build differs.
-GAMBATTE_SRC := dist/coresrc/gambatte
-GPSP_SRC     := dist/coresrc/gpsp
+CORE_SRC_ROOT ?= .cache/cores
+GAMBATTE_SRC := $(CORE_SRC_ROOT)/gambatte
+GPSP_SRC     := $(CORE_SRC_ROOT)/gpsp
+GAMBATTE_REPO := https://github.com/libretro/gambatte-libretro.git
+GAMBATTE_REV  := 9b3b5e3cc18ec92f460d37dd551eaf90c55bfcea
+GPSP_REPO     := https://github.com/libretro/gpsp.git
+GPSP_REV      := 69e86ebe89f14c3f5f75b809c12c0a953b3d6ce4
+GAMBATTE_PATCHES := cores/patches/gambatte-platforms.patch cores/patches/gambatte-serial-timeout.patch
+GPSP_PATCHES := cores/patches/gpsp-platforms.patch cores/patches/gpsp-001-rfu-disconnect.patch cores/patches/gpsp-002-rfu-queue-size.patch cores/patches/gpsp-003-netplay-version.patch
+GAMBATTE_STAMP := $(GAMBATTE_SRC)/.netplay-patched-$(GAMBATTE_REV)
+GPSP_STAMP := $(GPSP_SRC)/.netplay-patched-$(GPSP_REV)
 
-# The `platform=` string is not our platform id - it selects a branch inside the
-# core's own Makefile, and an unrecognised one silently falls through to some
-# other target (snes9x picks *Windows*, and mgba stops with "no makefile
-# found"). gpsp knows tg5040/tg5050/my282 and nothing else, so the two newer
-# aarch64 targets borrow the tg5040 branch: it only sets CC/CXX/AR from
-# CROSS_COMPILE plus -shared -fPIC, with no CPU tuning of its own, so the
-# toolchain image decides the actual target. Determinism does not enter into it
-# - both these cores are link-cable only, where each device runs its own
-# console and no state is ever compared.
-core_platform = $(if $(filter my355 h700,$(1)),tg5040,$(1))
+FCEUMM_SRC := $(CORE_SRC_ROOT)/fceumm
+PICODRIVE_SRC := $(CORE_SRC_ROOT)/picodrive
+SNES9X_SRC := $(CORE_SRC_ROOT)/snes9x
+SUPAFAUST_SRC := $(CORE_SRC_ROOT)/mednafen_supafaust
+PCSX_SRC := $(CORE_SRC_ROOT)/pcsx_rearmed
+FCEUMM_REV := afe65ef1b4328c0bf2df05fb47a6b31a45bccf47
+PICODRIVE_REV := b0be121b7d58d6ee1ee2809974e62893c80a8264
+SNES9X_REV := 185488cd83aaf274752a742c94d45561cbecb7af
+SUPAFAUST_REV := d6187e5337e6c2646d003db3ab1936727ca75301
+PCSX_REV := 050981b
 
-define core_build
-	@for p in $(PLATFORMS); do \
-		echo "== $(1) $$p"; \
-		mkdir -p dist/cores/$$p; \
-		case $$p in my282) img=nextui-my282-toolchain:local ;; \
-		            *) img=ghcr.io/loveretro/$$p-toolchain:latest ;; esac; \
-		bp=$$p; case $$p in my355|h700) bp=tg5040 ;; esac; \
-		docker run --rm -u "$$(id -u):$$(id -g)" -v "$$PWD":/w -w /w/$(2) \
-			$$img sh -c "make $(3) platform=$$bp clean >/dev/null 2>&1; \
-			make $(3) platform=$$bp -j4 >/dev/null 2>&1 && \
-			cp $(1)_libretro.so /w/dist/cores/$$p/" || exit 1; \
-	done
+core-sources: $(GAMBATTE_STAMP) $(GPSP_STAMP)
+
+compatibility-sources: core-sources $(FCEUMM_SRC)/.compat-pinned $(PICODRIVE_SRC)/.compat-pinned \
+	$(SNES9X_SRC)/.compat-pinned \
+	$(SUPAFAUST_SRC)/.compat-pinned $(PCSX_SRC)/.compat-pinned
+
+define compat_source
+$(1)/.compat-pinned:
+	@rm -rf "$(1)"
+	@mkdir -p "$(CORE_SRC_ROOT)"
+	@git clone -q $(2) "$(1)"
+	@git -C "$(1)" checkout -q $(3)
+	@touch "$$@"
 endef
 
-cores: cores-gambatte cores-gpsp
+$(eval $(call compat_source,$(FCEUMM_SRC),https://github.com/libretro/libretro-fceumm.git,$(FCEUMM_REV)))
+$(eval $(call compat_source,$(SNES9X_SRC),https://github.com/libretro/snes9x.git,$(SNES9X_REV)))
+$(eval $(call compat_source,$(SUPAFAUST_SRC),https://github.com/libretro/supafaust.git,$(SUPAFAUST_REV)))
+
+$(PICODRIVE_SRC)/.compat-pinned: cores/patches/picodrive-old-arm-hwcap.patch
+	@rm -rf "$(PICODRIVE_SRC)"
+	@mkdir -p "$(CORE_SRC_ROOT)"
+	@git clone -q https://github.com/irixxxx/picodrive.git "$(PICODRIVE_SRC)"
+	@git -C "$(PICODRIVE_SRC)" checkout -q "$(PICODRIVE_REV)"
+	@git -C "$(PICODRIVE_SRC)" submodule update --init --recursive
+	@patch -d "$(PICODRIVE_SRC)" -p1 < cores/patches/picodrive-old-arm-hwcap.patch
+	@touch "$@"
+
+$(PCSX_SRC)/.compat-pinned: cores/patches/pcsx-rearmed-old-arm-hwcap.patch
+	@rm -rf "$(PCSX_SRC)"
+	@mkdir -p "$(CORE_SRC_ROOT)"
+	@git clone -q https://github.com/libretro/pcsx_rearmed.git "$(PCSX_SRC)"
+	@git -C "$(PCSX_SRC)" checkout -q "$(PCSX_REV)"
+	@git -C "$(PCSX_SRC)" submodule update --init frontend/libpicofe
+	@patch -d "$(PCSX_SRC)" -p1 < cores/patches/pcsx-rearmed-old-arm-hwcap.patch
+	@touch "$@"
+
+$(GAMBATTE_STAMP): $(GAMBATTE_PATCHES)
+	@rm -rf "$(GAMBATTE_SRC)"
+	@mkdir -p "$(CORE_SRC_ROOT)"
+	@git clone -q "$(GAMBATTE_REPO)" "$(GAMBATTE_SRC)"
+	@git -C "$(GAMBATTE_SRC)" checkout -q "$(GAMBATTE_REV)"
+	@patch -d "$(GAMBATTE_SRC)" -p1 < cores/patches/gambatte-platforms.patch
+	@patch -d "$(GAMBATTE_SRC)" -p1 < cores/patches/gambatte-serial-timeout.patch
+	@touch "$@"
+
+$(GPSP_STAMP): $(GPSP_PATCHES)
+	@rm -rf "$(GPSP_SRC)"
+	@mkdir -p "$(CORE_SRC_ROOT)"
+	@git clone -q "$(GPSP_REPO)" "$(GPSP_SRC)"
+	@git -C "$(GPSP_SRC)" checkout -q "$(GPSP_REV)"
+	@patch -d "$(GPSP_SRC)" -p1 < cores/patches/gpsp-platforms.patch
+	@patch -d "$(GPSP_SRC)" -p1 < cores/patches/gpsp-001-rfu-disconnect.patch
+	@patch -d "$(GPSP_SRC)" -p1 < cores/patches/gpsp-002-rfu-queue-size.patch
+	@patch -d "$(GPSP_SRC)" -p1 < cores/patches/gpsp-003-netplay-version.patch
+	@touch "$@"
+
+# The `platform=` string is not our platform id - it selects a branch inside the
+# core's own Makefile, and an unrecognised one can silently fall through to
+# Windows. Our tracked patches add tg5040/tg5050/my282; the two newer aarch64
+# targets borrow the branch matching their CPU family. Determinism does not enter into it
+# - both these cores are link-cable only, where each device runs its own
+# console and no state is ever compared.
+define core_build
+	@for p in $(PLATFORMS); do \
+			echo "== $(1) $$p"; \
+			mkdir -p dist/cores/$$p; \
+			bp=$$p; case $$p in my355) bp=tg5050 ;; h700) bp=tg5040 ;; esac; \
+			$(MAKE) -s -C "$(BUILDER)" build PLATFORM=$$p PROJECT="$$PWD" \
+				CMD='sh -c "make -C $(2) $(3) platform='$$bp' clean >/dev/null 2>&1; \
+				make -C $(2) $(3) platform='$$bp' -j4 && \
+				cp $(2)/$(1)_libretro.so dist/cores/'$$p'/"' || exit 1; \
+		done
+endef
+
+cores: core-sources cores-gambatte cores-gpsp
 
 cores-gambatte:
 	@test -d "$(GAMBATTE_SRC)" || { echo "missing $(GAMBATTE_SRC)"; exit 1; }
@@ -88,6 +161,24 @@ cores-gpsp:
 		grep -c RFU_PKT_QUEUE_SIZE $(GPSP_SRC)/rfu.c; \
 	done
 
+COMPAT_CORES := fceumm picodrive snes9x mednafen_supafaust pcsx_rearmed gambatte gpsp
+
+compatibility: compatibility-sources cores compatibility-armv7 compatibility-aarch64
+
+compatibility-armv7:
+	@$(MAKE) -s -C "$(BUILDER)" build PLATFORM=my282 PROJECT="$$PWD" \
+		CMD='COMPAT_START=$(COMPAT_START) sh cores/build-compat.sh armv7'
+
+compatibility-aarch64:
+	@$(MAKE) -s -C "$(BUILDER)" build PLATFORM=tg5040 PROJECT="$$PWD" \
+		CMD='COMPAT_START=$(COMPAT_START) sh cores/build-compat.sh aarch64'
+
+check-compatibility:
+	@for arch in armv7 aarch64; do for c in $(COMPAT_CORES); do \
+		test -f dist/compatibility/$$arch/$${c}_libretro.so || { \
+			echo "missing compatibility $$arch/$$c - run 'make compatibility' first"; exit 1; }; \
+	done; done
+
 # The UI needs GFX_/PAD_ from NextUI's common/api.c, which is compiled into
 # minarch and unreachable from the shim - so the app carries its own copy.
 NEXTUI ?= ../../NextUI
@@ -98,7 +189,7 @@ app:
 	@for p in $(PLATFORMS); do \
 		echo "== app $$p"; \
 		$(MAKE) -s -C "$(BUILDER)" build PLATFORM=$$p PROJECT="$$PWD" \
-			CMD='sh -c "cd app && make PLATFORM='$$p' NEXTUI=/opt/nextui-src"' >/dev/null || exit 1; \
+			CMD='sh -c "cd app && make PLATFORM='$$p' NEXTUI=/opt/nextui-src"' || exit 1; \
 	done
 	@ls -la bin/*/netplay.elf | awk '{printf "   %-46s %s bytes\n", $$NF, $$5}'
 
@@ -126,39 +217,68 @@ test:
 # shipped and is the pak's whole UI.)
 ###########################################################
 
-dist: $(addprefix check-shim-,$(PLATFORMS))
-	@rm -rf "$(STAGE)" "$(ARCHIVE)"
-	@mkdir -p "$(STAGE)/$(PAK)/launcher" "$(STAGE)/$(PAK)/state" dist
+BASE_DIST_CHECKS := $(foreach p,$(PLATFORMS),check-shim-$(p) check-app-$(p)) check-netplay-cores
 
-	@cp pak.json "$(STAGE)/$(PAK)/"
-	@cp launcher/pak-launch.sh "$(STAGE)/$(PAK)/launch.sh"
+dist: dist-base dist-compatibility dist-full
+	@echo
+	@du -h "$(BASE_ARCHIVE)" "$(COMPAT_ARCHIVE)" "$(FULL_ARCHIVE)"
+
+dist-base: $(BASE_DIST_CHECKS)
+	@rm -rf "$(BASE_STAGE)" "$(BASE_ARCHIVE)"
+	@mkdir -p "$(BASE_STAGE)/$(PAK)/launcher" "$(BASE_STAGE)/$(PAK)/state" dist
+
+	@cp pak.json "$(BASE_STAGE)/$(PAK)/"
+	@cp launcher/pak-launch.sh "$(BASE_STAGE)/$(PAK)/launch.sh"
 	@cp launcher/minarch.elf launcher/launch-stub.sh launcher/adhoc-join.sh launcher/wifi-watchdog.sh \
 	    launcher/install-stubs.sh launcher/wrap-pak.sh launcher/bind-mount.sh launcher/pre-launch.sh \
-	    "$(STAGE)/$(PAK)/launcher/"
-	@cp launcher/session.conf.example "$(STAGE)/$(PAK)/"
+	    launcher/mount-common.sh \
+	    "$(BASE_STAGE)/$(PAK)/launcher/"
+	@cp launcher/session.conf.example "$(BASE_STAGE)/$(PAK)/"
+	@mkdir -p "$(BASE_STAGE)/$(PAK)/cores/override"
 	@for p in $(PLATFORMS); do \
-		mkdir -p "$(STAGE)/$(PAK)/bin/$$p"; \
-		cp bin/$$p/netplay_shim.so "$(STAGE)/$(PAK)/bin/$$p/"; \
-		cp bin/$$p/netplay.elf "$(STAGE)/$(PAK)/bin/$$p/"; \
-		for c in gambatte gpsp; do \
-			if [ -f dist/cores/$$p/$${c}_libretro.so ]; then \
-				mkdir -p "$(STAGE)/$(PAK)/cores/override/$$p"; \
-				cp dist/cores/$$p/$${c}_libretro.so "$(STAGE)/$(PAK)/cores/override/$$p/"; \
-			fi; \
-		done; \
+		mkdir -p "$(BASE_STAGE)/$(PAK)/cores/override/$$p"; \
+		cp dist/cores/$$p/gambatte_libretro.so dist/cores/$$p/gpsp_libretro.so \
+		   "$(BASE_STAGE)/$(PAK)/cores/override/$$p/"; \
 	done
+	@for p in $(PLATFORMS); do \
+		mkdir -p "$(BASE_STAGE)/$(PAK)/bin/$$p"; \
+		cp bin/$$p/netplay_shim.so "$(BASE_STAGE)/$(PAK)/bin/$$p/"; \
+		cp bin/$$p/netplay.elf "$(BASE_STAGE)/$(PAK)/bin/$$p/"; \
+		done
+	@chmod 755 "$(BASE_STAGE)/$(PAK)/launch.sh" "$(BASE_STAGE)/$(PAK)/launcher"/*
+	@find "$(BASE_STAGE)" -name '.DS_Store' -delete
+	@cd "$(BASE_STAGE)" && zip -q -r "../Netplay.pak.zip" "$(PAK)" -x '*/.*'
 
-	@chmod 755 "$(STAGE)/$(PAK)/launch.sh" "$(STAGE)/$(PAK)/launcher"/*
-	@find "$(STAGE)" -name '.DS_Store' -delete
+dist-compatibility: check-compatibility
+	@rm -rf "$(COMPAT_STAGE)" "$(COMPAT_ARCHIVE)"
+	@mkdir -p "$(COMPAT_STAGE)/$(PAK)/cores/compatibility"
+	@cp -R dist/compatibility/armv7 dist/compatibility/aarch64 \
+		"$(COMPAT_STAGE)/$(PAK)/cores/compatibility/"
+	@cp cores/compatibility-platforms.txt "$(COMPAT_STAGE)/$(PAK)/cores/compatibility/PLATFORMS.txt"
+	@cd "$(COMPAT_STAGE)" && zip -q -r "../compatibility-cores.zip" "$(PAK)" -x '*/.*'
 
-	@cd "$(STAGE)" && zip -q -r "../$(PAK).zip" "$(PAK)" -x '*/.*'
-	@echo
-	@echo "$(ARCHIVE)  ($$(du -h "$(ARCHIVE)" | cut -f1))"
-	@unzip -l "$(ARCHIVE)" | tail -n +4 | head -n -2
+dist-full: dist-base check-compatibility
+	@rm -rf "$(FULL_STAGE)" "$(FULL_ARCHIVE)"
+	@cp -a "$(BASE_STAGE)" "$(FULL_STAGE)"
+	@mkdir -p "$(FULL_STAGE)/$(PAK)/cores/compatibility"
+	@cp -R dist/compatibility/armv7 dist/compatibility/aarch64 \
+		"$(FULL_STAGE)/$(PAK)/cores/compatibility/"
+	@cp cores/compatibility-platforms.txt "$(FULL_STAGE)/$(PAK)/cores/compatibility/PLATFORMS.txt"
+	@cd "$(FULL_STAGE)" && zip -q -r "../Netplay-Full.pak.zip" "$(PAK)" -x '*/.*'
+
+check-netplay-cores:
+	@for p in $(PLATFORMS); do for c in gambatte gpsp; do \
+		test -f dist/cores/$$p/$${c}_libretro.so || { \
+			echo "missing netplay core $$p/$$c - run 'make cores' first"; exit 1; }; \
+	done; done
 
 check-shim-%:
 	@test -f bin/$*/netplay_shim.so || { \
 		echo "missing bin/$*/netplay_shim.so - run 'make shim' first"; exit 1; }
+
+check-app-%:
+	@test -f bin/$*/netplay.elf || { \
+		echo "missing bin/$*/netplay.elf - run 'make app' first"; exit 1; }
 
 clean:
 	rm -rf dist

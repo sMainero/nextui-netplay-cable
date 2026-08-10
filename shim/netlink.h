@@ -61,6 +61,10 @@ uint16_t NetLink_remoteClientId(void);
 bool NetLink_consumeConnectEvent(void);
 bool NetLink_consumeDisconnectEvent(void);
 
+/* Increments after every successful TCP greeting. The emulator thread uses it
+ * to distinguish a replacement process from the peer it originally synced. */
+uint32_t NetLink_connectionGeneration(void);
+
 bool NetLink_send(int flags, const void* buf, size_t len, uint16_t client_id);
 
 /* Called once per frame from retro_run. When the frontend stops calling it -
@@ -112,12 +116,37 @@ bool NetLink_takeState(void** data, size_t* len);  /* caller frees */
 /* Periodic agreement check. Without it a divergence is silent and the two
  * games quietly tell different stories. */
 void NetLink_sendHash(uint32_t frame, uint32_t hash);
-/* Reserved frame number for the core-identity hash, so it cannot be confused
- * with - or overwritten by - a divergence hash. */
-#define NETLINK_IDENTITY_FRAME 0xFFFFFFFFu
-
 bool NetLink_takeHash(uint32_t* frame, uint32_t* hash);
-bool NetLink_takeIdentity(uint32_t* identity);
+
+typedef struct {
+	uint8_t  rom_sha256[32];
+	uint32_t core_identity;
+	uint32_t state_size;
+	uint32_t sram_size;
+	uint32_t rtc_size;
+} NetLinkSessionIdentity;
+
+/* Sent afresh on each TCP connection, before any serialized state is accepted. */
+bool NetLink_sendSessionIdentity(const NetLinkSessionIdentity* identity);
+bool NetLink_takeSessionIdentity(NetLinkSessionIdentity* identity);
+
+/* The guest confirms the result of each periodic comparison. The host only
+ * promotes the candidate snapshot after a matching acknowledgement. */
+bool NetLink_ackCheckpoint(uint32_t frame, uint32_t hash, bool matched);
+bool NetLink_takeCheckpointAck(uint32_t* frame, uint32_t* hash, bool* matched);
+
+/* Authoritative-state recovery. The client requests it after a confirmed hash
+ * mismatch. The host brackets a state transfer with BEGIN, waits for the
+ * client's load ACK, then releases both timelines with COMMIT. Epochs make a
+ * delayed control packet from an abandoned attempt harmless. */
+bool NetLink_requestResync(uint32_t frame);
+bool NetLink_takeResyncRequest(uint32_t* frame);
+bool NetLink_beginResync(uint32_t epoch, uint32_t resume_frame);
+bool NetLink_takeResyncBegin(uint32_t* epoch, uint32_t* resume_frame);
+bool NetLink_ackResync(uint32_t epoch, bool loaded);
+bool NetLink_takeResyncAck(uint32_t* epoch, bool* loaded);
+bool NetLink_commitResync(uint32_t epoch);
+bool NetLink_takeResyncCommit(uint32_t* epoch);
 
 /* --- core sharing -------------------------------------------------------
  *
@@ -134,6 +163,7 @@ bool NetLink_takeIdentity(uint32_t* identity);
  * The hard limit is architecture: a 32-bit ARM device cannot load an AArch64
  * object. That is checked before any transfer is attempted.
  */
+#if 0 /* Frozen: never accept executable code from an unauthenticated peer. */
 #define NETLINK_MAX_CORE (24u * 1024u * 1024u)
 
 /* Identifies a build well enough to know whether two differ. Machine is the
@@ -171,6 +201,7 @@ bool NetLink_peerCoreId(NetLinkCoreId* out);
 
 bool NetLink_sendCore(const void* data, size_t len);
 bool NetLink_takeCore(void** data, size_t* len);   /* caller frees */
+#endif
 
 /* Copy the oldest queued packet out. False when the queue is empty. */
 bool NetLink_popPacket(void* out, size_t out_cap, size_t* out_len);

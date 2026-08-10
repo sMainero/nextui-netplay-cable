@@ -254,12 +254,11 @@ void NS_wifiPowerSaveRestore(void) {
 
 const char* const NS_INST_CORE[NS_INST_CORES] = { "gambatte", "gpsp", "mgba" };
 
-/* Defaults chosen so a fresh install behaves the way most pairs will want:
- * sharing on, because a build mismatch is otherwise a dead end the user cannot
- * diagnose; the other two off, because they change what the device does rather
- * than just how well it does it. */
+/* Executable sharing is frozen and therefore defaults off. Compatibility cores
+ * are local, pinned artifacts and are the safe default fallback. */
 static NS_Settings ns_set = {
-	.share_cores   = true,
+	.share_cores   = false,
+	.compatibility_cores = true,
 	.simple_client = false,
 	.instanced     = NS_INST_OFF,
 	.inst_core     = { false, false, false },
@@ -268,6 +267,10 @@ static bool ns_set_loaded = false;
 
 static void settings_path(char* out, int len) {
 	snprintf(out, len, "%s/state/settings", ns_pak);
+}
+
+static const char* compatibility_arch(void) {
+	return !strcmp(ns_platform, "my282") ? "armv7" : "aarch64";
 }
 
 NS_Settings* NS_settings(void) {
@@ -294,6 +297,7 @@ void NS_settingsLoad(void) {
 		int v = atoi(eq + 1);
 
 		if      (!strcmp(k, "share_cores"))   ns_set.share_cores = v != 0;
+		else if (!strcmp(k, "compatibility_cores")) ns_set.compatibility_cores = v != 0;
 		else if (!strcmp(k, "simple_client")) ns_set.simple_client = v != 0;
 		else if (!strcmp(k, "instanced"))
 			ns_set.instanced = (v < 0 || v > NS_INST_SELECTED) ? NS_INST_OFF : (NS_InstMode)v;
@@ -319,6 +323,7 @@ void NS_settingsSave(void) {
 	FILE* f = fopen(tmp, "w");
 	if (!f) { ns_log("cannot write settings\n"); return; }
 	fprintf(f, "share_cores=%d\n",   ns_set.share_cores ? 1 : 0);
+	fprintf(f, "compatibility_cores=%d\n", ns_set.compatibility_cores ? 1 : 0);
 	fprintf(f, "simple_client=%d\n", ns_set.simple_client ? 1 : 0);
 	fprintf(f, "instanced=%d\n",     (int)ns_set.instanced);
 	for (int i = 0; i < NS_INST_CORES; i++)
@@ -336,7 +341,8 @@ bool NS_coreInstalled(const char* core) {
 	snprintf(p, sizeof(p), "%s/.system/%s/cores/%s_libretro.so", ns_sd, ns_platform, core);
 	if (file_exists(p)) return true;
 
-	snprintf(p, sizeof(p), "%s/cores/override/%s/%s_libretro.so", ns_pak, ns_platform, core);
+	snprintf(p, sizeof(p), "%s/cores/compatibility/%s/%s_libretro.so",
+	         ns_pak, compatibility_arch(), core);
 	if (file_exists(p)) return true;
 
 	char cmd[768];
@@ -423,23 +429,31 @@ static bool scan_core_file(const char* path, NS_CoreInfo* out) {
 
 /* library_version without a ROM. */
 static void probe_version(const char* path, char* out, int len) {
+	struct core_system_info {
+		const char* name;
+		const char* version;
+		const char* extensions;
+		bool need_fullpath;
+		bool block_extract;
+	};
 	out[0] = '\0';
 	void* h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 	if (!h) { ns_log("manifest: %s will not load here (%s)\n", path, dlerror()); return; }
-	void (*gsi)(struct { const char* n; const char* v; const char* e; char pad[64]; }*);
+	void (*gsi)(struct core_system_info*);
 	*(void**)&gsi = dlsym(h, "retro_get_system_info");
 	if (gsi) {
-		struct { const char* n; const char* v; const char* e; char pad[64]; } i;
+		struct core_system_info i;
 		memset(&i, 0, sizeof(i));
 		gsi(&i);
-		if (i.v) snprintf(out, len, "%s", i.v);
+		if (i.version) snprintf(out, len, "%s", i.version);
 	}
 	dlclose(h);
 }
 
-static bool core_path(const char* core, char* out, int len) {
-	snprintf(out, len, "%s/cores/override/%s/%s_libretro.so", ns_pak, ns_platform, core);
-	if (file_exists(out)) return true;
+/* The device's installed core is always considered first. Compatibility cores
+ * are deliberately excluded here; otherwise merely bundling one would make it
+ * look like the device was already using it. */
+static bool installed_core_path(const char* core, char* out, int len) {
 	snprintf(out, len, "%s/.system/%s/cores/%s_libretro.so", ns_sd, ns_platform, core);
 	if (file_exists(out)) return true;
 
@@ -459,17 +473,37 @@ static bool core_path(const char* core, char* out, int len) {
 	return ok;
 }
 
+static bool compatibility_core_path(const char* core, char* out, int len) {
+	snprintf(out, len, "%s/cores/compatibility/%s/%s_libretro.so",
+	         ns_pak, compatibility_arch(), core);
+	return file_exists(out);
+}
+
 int NS_coreManifest(NS_CoreInfo* out, int max) {
 	int n = 0;
 	for (size_t i = 0; i < sizeof(MANIFEST_CORES)/sizeof(MANIFEST_CORES[0]) && n < max; i++) {
-		char path[256];
-		if (!core_path(MANIFEST_CORES[i], path, sizeof(path))) continue;
-
 		memset(&out[n], 0, sizeof(out[n]));
 		snprintf(out[n].core, sizeof(out[n].core), "%s", MANIFEST_CORES[i]);
-		snprintf(out[n].path, sizeof(out[n].path), "%s", path);
-		if (!scan_core_file(path, &out[n])) continue;
-		probe_version(path, out[n].version, sizeof(out[n].version));
+
+		char path[256];
+		if (installed_core_path(MANIFEST_CORES[i], path, sizeof(path))) {
+			snprintf(out[n].path, sizeof(out[n].path), "%s", path);
+			if (scan_core_file(path, &out[n])) {
+				probe_version(path, out[n].version, sizeof(out[n].version));
+				out[n].installed = true;
+			}
+		}
+
+		if (compatibility_core_path(MANIFEST_CORES[i], path, sizeof(path))) {
+			NS_CoreInfo compat;
+			memset(&compat, 0, sizeof(compat));
+			if (scan_core_file(path, &compat)) {
+				probe_version(path, out[n].compat_version, sizeof(out[n].compat_version));
+				out[n].compat_available = out[n].compat_version[0] != '\0';
+			}
+		}
+
+		if (!out[n].installed && !out[n].compat_available) continue;
 		n++;
 	}
 	ns_log("manifest: %d core(s), runtime glibc %u.%u\n",
@@ -478,23 +512,22 @@ int NS_coreManifest(NS_CoreInfo* out, int max) {
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// core exchange
+// core compatibility negotiation
 //////////////////////////////////////////////////////////////////////////////
 
-#define CORE_MAGIC 0x4E50434Du   /* 'NPCM' */
-#define CORE_OP_DONE 0
-#define CORE_OP_GET  1
-#define CORE_OP_PUT  2
+#define CORE_MAGIC 0x4E504332u   /* 'NPC2': metadata-only compatibility protocol */
 #define CORE_IO_MS   30000
-#define CORE_MAX_BYTES (24u * 1024u * 1024u)
 
 typedef struct __attribute__((packed)) {
 	char     core[32];
 	char     version[32];
+	char     compat_version[32];
 	uint32_t crc;
 	uint32_t size;
 	uint32_t glibc;
 	uint16_t machine;
+	uint8_t  installed;
+	uint8_t  compat_available;
 } CoreWire;
 
 static int core_listen_fd = -1;
@@ -523,40 +556,33 @@ static bool io_all(int fd, void* buf, size_t len, bool writing) {
 	return true;
 }
 
-static void staged_dir(char* out, int len) {
-	snprintf(out, len, "%s/cores/staged", ns_pak);
-}
-
-void NS_coreStagedClear(void) {
-	char cmd[600], dir[512];
-	staged_dir(dir, sizeof(dir));
-	snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
-	system(cmd);
-}
-
 static bool send_manifest(int fd, NS_CoreInfo* m, int n) {
-	uint32_t hdr[3] = { htonl(CORE_MAGIC), htonl((uint32_t)n), htonl(NS_runtimeGlibc()) };
+	uint32_t hdr[3] = { htonl(CORE_MAGIC), htonl((uint32_t)n),
+	                    htonl(NS_settings()->compatibility_cores ? 1u : 0u) };
 	if (!io_all(fd, hdr, sizeof(hdr), true)) return false;
 	for (int i = 0; i < n; i++) {
 		CoreWire w;
 		memset(&w, 0, sizeof(w));
 		snprintf(w.core, sizeof(w.core), "%s", m[i].core);
 		snprintf(w.version, sizeof(w.version), "%s", m[i].version);
+		snprintf(w.compat_version, sizeof(w.compat_version), "%s", m[i].compat_version);
 		w.crc = htonl(m[i].crc);
 		w.size = htonl(m[i].size);
 		w.glibc = htonl(m[i].glibc);
 		w.machine = htons(m[i].machine);
+		w.installed = m[i].installed ? 1 : 0;
+		w.compat_available = m[i].compat_available ? 1 : 0;
 		if (!io_all(fd, &w, sizeof(w), true)) return false;
 	}
 	return true;
 }
 
-static int recv_manifest(int fd, NS_CoreInfo* out, int max, uint32_t* peer_runtime) {
+static int recv_manifest(int fd, NS_CoreInfo* out, int max, bool* peer_compat_enabled) {
 	uint32_t hdr[3];
 	if (!io_all(fd, hdr, sizeof(hdr), false)) return -1;
 	if (ntohl(hdr[0]) != CORE_MAGIC) return -1;
 	int n = (int)ntohl(hdr[1]);
-	*peer_runtime = ntohl(hdr[2]);
+	*peer_compat_enabled = ntohl(hdr[2]) != 0;
 	if (n < 0 || n > NS_MAX_MANIFEST) return -1;
 
 	int kept = 0;
@@ -566,13 +592,17 @@ static int recv_manifest(int fd, NS_CoreInfo* out, int max, uint32_t* peer_runti
 		if (kept >= max) continue;
 		w.core[sizeof(w.core) - 1] = '\0';
 		w.version[sizeof(w.version) - 1] = '\0';
+		w.compat_version[sizeof(w.compat_version) - 1] = '\0';
 		memset(&out[kept], 0, sizeof(out[kept]));
 		snprintf(out[kept].core, sizeof(out[kept].core), "%s", w.core);
 		snprintf(out[kept].version, sizeof(out[kept].version), "%s", w.version);
+		snprintf(out[kept].compat_version, sizeof(out[kept].compat_version), "%s", w.compat_version);
 		out[kept].crc = ntohl(w.crc);
 		out[kept].size = ntohl(w.size);
 		out[kept].glibc = ntohl(w.glibc);
 		out[kept].machine = ntohs(w.machine);
+		out[kept].installed = w.installed != 0;
+		out[kept].compat_available = w.compat_available != 0;
 		kept++;
 	}
 	return kept;
@@ -583,10 +613,93 @@ static NS_CoreInfo* find_core(NS_CoreInfo* m, int n, const char* name) {
 	return NULL;
 }
 
+static bool installed_builds_match(const char* core, const NS_CoreInfo* a, const NS_CoreInfo* b) {
+	if (!a || !b || !a->installed || !b->installed) return false;
+	/* Link cores need the pak's networking fixes, not merely the same upstream
+	 * revision on both devices. A system core carrying the same marked build is
+	 * fine; an unmarked stock build is not feature-compatible. */
+	if (!strcmp(core, "gambatte") || !strcmp(core, "gpsp")) {
+		if (!a->compat_available || !b->compat_available ||
+		    strcmp(a->version, a->compat_version) || strcmp(b->version, b->compat_version))
+			return false;
+	}
+	if (a->version[0] && b->version[0]) return !strcmp(a->version, b->version);
+	return a->machine == b->machine && a->size == b->size && a->crc == b->crc;
+}
+
+static bool compatibility_builds_match(const NS_CoreInfo* a, const NS_CoreInfo* b) {
+	return a && b && a->compat_available && b->compat_available &&
+	       a->compat_version[0] && !strcmp(a->compat_version, b->compat_version);
+}
+
+/* Rewrite only the generated compatibility selections, preserving role,
+ * transport and hand-edited options. Both copies must agree because the
+ * launcher reads state/session while session.conf is the durable template. */
+static bool write_compat_file(const char* path, const char selected[][32], int count) {
+	char tmp[560];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	FILE* in = fopen(path, "r");
+	if (!in) return false;
+	FILE* out = fopen(tmp, "w");
+	if (!out) { fclose(in); return false; }
+
+	char line[512];
+	while (fgets(line, sizeof(line), in))
+		if (strncmp(line, "compat_core.", 12)) fputs(line, out);
+	for (int i = 0; i < count; i++) fprintf(out, "compat_core.%s=1\n", selected[i]);
+
+	fclose(in);
+	if (fclose(out) != 0 || rename(tmp, path) != 0) {
+		remove(tmp);
+		return false;
+	}
+	return true;
+}
+
+static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, int tn,
+								bool peer_enabled) {
+	char selected[NS_MAX_MANIFEST][32];
+	int count = 0;
+	bool enabled = NS_settings()->compatibility_cores && peer_enabled;
+
+	for (size_t i = 0; i < sizeof(MANIFEST_CORES) / sizeof(MANIFEST_CORES[0]); i++) {
+		NS_CoreInfo* a = find_core(mine, mn, MANIFEST_CORES[i]);
+		NS_CoreInfo* b = find_core(theirs, tn, MANIFEST_CORES[i]);
+		if (installed_builds_match(MANIFEST_CORES[i], a, b)) {
+			ns_log("%s: installed builds match; keeping them\n", MANIFEST_CORES[i]);
+			continue;
+		}
+		if (enabled && compatibility_builds_match(a, b)) {
+			snprintf(selected[count++], sizeof(selected[0]), "%s", MANIFEST_CORES[i]);
+			ns_log("%s: installed builds differ; both will use compatibility cores\n",
+			       MANIFEST_CORES[i]);
+		} else if (a && b && (a->installed || b->installed)) {
+			ns_log("%s: installed builds differ and no common compatibility core is enabled\n",
+			       MANIFEST_CORES[i]);
+		}
+	}
+
+	char path[512];
+	snprintf(path, sizeof(path), "%s/session.conf", ns_pak);
+	if (!write_compat_file(path, selected, count)) {
+		ns_log("cannot update compatibility selections in session.conf\n");
+		return -1;
+	}
+	snprintf(path, sizeof(path), "%s/state/session", ns_pak);
+	if (!write_compat_file(path, selected, count)) {
+		ns_log("cannot update compatibility selections in active session\n");
+		/* Do not leave a durable selection that disagrees with the active file. */
+		snprintf(path, sizeof(path), "%s/session.conf", ns_pak);
+		write_compat_file(path, selected, 0);
+		return -1;
+	}
+	return count;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // host side
 
-void NS_coreServeStart(void) {
+void NS_compatServeStart(void) {
 	if (core_listen_fd >= 0) return;
 
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -606,14 +719,14 @@ void NS_coreServeStart(void) {
 		return;
 	}
 	core_listen_fd = fd;
-	ns_log("core exchange listening on %d\n", NS_CORE_PORT);
+	ns_log("core compatibility negotiation listening on %d\n", NS_CORE_PORT);
 }
 
-void NS_coreServeStop(void) {
+void NS_compatServeStop(void) {
 	if (core_listen_fd >= 0) { close(core_listen_fd); core_listen_fd = -1; }
 }
 
-void NS_coreServeTick(void) {
+void NS_compatServeTick(void) {
 	if (core_listen_fd < 0) return;
 
 	int fd = accept(core_listen_fd, NULL, NULL);
@@ -623,14 +736,24 @@ void NS_coreServeTick(void) {
 	int n = NS_coreManifest(mine, NS_MAX_MANIFEST);
 
 	NS_CoreInfo theirs[NS_MAX_MANIFEST];
-	uint32_t peer_runtime = 0;
-	if (recv_manifest(fd, theirs, NS_MAX_MANIFEST, &peer_runtime) < 0 ||
+	bool peer_compat_enabled = false;
+	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST, &peer_compat_enabled);
+	if (tn < 0 ||
 	    !send_manifest(fd, mine, n)) {
-		ns_log("core exchange: manifest failed\n");
+		ns_log("core compatibility negotiation: manifest failed\n");
 		close(fd);
 		return;
 	}
+	int selected = select_compatibility(mine, n, theirs, tn, peer_compat_enabled);
+	if (selected < 0)
+		ns_log("core compatibility negotiation: could not activate selections\n");
+	else
+		ns_log("core compatibility negotiation: %d fallback(s) selected\n", selected);
 
+	/* Frozen core-sharing implementation. Executable files must never be
+	 * accepted from an unauthenticated peer. Kept here, excluded from the build,
+	 * so the setting and its former implementation can be revisited together. */
+#if 0
 	/* Serve requests until the client says it is done. The client drives,
 	 * because it is the side that knows what it could not load. */
 	for (;;) {
@@ -682,16 +805,16 @@ void NS_coreServeTick(void) {
 			free(buf);
 		} else break;
 	}
+#endif
 	close(fd);
 }
 
 //////////////////////////////////////////////////////////////////////////////
 // client side
 
-/* Decide, per core, what has to happen. Same rules the shim applies at launch,
- * made once here instead: identical revision needs nothing, and whoever can
- * actually load the other's file is what decides who donates. */
-int NS_coreSync(const char* host_ip, char* err, int errlen) {
+/* Compare installed builds first, then select the pak fallback on both sides
+ * only when both settings and both local compatibility artifacts permit it. */
+int NS_compatSync(const char* host_ip, char* err, int errlen) {
 	NS_CoreInfo mine[NS_MAX_MANIFEST];
 	int n = NS_coreManifest(mine, NS_MAX_MANIFEST);
 	if (n <= 0) { snprintf(err, errlen, "no cores found locally"); return -1; }
@@ -720,19 +843,28 @@ int NS_coreSync(const char* host_ip, char* err, int errlen) {
 	}
 
 	NS_CoreInfo theirs[NS_MAX_MANIFEST];
-	uint32_t peer_runtime = 0;
-	if (!send_manifest(fd, mine, n) ||
-	    recv_manifest(fd, theirs, NS_MAX_MANIFEST, &peer_runtime) < 0) {
+	bool peer_compat_enabled = false;
+	if (!send_manifest(fd, mine, n)) {
 		close(fd);
 		snprintf(err, errlen, "manifest exchange failed");
 		return -1;
 	}
-	int tn = 0;
-	for (int i = 0; i < NS_MAX_MANIFEST; i++) if (theirs[i].core[0]) tn = i + 1;
+	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST, &peer_compat_enabled);
+	if (tn < 0) {
+		close(fd);
+		snprintf(err, errlen, "manifest exchange failed");
+		return -1;
+	}
 
+	int selected = select_compatibility(mine, n, theirs, tn, peer_compat_enabled);
+	if (selected < 0)
+		snprintf(err, errlen, "cannot activate core selection");
+
+	/* Frozen peer-to-peer executable transfer. Compatibility negotiation above
+	 * exchanges metadata only and selects local, packaged artifacts. */
+#if 0
 	uint32_t my_runtime = NS_runtimeGlibc();
 	int staged = 0, attempted = 0;
-
 	for (int i = 0; i < n; i++) {
 		NS_CoreInfo* t = find_core(theirs, tn, mine[i].core);
 		if (!t || !t->version[0]) continue;                 /* peer lacks it */
@@ -809,10 +941,14 @@ int NS_coreSync(const char* host_ip, char* err, int errlen) {
 
 	uint8_t done = CORE_OP_DONE;
 	io_all(fd, &done, 1, true);
+	(void)my_runtime;
+	(void)attempted;
+#endif
 	close(fd);
 
-	ns_log("core sync: %d of %d mismatched core(s) resolved\n", staged, attempted);
-	return staged;
+	if (selected >= 0)
+		ns_log("core compatibility negotiation: %d fallback(s) selected\n", selected);
+	return selected;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -870,9 +1006,10 @@ int NS_runChecks(NS_Check* out, int max, NS_CheckResult* worst) {
 		char probe[512];
 		snprintf(probe, sizeof(probe), "%s/Emus/%s", ns_sd, ns_platform);
 		mkdir(probe, 0755);
+		bool writable = access(probe, W_OK) == 0;
 		add(out, &n, max,
-		    file_exists(probe) ? NS_CHECK_OK : NS_CHECK_FAIL,
-		    "SD pak override", file_exists(probe) ? "path writable" : "cannot create");
+		    writable ? NS_CHECK_OK : NS_CHECK_FAIL,
+		    "SD pak override", writable ? "path writable" : "cannot create or write");
 	}
 
 	/* 3. core.name is basename truncated at the last underscore, and it feeds
@@ -938,15 +1075,32 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	 * of them to whichever mode was picked before a game was even chosen.
 	 * Hand-editing mode=netplay or mode=link into this file still overrides. */
 
+	/* A new arm must never inherit a checkpoint from an older play session of
+	 * the same ROM. The identifier is local to each device; it only namespaces
+	 * that device's /tmp checkpoint and therefore need not be negotiated. */
+	unsigned char nonce[16];
+	memset(nonce, 0, sizeof(nonce));
+	FILE* random = fopen("/dev/urandom", "rb");
+	size_t random_bytes = 0;
+	if (random) { random_bytes = fread(nonce, 1, sizeof(nonce), random); fclose(random); }
+	if (random_bytes != sizeof(nonce)) {
+		struct timeval now;
+		gettimeofday(&now, NULL);
+		memcpy(nonce, &now, sizeof(now) < sizeof(nonce) ? sizeof(now) : sizeof(nonce));
+		nonce[sizeof(nonce) - 1] ^= (unsigned char)getpid();
+	}
+	for (size_t i = 0; i < sizeof(nonce); i++) fprintf(f, i ? "%02x" : "session_id=%02x", nonce[i]);
+	fputc('\n', f);
+
 	/* Sized for the transport actually in use. Both sides reach the same answer
 	 * because a client only holds an ad hoc address when it joined this host's
 	 * network, and the host only serves one when it is hosting ad hoc. */
 	bool adhoc = hotspot_running || joined_hotspot;
 	fprintf(f, "input_delay=%d\n", adhoc ? NS_INPUT_DELAY_ADHOC : NS_INPUT_DELAY_WIFI);
 
-	/* The shim decides core sharing before it opens the core, long before it
-	 * could ask the app anything - so the answer travels in the session file. */
+	/* Kept in the session format while peer executable sharing is frozen. */
 	fprintf(f, "share_cores=%d\n", NS_settings()->share_cores ? 1 : 0);
+	fprintf(f, "compatibility_cores=%d\n", NS_settings()->compatibility_cores ? 1 : 0);
 
 	/* Record the ad hoc network so the launch stub can put us back on it. The
 	 * join done here does not survive the app exiting - the platform brings its
@@ -1031,8 +1185,8 @@ void NS_disarm(void) {
 	         ns_sd, ns_platform, ns_sd, ns_platform, ns_sd, ns_platform, ns_pak);
 	system(cmd);
 
-	snprintf(cmd, sizeof(cmd), "rm -f '%s/state/session' '%s/state/force-shim'; rm -rf '%s/cores/staged'",
-	         ns_pak, ns_pak, ns_pak);
+	snprintf(cmd, sizeof(cmd), "rm -f '%s/state/session' '%s/state/force-shim'",
+	         ns_pak, ns_pak);
 	system(cmd);
 
 	NS_hotspotStop();
@@ -1047,8 +1201,7 @@ void NS_disarm(void) {
  * instead of a full reinstall across every Emus pak. */
 void NS_endSession(void) {
 	char cmd[1200];
-	snprintf(cmd, sizeof(cmd), "rm -f '%s/state/session'; rm -rf '%s/cores/staged'",
-	         ns_pak, ns_pak);
+	snprintf(cmd, sizeof(cmd), "rm -f '%s/state/session'", ns_pak);
 	system(cmd);
 
 	/* A session is a network arrangement as much as a file. Ending one has to

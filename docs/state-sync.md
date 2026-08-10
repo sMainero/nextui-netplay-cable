@@ -98,16 +98,54 @@ its own footprint.
 
 Anything touching state during a session must preserve these:
 
-1. **Both sides call `serialize` the same number of times, at the same frames.**
-   Not "roughly" — exactly.
+1. **Outside an authoritative-state transaction, both sides call `serialize`
+   the same number of times, at the same frames.** Not "roughly" — exactly.
 2. **Both sides reach a shared starting state via the same `unserialize` call.**
    Sending bytes one way is not enough.
 3. **Diagnostics are not free.** A probe that serializes must undo itself, or run
    on both sides identically.
-4. **A frontend-initiated `unserialize` mid-session breaks lockstep.** Already
-   detected via `shim_owns_unserialize` and logged.
+4. **Every authoritative transfer ends with both sides loading the same blob.**
+   This erases serialization side effects on the host and makes the recovered
+   state independent of either device's prior trajectory.
+5. **Frontend save states are unavailable while a session is armed.** The shim
+   still calls the wrapped core's serialization functions directly for initial
+   synchronization and acknowledged desync recovery.
+6. **Only the host persists shared-screen SRAM/RTC.** Every authoritative blob
+   includes the raw save-memory regions; the guest uses them in memory but
+   exposes no persistent memory to its frontend.
 
-## A bug that hid the evidence
+## Identity, confirmed checkpoints, and process rejoin
+
+These mechanisms apply only to shared-screen lockstep netplay. Link-cable play
+continues to exchange the cores' native serial/RFU traffic and never loads a
+peer emulator state.
+
+Before accepting any state on each TCP connection, both sides require an exact
+match on the SHA-256 of loaded ROM content (including files referenced by
+CUE/M3U), core identity, serialized-state size, SRAM size and RTC size. A
+mismatch fails closed before either core advances or calls `unserialize`.
+Protocol version 7 makes an
+older shim fail the greeting rather than misread these messages.
+
+Every 300 frames the host retains the exact authoritative bundle it hashed as a
+*candidate*. The bundle contains serialized state plus raw SRAM and RTC, so a
+checkpoint or rejoin does not depend on whether a particular core happens to
+include persistent memory in `retro_serialize`.
+The guest hashes at the same frame and reports agreement. Only an exact
+frame/hash match promotes the candidate, using write + `fsync` + atomic rename
+to `/tmp/netplay-host-<session-id>.state`. A new arm generates a new session ID,
+so an earlier play session cannot be resumed accidentally. The file carries the
+ROM hash, core identity, state size, frame and a checksum, all revalidated before
+loading. `/tmp` survives an emulator-process crash but not a reboot and avoids
+SD-card writes.
+
+On guest restart, the still-running host sends its current state. On host
+restart, the new host loads its last confirmed checkpoint and sends that same
+blob to the surviving guest; both may rewind by at most 300 frames. Both paths
+use the BEGIN/state/ACK/COMMIT barrier, reset queued input, and jump the frame
+namespace so delayed packets from the abandoned timeline cannot collide.
+
+## A bug that hid the evidence (protocols before version 6)
 
 The core-identity hash was sent as `CMD_HASH` frame 0. `netplay_checkDivergence`
 also sends a state hash at frame 0, since `0 % HASH_INTERVAL == 0`. Only the most
@@ -116,8 +154,9 @@ identity against a state hash.
 
 Every `core identity differs` message logged before this was fixed is
 meaningless. It caused a picodrive rebuild that was not needed for the reason it
-was done. Identity now travels on `IDENTITY_FRAME` (`0xFFFFFFFF`), which also
-frees frame 0 to be compared and reported directly:
+was done. Identity first moved to a reserved hash frame. Protocol 6 removes that
+overload entirely: ROM/core/state identity has its own message, while frame 0 is
+only a state agreement check:
 
 ```
 state at frame 0: ours XXXXXXXX, host YYYYYYYY - handshake equalised both sides
@@ -326,10 +365,8 @@ making the two devices treat a badly behaved core identically.
 
 ### Still open
 
-- The client drains the incoming hash slot only every `HASH_INTERVAL` frames, and
-  the slot holds one value, so a hash can be overwritten before it is read.
-  Checkpoints at 1200, 2100 and 2700 went unreported in the run above. Cosmetic —
-  fewer comparisons, no false verdicts — but a short queue would recover them.
+- The client now queues eight incoming hash checkpoints, so a late arrival no
+  longer overwrites an older one before the emulator thread can compare it.
 - Cross-device determinism is confirmed at 600 frames. The 1800-frame comparison
   was started but never finished; the Brick produced `ae8a2b95` and the A30 leg
   did not complete.

@@ -61,6 +61,18 @@ expect "core:netpacket_refused"
 grep -q "RESULT: ok" "$OUT/trace" || { echo "  MISS assertions passed"; fail=1; }
 
 echo
+echo "== an active session hides frontend save-state support"
+printf 'role=host\nport=55991\nmode=link\n' > "$OUT/session"
+NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/session" \
+	HARNESS_EXPECT_NO_STATES=1 "$OUT/harness" "$SHIM" > "$OUT/session-state" 2>&1 || {
+	cat "$OUT/session-state"; echo "  MISS active-session state policy"; fail=1
+}
+grep -q "frontend save-state load blocked during session" "$OUT/session-state" \
+	&& grep -q "RESULT: ok" "$OUT/session-state" \
+	&& echo "  ok   save, load, auto-resume and autosave are unavailable" \
+	|| { echo "  MISS active-session state policy"; fail=1; }
+
+echo
 echo "== fails loudly with no real core"
 if NETPLAY_REAL_CORE= "$OUT/harness" "$SHIM" >"$OUT/nocore" 2>&1; then
 	echo "  MISS expected non-zero exit"

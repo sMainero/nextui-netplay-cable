@@ -52,6 +52,7 @@
 
 NP="$SDCARD_PATH/Tools/$PLATFORM/Netplay.pak"
 STAGE="$NP/mounts"
+MOUNT_STAGE="$STAGE"
 MANIFEST="$NP/state/mounts.list"
 SYS_EMUS="$SYSTEM_PATH/paks/Emus"
 AUTO="$USERDATA_PATH/auto.sh"
@@ -59,32 +60,10 @@ AUTO="$USERDATA_PATH/auto.sh"
 MARKER="Installed by Netplay.pak"
 HOOK_TAG="Netplay.pak-on-boot"
 
-NETPLAY_CORES="fbneo fceumm snes9x snes9x2005 mednafen_supafaust picodrive pcsx_rearmed gpsp gambatte"
-
 log() { echo "[netplay-mount] $*"; }
 
-# Report every supported core a launch.sh could select. Two shapes exist:
-# tg5040/tg5050 assign EMU_EXE at the top level, my282 selects it inside a case
-# statement over EMU_TAG, so the match cannot be anchored to line start.
-launch_cores() {
-	_found=""
-	for _e in $(sed -n 's/.*EMU_EXE=\([A-Za-z0-9_]*\).*/\1/p' "$1" | sort -u); do
-		core_is_supported "$_e" && _found="$_found $_e"
-	done
-	echo "$_found" | sed 's/^ *//'
-}
-
-core_is_supported() {
-	_exe="$1"
-	for _c in $NETPLAY_CORES; do
-		[ "$_exe" = "$_c" ] && return 0
-	done
-	return 1
-}
-
-is_mounted() {
-	grep -q " $(echo "$1" | sed 's/ /\\040/g') " /proc/mounts 2>/dev/null
-}
+[ -f "$NP/launcher/mount-common.sh" ] || { log "missing mount-common.sh"; exit 1; }
+. "$NP/launcher/mount-common.sh"
 
 # A system pak we can cover: real pak, has a launch.sh, selects a core the shim
 # knows how to drive.
@@ -98,20 +77,9 @@ coverable() {
 		[ -d "$_pak" ] || continue
 		[ -f "$_pak/launch.sh" ] || continue
 
-		if is_mounted "$_pak"; then echo "$_pak"; continue; fi
-		[ -n "$(launch_cores "$_pak/launch.sh")" ] && echo "$_pak"
+		if mount_is_mounted "$_pak"; then echo "$_pak"; continue; fi
+		[ -n "$(mount_launch_cores "$_pak/launch.sh")" ] && echo "$_pak"
 	done
-}
-
-fingerprint() { ( cd "$1" && ls -la ) 2>/dev/null; }
-
-# The staged copy goes stale if NextUI updates the pak underneath us. Mounting a
-# stale copy would silently run last month's launch script.
-needs_resync() {
-	_dst="$STAGE/$(basename "$1" .pak).pak"
-	[ -d "$_dst" ] || return 0
-	[ -f "$_dst/.source-fingerprint" ] || return 0
-	[ "$(fingerprint "$1")" != "$(cat "$_dst/.source-fingerprint")" ]
 }
 
 ###########################################################
@@ -120,7 +88,7 @@ do_sync() {
 	# Staging reads the originals, so nothing may be shadowing them - and an
 	# rm -rf through a live mount would delete the real pak.
 	for _pak in $(coverable); do
-		if is_mounted "$_pak"; then
+		if mount_is_mounted "$_pak"; then
 			log "refusing to sync while mounted - run 'down' first"
 			return 1
 		fi
@@ -132,31 +100,10 @@ do_sync() {
 		_tag="$(basename "$_pak" .pak)"
 		_dst="$STAGE/$_tag.pak"
 
-		rm -rf "$_dst"
-		mkdir -p "$_dst"
-		cp -a "$_pak"/. "$_dst"/ 2>/dev/null || { log "copy failed for $_tag"; continue; }
-
-		mv "$_dst/launch.sh" "$_dst/launch.sh.old" || { log "no launch.sh for $_tag"; continue; }
-		chmod 755 "$_dst/launch.sh.old"
-
-		# $0 stays at the pak's real path under the mount, so the original can
-		# be run from $(dirname $0) and everything it derives stays correct.
-		{
-			echo "#!/bin/sh"
-			echo "# $MARKER - wraps $_tag, original preserved as launch.sh.old"
-			echo "# This file exists only inside a bind mount; the pak on disk is unchanged."
-			echo "DIR=\"\$(dirname \"\$0\")\""
-			echo "NETPLAY_PAK=\"$NP\""
-			echo "export NETPLAY_PAK"
-			echo "[ -f \"\$NETPLAY_PAK/launcher/pre-launch.sh\" ] && . \"\$NETPLAY_PAK/launcher/pre-launch.sh\""
-			echo "exec \"\$DIR/launch.sh.old\" \"\$@\""
-		} > "$_dst/launch.sh"
-		chmod 755 "$_dst/launch.sh"
-
-		fingerprint "$_pak" > "$_dst/.source-fingerprint"
+		mount_stage_pak "$_pak" || { log "copy failed for $_tag"; continue; }
 
 		_n=$((_n + 1))
-		log "staged $_tag ($(launch_cores "$_dst/launch.sh.old"))"
+		log "staged $_tag ($(mount_launch_cores "$_dst/launch.sh.old"))"
 	done
 	log "$_n pak(s) staged"
 }
@@ -164,11 +111,6 @@ do_sync() {
 # Refuse to mount anything we are not certain about. A bad mount does not fail
 # visibly - it makes one system stop launching games, which is worse than not
 # covering it.
-staged_ok() {
-	[ -d "$1" ] && [ -f "$1/launch.sh" ] && [ -f "$1/launch.sh.old" ] \
-		&& grep -q "$MARKER" "$1/launch.sh" 2>/dev/null
-}
-
 do_up() {
 	command -v mount >/dev/null 2>&1 || { log "no mount available"; return 1; }
 
@@ -183,23 +125,31 @@ do_up() {
 
 	mkdir -p "$(dirname "$MANIFEST")"
 	_n=0
+	_owned=0
 	_fail=0
 	for _pak in $(coverable); do
 		_tag="$(basename "$_pak" .pak)"
 		_dst="$STAGE/$_tag.pak"
 
-		is_mounted "$_pak" && { log "$_tag already up"; continue; }
+		if mount_is_mounted "$_pak"; then
+			if mount_is_ours "$_pak"; then
+				_owned=$((_owned + 1)); log "$_tag already up"
+			else
+				_fail=$((_fail + 1)); log "$_tag mounted by another tool - leaving it alone"
+			fi
+			continue
+		fi
 
-		if ! staged_ok "$_dst"; then
+		if ! mount_staged_ok "$_dst"; then
 			log "$_tag not staged - run 'sync' first"
 			_fail=$((_fail + 1))
 			continue
 		fi
-		if needs_resync "$_pak"; then
+		if mount_needs_resync "$_pak"; then
 			log "$_tag changed on disk - restaging"
 			rm -rf "$_dst"
 			do_sync >/dev/null 2>&1
-			staged_ok "$_dst" || { log "$_tag restage failed - skipping"; _fail=$((_fail + 1)); continue; }
+			mount_staged_ok "$_dst" || { log "$_tag restage failed - skipping"; _fail=$((_fail + 1)); continue; }
 		fi
 
 		if mount --bind "$_dst" "$_pak" 2>/dev/null; then
@@ -213,30 +163,19 @@ do_up() {
 	done
 
 	[ -f "$MANIFEST.new" ] && mv "$MANIFEST.new" "$MANIFEST" || : > "$MANIFEST"
-	log "$_n pak(s) mounted${_fail:+, $_fail not covered}"
+	[ "$_fail" -gt 0 ] && log "$_n pak(s) mounted, $_fail not covered" || log "$_n pak(s) mounted"
 
 	# Cover EXTRAS paks that own their SD path too, so one command means "all
 	# netplay-capable systems are wrapped" rather than "some of them are".
 	[ -x "$NP/launcher/wrap-pak.sh" ] && "$NP/launcher/wrap-pak.sh" up
 
-	[ "$_n" -gt 0 ] && return 0
+	[ $((_n + _owned)) -gt 0 ] && return 0
 	return 1
 }
 
 do_down() {
-	_n=0
-	# Walk the filesystem, not the manifest: a mount we lost track of still has
-	# to come down, and a manifest entry that is already unmounted is harmless.
-	for _pak in "$SYS_EMUS"/*.pak; do
-		[ -d "$_pak" ] || continue
-		is_mounted "$_pak" || continue
-		if umount "$_pak" 2>/dev/null; then
-			_n=$((_n + 1))
-			log "down $(basename "$_pak" .pak)"
-		else
-			log "could not unmount $(basename "$_pak" .pak)"
-		fi
-	done
+	mount_down_owned "$SYS_EMUS"
+	_n=$MOUNT_DOWN_COUNT
 	rm -f "$MANIFEST"
 	log "$_n pak(s) unmounted"
 
@@ -259,6 +198,19 @@ do_boot() {
 	[ -d "$STAGE" ] || exit 0
 	do_up >/dev/null 2>&1
 	exit 0
+}
+
+# `up` is safe to repeat. Once our mounts are live the originals are shadowed,
+# so syncing is both unnecessary and unsafe; mount only any missing targets.
+do_activate() {
+	for _pak in "$SYS_EMUS"/*.pak; do
+		[ -d "$_pak" ] || continue
+		if mount_is_ours "$_pak"; then
+			do_up && do_hook_install
+			return $?
+		fi
+	done
+	do_sync && do_up && do_hook_install
 }
 
 ###########################################################
@@ -301,10 +253,10 @@ do_status() {
 		&& log "boot hook: installed" || log "boot hook: absent"
 	for _pak in $(coverable); do
 		_tag="$(basename "$_pak" .pak)"
-		if is_mounted "$_pak"; then
+		if mount_is_mounted "$_pak"; then
 			log "up       $_tag"
 		elif [ -d "$STAGE/$_tag.pak" ]; then
-			needs_resync "$_pak" && log "stale    $_tag" || log "staged   $_tag"
+			mount_needs_resync "$_pak" && log "stale    $_tag" || log "staged   $_tag"
 		else
 			log "unstaged $_tag"
 		fi
@@ -313,7 +265,7 @@ do_status() {
 
 case "$1" in
 	sync)        do_sync ;;
-	up)          do_sync && do_up && do_hook_install ;;
+	up)          do_activate ;;
 	down)        do_down; do_hook_remove ;;
 	boot)        do_boot ;;
 	status)      do_status ;;

@@ -23,13 +23,14 @@ check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; 
 # --- fake SD card ---------------------------------------------------------
 mkdir -p "$USERDATA_PATH" "$SYSTEM_PATH/bin" "$SYSTEM_PATH/cores" "$NP/launcher" "$NP/bin/$PLATFORM" "$NP/state"
 cp "$HERE/launch-stub.sh" "$HERE/install-stubs.sh" "$HERE/minarch.elf" "$HERE/wrap-pak.sh" \
-   "$HERE/bind-mount.sh" "$HERE/pre-launch.sh" "$NP/launcher/"
+   "$HERE/bind-mount.sh" "$HERE/mount-common.sh" "$HERE/pre-launch.sh" "$NP/launcher/"
 chmod 755 "$NP/launcher"/*
 : > "$NP/bin/$PLATFORM/netplay_shim.so"
 
 # A stand-in minarch that just reports the arguments and env it was handed.
 cat > "$SYSTEM_PATH/bin/minarch.elf" <<'EOF'
 #!/bin/sh
+[ "$NETPLAY_COMPAT_CORE" = "1" ] && echo "compat=1"
 echo "minarch core=$1 rom=$2 real=$NETPLAY_REAL_CORE session=$NETPLAY_SESSION"
 EOF
 chmod 755 "$SYSTEM_PATH/bin/minarch.elf"
@@ -117,6 +118,12 @@ check "routes through shim" "$OUT" \
 [ -f "$NP/cores/gpsp_libretro.so" ] && ok "shim staged under the real core's filename" \
 	|| bad "shim not staged as gpsp_libretro.so"
 
+# A normal launch must not rewrite the same shared object to the SD card.
+SHIM_INODE=$(ls -i "$NP/cores/gpsp_libretro.so" | awk '{print $1}')
+OUT=$(NETPLAY_SESSION=/tmp/session "$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
+check "unchanged shim is not copied again" \
+	"$(ls -i "$NP/cores/gpsp_libretro.so" | awk '{print $1}')" "$SHIM_INODE"
+
 echo
 echo "== shim staging preserves core.name"
 # minarch: basename truncated at the last underscore -> feeds config_dir/states_dir
@@ -143,19 +150,34 @@ OUT=$("$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
 check "clearing it restores stock" "$OUT" "minarch core=$SYSTEM_PATH/cores/gpsp_libretro.so rom=/roms/game.gba real= session="
 
 echo
-echo "== a pak-supplied core replaces the system one"
-# NextUI builds gambatte without HAVE_NETWORK, so Game Link is compiled out and
-# no configuration can restore it. The pak ships its own build instead.
-mkdir -p "$NP/cores/override/$PLATFORM"
+echo "== mandatory link cores and compatibility fallback"
+mkdir -p "$NP/cores/override/$PLATFORM" "$NP/cores/compatibility/aarch64"
 echo "pretend network-enabled core" > "$NP/cores/override/$PLATFORM/gpsp_libretro.so"
-OUT=$(NETPLAY_SESSION=/tmp/session "$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
+echo "pretend compatibility core" > "$NP/cores/compatibility/aarch64/fceumm_libretro.so"
+printf 'role=host\nport=55437\n' > "$ROOT/compat.session"
+OUT=$(NETPLAY_SESSION="$ROOT/compat.session" "$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
 echo "$OUT" | grep -q "real=$NP/cores/override/$PLATFORM/gpsp_libretro.so" \
-	&& ok "override core used as the real core" || bad "override ignored: $OUT"
+	&& ok "packaged gpSP used for link implementation" || bad "packaged gpSP ignored: $OUT"
+echo "$OUT" | grep -q "compat=1" \
+	&& ok "packaged-core launch is marked" || bad "compatibility environment missing: $OUT"
 echo "$OUT" | grep -q "core=$NP/cores/gpsp_libretro.so" \
 	&& ok "shim still staged under the real core name" || bad "shim name wrong: $OUT"
-rm -rf "$NP/cores/override"
-OUT=$(NETPLAY_SESSION=/tmp/session "$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba 2>&1)
-echo "$OUT" | grep -q "real=$SYSTEM_PATH/cores/gpsp_libretro.so" \
+
+# Other cores stay on the installed build until the setup negotiation selects
+# the matching compatibility build on both devices.
+OUT=$(NETPLAY_SESSION="$ROOT/compat.session" "$NP/launcher/minarch.elf" \
+	"$SYSTEM_PATH/cores/fceumm_libretro.so" /roms/game.nes 2>&1)
+echo "$OUT" | grep -q "real=$SYSTEM_PATH/cores/fceumm_libretro.so" \
+	&& ok "installed core remains first choice" || bad "compatibility core used eagerly: $OUT"
+printf 'compat_core.fceumm=1\n' >> "$ROOT/compat.session"
+OUT=$(NETPLAY_SESSION="$ROOT/compat.session" "$NP/launcher/minarch.elf" \
+	"$SYSTEM_PATH/cores/fceumm_libretro.so" /roms/game.nes 2>&1)
+echo "$OUT" | grep -q "real=$NP/cores/compatibility/aarch64/fceumm_libretro.so" \
+	&& ok "selected compatibility core used" || bad "compatibility fallback ignored: $OUT"
+rm -rf "$NP/cores/compatibility"
+OUT=$(NETPLAY_SESSION="$ROOT/compat.session" "$NP/launcher/minarch.elf" \
+	"$SYSTEM_PATH/cores/fceumm_libretro.so" /roms/game.nes 2>&1)
+echo "$OUT" | grep -q "real=$SYSTEM_PATH/cores/fceumm_libretro.so" \
 	&& ok "falls back to the system core" || bad "no fallback: $OUT"
 
 echo
@@ -252,6 +274,24 @@ printf '#!/bin/sh\nEMU_EXE=gpsp\necho updated\n' > "$SYSTEM_PATH/paks/Emus/GBA.p
 chmod 755 "$SYSTEM_PATH/paks/Emus/GBA.pak/launch.sh"
 "$NP/launcher/bind-mount.sh" status 2>&1 | grep -q "stale    GBA" \
 	&& ok "pak updated underneath is reported stale" || bad "stale staging not detected"
+
+echo
+echo "== bind-mount: mount ownership"
+# Teardown must distinguish our exact stage source from a foreign bind mount.
+OWN_TARGET="$SYSTEM_PATH/paks/Emus/GB.pak"
+OWN_SOURCE="$NP/mounts/GB.pak"
+FOREIGN_TARGET="$SYSTEM_PATH/paks/Emus/GBA.pak"
+MOUNTS_FIXTURE="$ROOT/proc-mounts"
+printf '%s %s none rw 0 0\n' "$OWN_SOURCE" "$OWN_TARGET" > "$MOUNTS_FIXTURE"
+printf '%s %s none rw 0 0\n' "$ROOT/other/GBA.pak" "$FOREIGN_TARGET" >> "$MOUNTS_FIXTURE"
+NETPLAY_MOUNTS_FILE="$MOUNTS_FIXTURE"
+export NETPLAY_MOUNTS_FILE
+MOUNT_STAGE="$NP/mounts"
+MARKER="Installed by Netplay.pak"
+. "$NP/launcher/mount-common.sh"
+mount_is_ours "$OWN_TARGET" && ok "recognises Netplay-owned mount" || bad "owned mount not recognised"
+mount_is_ours "$FOREIGN_TARGET" && bad "foreign mount claimed as ours" || ok "foreign mount left unowned"
+unset NETPLAY_MOUNTS_FILE
 
 echo
 echo "== bind-mount: boot hook"

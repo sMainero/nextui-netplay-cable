@@ -1,0 +1,15 @@
+diff --git a/deps/libchdr/deps/lzma-24.05/src/CpuArch.c b/deps/libchdr/deps/lzma-24.05/src/CpuArch.c
+index 0af9e26..a68146b 100644
+--- a/deps/libchdr/deps/lzma-24.05/src/CpuArch.c
++++ b/deps/libchdr/deps/lzma-24.05/src/CpuArch.c
+@@ -791,7 +791,10 @@ BoolInt CPU_IsSupported_AES (void) { return APPLE_CRYPTO_SUPPORT_VAL; }
+ #endif
+ 
+-#ifdef Z7_GETAUXV_AVAILABLE
++#if defined(Z7_GETAUXV_AVAILABLE) && \
++   (!defined(MY_CPU_ARM) || \
++    (defined(HWCAP2_CRC32) && defined(HWCAP2_SHA1) && \
++     defined(HWCAP2_SHA2) && defined(HWCAP2_AES)))
+ // #pragma message("=== Z7_GETAUXV_AVAILABLE === ")
+ #include <sys/auxv.h>
+ #define USE_HWCAP

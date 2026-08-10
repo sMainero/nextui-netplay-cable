@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "libretro.h"
 
@@ -20,6 +21,9 @@ static retro_input_poll_t         cb_input_poll;
 static retro_input_state_t        cb_input_state;
 
 static unsigned char state_blob[16];
+static unsigned char save_ram[16];
+static unsigned char rtc_ram[8];
+static unsigned core_runs;
 
 //////////////////////////////////////////////////////////////////////////////
 // netpacket - what gpsp/gambatte use for link play
@@ -80,6 +84,12 @@ void retro_set_input_state(retro_input_state_t cb)               { HIT("set_inpu
 
 void retro_init(void) {
 	HIT("init");
+	memset(state_blob, 0xAB, sizeof(state_blob));
+	memset(save_ram, getenv("FAKE_SRAM_BYTE") ? atoi(getenv("FAKE_SRAM_BYTE")) : 0x51,
+	       sizeof(save_ram));
+	memset(rtc_ram, getenv("FAKE_RTC_BYTE") ? atoi(getenv("FAKE_RTC_BYTE")) : 0x52,
+	       sizeof(rtc_ram));
+	core_runs = 0;
 	// Report what the frontend (or the shim) gives us for a core option, the way
 	// gpSP reads gpsp_serial to decide its link mode.
 	struct retro_variable var = { "gpsp_serial", NULL };
@@ -87,6 +97,19 @@ void retro_init(void) {
 		printf("core:option gpsp_serial=%s\n", var.value);
 	else
 		printf("core:option gpsp_serial=<unset>\n");
+	if (getenv("FAKE_CORE_NAME") && strstr(getenv("FAKE_CORE_NAME"), "PCSX")) {
+		const char* keys[] = { "pcsx_rearmed_memcard1", "pcsx_rearmed_memcard2" };
+		for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+			struct retro_variable pc = { keys[i], NULL };
+			if (cb_environment(RETRO_ENVIRONMENT_GET_VARIABLE, &pc) && pc.value)
+				printf("core:option %s=%s\n", keys[i], pc.value);
+			else
+				printf("core:option %s=<unset>\n", keys[i]);
+		}
+		const char* save_dir = NULL;
+		if (cb_environment(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir) && save_dir)
+			printf("core:save_directory=%s\n", save_dir);
+	}
 }
 void retro_deinit(void) { HIT("deinit"); }
 
@@ -122,6 +145,13 @@ void retro_reset(void) { HIT("reset"); }
 
 void retro_run(void) {
 	HIT("run");
+	state_blob[1]++;
+	const char* corrupt_at = getenv("FAKE_CORE_CORRUPT_AT");
+	if (corrupt_at && core_runs == (unsigned)atoi(corrupt_at)) {
+		state_blob[2] ^= 0x5A;
+		printf("core:state_corrupted run=%u\n", core_runs);
+	}
+	core_runs++;
 
 	// FAKE_CORE_BLOCK_AT/_MS reproduce a link-capable core blocking inside
 	// retro_run while it waits on its peer, as gambatte's NetSerial does.
@@ -172,6 +202,8 @@ void retro_run(void) {
 		input_sum ^= (unsigned)p1; input_sum *= 16777619u;
 		if (++shown % 100 == 0) printf("core:inputsum frames=%d sum=%08x\n", shown, input_sum);
 	}
+	if (core_runs <= 3)
+		printf("core:persistent sram=%u rtc=%u\n", save_ram[0], rtc_ram[0]);
 
 	static const int16_t frame[240 * 160];
 	cb_video_refresh(frame, 240, 160, 240 * sizeof(int16_t));
@@ -186,7 +218,6 @@ size_t retro_serialize_size(void) { HIT("serialize_size"); return sizeof(state_b
 bool retro_serialize(void* data, size_t size) {
 	HIT("serialize");
 	if (size < sizeof(state_blob)) return false;
-	memset(state_blob, 0xAB, sizeof(state_blob));
 	memcpy(data, state_blob, sizeof(state_blob));
 	return true;
 }
@@ -206,5 +237,15 @@ bool retro_load_game_special(unsigned t, const struct retro_game_info* i, size_t
 void retro_unload_game(void) { HIT("unload_game"); }
 
 unsigned retro_get_region(void) { HIT("get_region"); return RETRO_REGION_NTSC; }
-void* retro_get_memory_data(unsigned id) { HIT("get_memory_data"); return state_blob; }
-size_t retro_get_memory_size(unsigned id) { HIT("get_memory_size"); return sizeof(state_blob); }
+void* retro_get_memory_data(unsigned id) {
+	HIT("get_memory_data");
+	if (id == RETRO_MEMORY_SAVE_RAM) return save_ram;
+	if (id == RETRO_MEMORY_RTC) return rtc_ram;
+	return NULL;
+}
+size_t retro_get_memory_size(unsigned id) {
+	HIT("get_memory_size");
+	if (id == RETRO_MEMORY_SAVE_RAM) return sizeof(save_ram);
+	if (id == RETRO_MEMORY_RTC) return sizeof(rtc_ram);
+	return 0;
+}

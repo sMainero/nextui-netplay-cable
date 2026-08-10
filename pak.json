@@ -6,7 +6,7 @@
   "author": "bmpriest",
   "release_filename": "Netplay.pak.zip",
   "changelog": {
-    "v2.0.0-test": "Rewritten on a libretro shim - no patched system binaries. Ad hoc networking, core sharing between devices, bind-mounted pak wrapping, WiFi recovery. Adds my282, my355 and h700."
+    "v2.0.0-test": "Libretro shim, ad hoc networking, local compatibility-core fallback, bind-mounted pak wrapping, and WiFi recovery. Adds my282, my355 and h700."
   },
   "platforms": [
     "tg5040",

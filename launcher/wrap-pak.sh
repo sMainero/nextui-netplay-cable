@@ -34,35 +34,14 @@
 
 NP="$SDCARD_PATH/Tools/$PLATFORM/Netplay.pak"
 STAGE="$NP/wrapped"
+MOUNT_STAGE="$STAGE"
 SD_EMUS="$SDCARD_PATH/Emus/$PLATFORM"
 MARKER="Installed by Netplay.pak"
 
-NETPLAY_CORES="fbneo fceumm snes9x snes9x2005 mednafen_supafaust picodrive pcsx_rearmed gpsp gambatte"
-
 log() { echo "[netplay-wrap] $*"; }
 
-# Report every supported core a launch.sh could select. Two shapes exist:
-# tg5040/tg5050 assign EMU_EXE at the top level, my282 selects it inside a case
-# statement over EMU_TAG, so the match cannot be anchored to line start.
-launch_cores() {
-	_found=""
-	for _e in $(sed -n 's/.*EMU_EXE=\([A-Za-z0-9_]*\).*/\1/p' "$1" | sort -u); do
-		core_is_supported "$_e" && _found="$_found $_e"
-	done
-	echo "$_found" | sed 's/^ *//'
-}
-
-core_is_supported() {
-	_exe="$1"
-	for _c in $NETPLAY_CORES; do
-		[ "$_exe" = "$_c" ] && return 0
-	done
-	return 1
-}
-
-is_mounted() {
-	grep -q " $(echo "$1" | sed 's/ /\\040/g') " /proc/mounts 2>/dev/null
-}
+[ -f "$NP/launcher/mount-common.sh" ] || { log "missing mount-common.sh"; exit 1; }
+. "$NP/launcher/mount-common.sh"
 
 # Paks on the SD path that we could wrap: real pak, supported core, not already
 # one of our own stubs.
@@ -72,16 +51,16 @@ wrappable() {
 		_launch="$_pak/launch.sh"
 		[ -f "$_launch" ] || continue
 		grep -q "$MARKER" "$_launch" 2>/dev/null && continue
-		is_mounted "$_pak" && { echo "$_pak"; continue; }
+		mount_is_mounted "$_pak" && { echo "$_pak"; continue; }
 
-		[ -n "$(launch_cores "$_launch")" ] && echo "$_pak"
+		[ -n "$(mount_launch_cores "$_launch")" ] && echo "$_pak"
 	done
 }
 
 do_sync() {
 	# Staging reads the originals, so nothing may be shadowing them.
 	for _pak in $(wrappable); do
-		if is_mounted "$_pak"; then
+		if mount_is_mounted "$_pak"; then
 			log "refusing to sync while mounted - run 'down' first"
 			return 1
 		fi
@@ -93,28 +72,7 @@ do_sync() {
 		_tag="$(basename "$_pak" .pak)"
 		_dst="$STAGE/$_tag.pak"
 
-		rm -rf "$_dst"
-		mkdir -p "$_dst"
-		cp -a "$_pak"/. "$_dst"/ 2>/dev/null || { log "copy failed for $_tag"; continue; }
-
-		mv "$_dst/launch.sh" "$_dst/launch.sh.old"
-		chmod 755 "$_dst/launch.sh.old"
-
-		{
-			echo "#!/bin/sh"
-			echo "# $MARKER - wraps $_tag, original preserved as launch.sh.old"
-			echo "DIR=\"\$(dirname \"\$0\")\""
-			echo "NETPLAY_PAK=\"$NP\""
-			echo "export NETPLAY_PAK"
-			# Was PATH-only, so a wrapped EXTRAS pak never disabled power save
-			# and never re-joined the ad hoc network - the stub route did both.
-			echo "[ -f \"\$NETPLAY_PAK/launcher/pre-launch.sh\" ] && . \"\$NETPLAY_PAK/launcher/pre-launch.sh\""
-			echo "exec \"\$DIR/launch.sh.old\" \"\$@\""
-		} > "$_dst/launch.sh"
-		chmod 755 "$_dst/launch.sh"
-
-		# Fingerprint the original so a later sync can tell it changed.
-		( cd "$_pak" && ls -la ) > "$_dst/.source-fingerprint" 2>/dev/null
+		mount_stage_pak "$_pak" || { log "copy failed for $_tag"; continue; }
 
 		_n=$((_n + 1))
 		log "staged $_tag ($(du -sh "$_dst" 2>/dev/null | cut -f1))"
@@ -122,31 +80,30 @@ do_sync() {
 	log "$_n pak(s) staged"
 }
 
-# The staged copy goes stale if the pak is updated underneath us.
-needs_resync() {
-	_pak="$1"
-	_dst="$STAGE/$(basename "$_pak" .pak).pak"
-	[ -d "$_dst" ] || return 0
-	[ -f "$_dst/.source-fingerprint" ] || return 0
-	_now="$( cd "$_pak" && ls -la 2>/dev/null )"
-	[ "$_now" != "$(cat "$_dst/.source-fingerprint")" ]
-}
-
 do_up() {
 	command -v mount >/dev/null 2>&1 || { log "no mount available"; return 1; }
 
 	_n=0
+	_owned=0
+	_fail=0
 	for _pak in $(wrappable); do
 		_tag="$(basename "$_pak" .pak)"
 		_dst="$STAGE/$_tag.pak"
 
-		is_mounted "$_pak" && { log "$_tag already up"; continue; }
+		if mount_is_mounted "$_pak"; then
+			if mount_is_ours "$_pak"; then
+				_owned=$((_owned + 1)); log "$_tag already up"
+			else
+				_fail=$((_fail + 1)); log "$_tag mounted by another tool - leaving it alone"
+			fi
+			continue
+		fi
 
 		if [ ! -d "$_dst" ]; then
 			log "$_tag not staged - run 'sync' first"
 			continue
 		fi
-		if needs_resync "$_pak"; then
+		if mount_needs_resync "$_pak"; then
 			log "$_tag changed on disk - run 'down' then 'sync'"
 			continue
 		fi
@@ -158,40 +115,43 @@ do_up() {
 			log "could not mount $_tag (needs root?)"
 		fi
 	done
-	log "$_n pak(s) mounted"
+	[ "$_fail" -gt 0 ] && log "$_n pak(s) mounted, $_fail not covered" || log "$_n pak(s) mounted"
+	[ $((_n + _owned)) -gt 0 ]
 }
 
 do_down() {
-	_n=0
-	for _pak in "$SD_EMUS"/*.pak; do
-		[ -d "$_pak" ] || continue
-		is_mounted "$_pak" || continue
-		if umount "$_pak" 2>/dev/null; then
-			_n=$((_n + 1))
-			log "down $(basename "$_pak" .pak)"
-		else
-			log "could not unmount $(basename "$_pak" .pak)"
-		fi
-	done
+	mount_down_owned "$SD_EMUS"
+	_n=$MOUNT_DOWN_COUNT
 	log "$_n pak(s) unmounted"
 }
 
 do_status() {
 	for _pak in $(wrappable); do
 		_tag="$(basename "$_pak" .pak)"
-		if is_mounted "$_pak"; then
+		if mount_is_mounted "$_pak"; then
 			log "up      $_tag"
 		elif [ -d "$STAGE/$_tag.pak" ]; then
-			needs_resync "$_pak" && log "stale   $_tag" || log "staged  $_tag"
+			mount_needs_resync "$_pak" && log "stale   $_tag" || log "staged  $_tag"
 		else
 			log "unstaged $_tag"
 		fi
 	done
 }
 
+do_activate() {
+	for _pak in "$SD_EMUS"/*.pak; do
+		[ -d "$_pak" ] || continue
+		if mount_is_ours "$_pak"; then
+			do_up
+			return $?
+		fi
+	done
+	do_sync && do_up
+}
+
 case "$1" in
 	sync)   do_sync ;;
-	up)     do_up ;;
+	up)     do_activate ;;
 	down)   do_down ;;
 	status) do_status ;;
 	*)      echo "usage: $0 sync|up|down|status" >&2; exit 2 ;;

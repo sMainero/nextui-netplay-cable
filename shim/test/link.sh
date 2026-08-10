@@ -15,8 +15,12 @@ cd "$(dirname "$0")"
 
 CC="${CC:-cc}"
 OUT=$(mktemp -d)
-PORT=${PORT:-45437}
-trap 'kill $HOST_PID $CLIENT_PID 2>/dev/null || true; rm -rf "$OUT"' EXIT
+PORT=${PORT:-$((40000 + ($$ % 20000)))}
+cleanup() {
+	kill $HOST_PID $CLIENT_PID 2>/dev/null || true
+	if [ -n "$KEEP_TEST_OUTPUT" ]; then echo "test logs kept at $OUT"; else rm -rf "$OUT"; fi
+}
+trap cleanup EXIT
 
 echo "== building"
 (cd .. && make native >/dev/null)
@@ -254,18 +258,32 @@ PORT7=$((PORT + 6))
 printf 'role=host\nport=%s\nmode=netplay\n'                  "$PORT7" > "$OUT/h7.session"
 printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=netplay\n' "$PORT7" > "$OUT/c7.session"
 
-HARNESS_BUTTONS=17 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h7.session" \
+FAKE_CORE_NAME=PCSX-ReARMed FAKE_SRAM_BYTE=17 FAKE_RTC_BYTE=18 \
+	HARNESS_EXPECT_CORE_NAME=PCSX-ReARMed HARNESS_BUTTONS=17 \
+	NETPLAY_COMPAT_CORE=1 HARNESS_EXPECT_NO_STATES=1 \
+	NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h7.session" \
 	"$OUT/harness" "$SHIM" 400 10 > "$OUT/h7.log" 2>&1 &
 H7=$!
 sleep 0.5
-HARNESS_BUTTONS=34 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c7.session" \
+FAKE_CORE_NAME=PCSX-ReARMed FAKE_SRAM_BYTE=99 FAKE_RTC_BYTE=100 \
+	HARNESS_EXPECT_CORE_NAME=PCSX-ReARMed HARNESS_BUTTONS=34 \
+	NETPLAY_COMPAT_CORE=1 HARNESS_EXPECT_NO_STATES=1 \
+	HARNESS_EXPECT_NO_PERSISTENCE=1 \
+	NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c7.session" \
 	"$OUT/harness" "$SHIM" 400 10 > "$OUT/c7.log" 2>&1 &
 C7=$!
 wait $H7 2>/dev/null || true
 wait $C7 2>/dev/null || true
 
-expect "$OUT/h7.log" "sent .* byte state"    "host shipped its state"
-expect "$OUT/c7.log" "adopted .* byte state" "client adopted it"
+expect "$OUT/h7.log" "authoritative initial state sent" "host shipped its state"
+expect "$OUT/c7.log" "authoritative resync .* adopted"  "client adopted it"
+expect "$OUT/h7.log" "RESULT: ok" "frontend states blocked without breaking netplay state sync"
+expect "$OUT/c7.log" "RESULT: ok" "guest SRAM and RTC are hidden from frontend persistence"
+expect "$OUT/h7.log" "core:option pcsx_rearmed_memcard1=libretro" "PCSX card 1 is frontend-managed"
+expect "$OUT/h7.log" "core:option pcsx_rearmed_memcard2=none" "PCSX card 2 is disabled for the session"
+expect "$OUT/c7.log" "core:persistent sram=17 rtc=18" "guest adopted host raw SRAM and RTC"
+expect "$OUT/h7.log" "core:save_directory=/tmp$" "host core keeps the frontend save directory"
+expect "$OUT/c7.log" "core:save_directory=/tmp/netplay-guest-" "guest core-managed saves are volatile"
 
 # Host holds 17, client holds 34. Both must see the same pairing: p0 is the
 # host's input, p1 the client's, on both devices.
@@ -289,6 +307,118 @@ if grep -q "DESYNC" "$OUT/h7.log" "$OUT/c7.log"; then
 	fail=1
 else
 	echo "  ok   no divergence reported"
+fi
+
+echo
+echo "== a desync is recovered from the host's authoritative state"
+PORT11=$((PORT + 10))
+printf 'role=host\nport=%s\nmode=netplay\n'                    "$PORT11" > "$OUT/h11.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=netplay\n' "$PORT11" > "$OUT/c11.session"
+
+HARNESS_BUTTONS=17 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
+	NETPLAY_SESSION="$OUT/h11.session" \
+	"$OUT/harness" "$SHIM" 1000 5 > "$OUT/h11.log" 2>&1 &
+H11=$!
+sleep 0.5
+FAKE_CORE_CORRUPT_AT=80 HARNESS_BUTTONS=34 \
+	NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c11.session" \
+	"$OUT/harness" "$SHIM" 1000 5 > "$OUT/c11.log" 2>&1 &
+C11=$!
+wait $H11 2>/dev/null || true
+wait $C11 2>/dev/null || true
+
+expect "$OUT/c11.log" "core:state_corrupted" "client state was deliberately corrupted"
+expect "$OUT/c11.log" "DESYNC at frame" "client detected the divergence"
+expect "$OUT/c11.log" "requested authoritative state" "client requested recovery"
+expect "$OUT/h11.log" "authoritative resync .* sent" "host sent an authoritative snapshot"
+expect "$OUT/c11.log" "authoritative resync .* adopted" "client adopted the snapshot"
+expect "$OUT/h11.log" "authoritative resync .* committed" "host committed the recovered timeline"
+expect "$OUT/c11.log" "authoritative resync .* committed" "client resumed only after commit"
+
+desyncs=$(grep -c "DESYNC at frame" "$OUT/c11.log" || true)
+if [ "$desyncs" -eq 1 ] && grep -Eq "in sync at frame (900|[1-9][0-9]{3,})" "$OUT/c11.log"; then
+	echo "  ok   later checkpoint is synchronized after one recovery"
+else
+	echo "  MISS recovery did not stay synchronized (desyncs=$desyncs)"
+	grep -E "DESYNC|resync|in sync" "$OUT/c11.log" | sed 's/^/       /'
+	fail=1
+fi
+
+echo
+echo "== a restarted guest rejoins the live host"
+PORT12=$((PORT + 11))
+SID12=$(printf '%032x' "$PORT12")
+printf 'role=host\nport=%s\nmode=netplay\nsession_id=%s\n' "$PORT12" "$SID12" > "$OUT/h12.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=netplay\nsession_id=%s\n' "$PORT12" "$SID12" > "$OUT/c12.session"
+
+HARNESS_BUTTONS=17 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h12.session" \
+	"$OUT/harness" "$SHIM" 1700 5 > "$OUT/h12.log" 2>&1 &
+H12=$!
+sleep 0.3
+HARNESS_DIE_AT=450 HARNESS_BUTTONS=34 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
+	NETPLAY_SESSION="$OUT/c12.session" "$OUT/harness" "$SHIM" 900 5 > "$OUT/c12a.log" 2>&1 &
+C12=$!
+wait $C12 2>/dev/null || true
+HARNESS_BUTTONS=34 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c12.session" \
+	"$OUT/harness" "$SHIM" 900 5 > "$OUT/c12b.log" 2>&1 &
+C12=$!
+wait $H12 2>/dev/null || true
+wait $C12 2>/dev/null || true
+
+expect "$OUT/c12a.log" "fe:process_crash" "first guest process crashed"
+expect "$OUT/h12.log" "authoritative live state sent for connection 2" "live host sent current state to replacement guest"
+expect "$OUT/c12b.log" "ROM and core identity match peer" "replacement guest identity was validated"
+expect "$OUT/c12b.log" "authoritative resync .* committed" "replacement guest rejoined"
+expect "$OUT/c12b.log" "core:ports p0=17 p1=34" "replacement guest resumed shared inputs"
+
+echo
+echo "== a restarted host rewinds both peers to its confirmed checkpoint"
+PORT13=$((PORT + 12))
+SID13=$(printf '%032x' "$PORT13")
+printf 'role=host\nport=%s\nmode=netplay\nsession_id=%s\n' "$PORT13" "$SID13" > "$OUT/h13.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=netplay\nsession_id=%s\n' "$PORT13" "$SID13" > "$OUT/c13.session"
+
+HARNESS_DIE_AT=700 HARNESS_BUTTONS=17 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
+	NETPLAY_SESSION="$OUT/h13.session" "$OUT/harness" "$SHIM" 1200 5 > "$OUT/h13a.log" 2>&1 &
+H13=$!
+sleep 0.3
+HARNESS_BUTTONS=34 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c13.session" \
+	"$OUT/harness" "$SHIM" 2000 5 > "$OUT/c13.log" 2>&1 &
+C13=$!
+wait $H13 2>/dev/null || true
+HARNESS_BUTTONS=17 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h13.session" \
+	"$OUT/harness" "$SHIM" 1100 5 > "$OUT/h13b.log" 2>&1 &
+H13=$!
+wait $H13 2>/dev/null || true
+wait $C13 2>/dev/null || true
+
+expect "$OUT/h13a.log" "confirmed host checkpoint promoted at frame [1-9][0-9]*" "guest confirmed a periodic checkpoint"
+expect "$OUT/h13a.log" "fe:process_crash" "first host process crashed"
+expect "$OUT/h13b.log" "restored last confirmed host checkpoint from frame [1-9][0-9]*" "replacement host loaded only the confirmed checkpoint"
+expect "$OUT/h13b.log" "authoritative checkpoint state sent" "replacement host remained authoritative"
+expect "$OUT/c13.log" "connection 2 requires an authoritative sync" "surviving guest detected replacement host"
+expect "$OUT/c13.log" "authoritative resync .* committed" "surviving guest adopted restored host state"
+
+echo
+echo "== ROM-content mismatch is rejected before state loading"
+PORT14=$((PORT + 13))
+printf 'role=host\nport=%s\nmode=netplay\n' "$PORT14" > "$OUT/h14.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=netplay\n' "$PORT14" > "$OUT/c14.session"
+HARNESS_ROM_ID=rom-a NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h14.session" \
+	"$OUT/harness" "$SHIM" 180 5 > "$OUT/h14.log" 2>&1 &
+H14=$!
+sleep 0.2
+HARNESS_ROM_ID=rom-b NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c14.session" \
+	"$OUT/harness" "$SHIM" 180 5 > "$OUT/c14.log" 2>&1 &
+C14=$!
+wait $H14 2>/dev/null || true
+wait $C14 2>/dev/null || true
+expect "$OUT/h14.log" "refusing peer: ROM content hashes differ" "host rejected wrong ROM"
+expect "$OUT/c14.log" "refusing peer: ROM content hashes differ" "guest rejected wrong ROM"
+if grep -q "core:run" "$OUT/h14.log" "$OUT/c14.log"; then
+	echo "  MISS a core advanced despite ROM mismatch"; fail=1
+else
+	echo "  ok   no emulator frame advanced after rejection"
 fi
 
 echo
@@ -397,6 +527,7 @@ echo "== a session still waiting for its peer must present something"
 PORT10=$((PORT + 9))
 printf 'role=host\nport=%s\nmode=netplay\n' "$PORT10" > "$OUT/w1.session"
 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/w1.session" \
+	NETPLAY_NEGOTIATE_TIMEOUT_MS=100 \
 	"$OUT/harness" "$SHIM" 120 15 > "$OUT/w1.log" 2>&1 || true
 
 w1_video=$(sed -n 's/.*fe:totals video=\([0-9]*\).*/\1/p' "$OUT/w1.log")
@@ -418,8 +549,9 @@ PORT9=$((PORT + 8))
 mode_case() { # <tag> <core name> <mode line, or empty> <expected mode> <expected source>
 	printf 'role=host\nport=%s\n' "$PORT9" > "$OUT/$1.session"
 	[ -n "$3" ] && echo "$3" >> "$OUT/$1.session"
-	FAKE_CORE_NAME="$2" NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
-		NETPLAY_SESSION="$OUT/$1.session" \
+		FAKE_CORE_NAME="$2" NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
+			NETPLAY_NEGOTIATE_TIMEOUT_MS=100 \
+			NETPLAY_SESSION="$OUT/$1.session" \
 		"$OUT/harness" "$SHIM" 5 15 > "$OUT/$1.log" 2>&1 || true
 	expect "$OUT/$1.log" "mode=$4 for .* ($5)" "$2${3:+ + $3} -> $4 ($5)"
 }

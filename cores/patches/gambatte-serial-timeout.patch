@@ -1,0 +1,44 @@
+Give NetSerial's blocking read a deadline so a vanished peer cannot wedge the
+emulator thread and, with it, frontend input polling.
+
+--- a/libgambatte/libretro/net_serial.cpp
++++ b/libgambatte/libretro/net_serial.cpp
+@@ -12,9 +12,22 @@
+ #include <sys/socket.h>
+ #include <sys/ioctl.h>
++#include <sys/time.h>
+ #include <netinet/in.h>
+ #include <netdb.h>
+ #endif
+ 
++#ifndef _WIN32
++static void netserial_set_recv_deadline(int fd)
++{
++	struct timeval tv;
++	tv.tv_sec = 2;
++	tv.tv_usec = 0;
++	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++}
++#else
++static void netserial_set_recv_deadline(int fd) { (void)fd; }
++#endif
++
+ NetSerial::NetSerial()
+ : is_stopped_(true)
+ , is_server_(false)
+@@ -144,6 +157,7 @@ bool NetSerial::acceptClient()
+ 
+ 		socklen_t client_len = sizeof(client_addr);
+ 		sockfd_ = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
++		if (sockfd_ >= 0) netserial_set_recv_deadline(sockfd_);
+ 		if (sockfd_ < 0) {
+ 			gambatte_log(RETRO_LOG_ERROR, "Error on accept: %s\n", strerror(errno));
+ 			return false;
+@@ -181,6 +195,7 @@ bool NetSerial::startClientSocket()
+ 			return false;
+ 		}
+ 		sockfd_ = fd;
++		netserial_set_recv_deadline(sockfd_);
+ 		gambatte_log(RETRO_LOG_INFO, "GameLink network client connected to server!\n");
+ 	}
+ 	return true;

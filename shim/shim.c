@@ -9,8 +9,8 @@
  *                            GB/GBA link works on a stock frontend
  *   - retro_set_input_state  port 1 can be served from the network
  *   - retro_run              frame advance can be gated on the peer
- *   - retro_(un)serialize    rollback, and detection of frontend-initiated
- *                            loads (rewind/load state) that would desync us
+ *   - retro_(un)serialize    hide frontend save states during sessions while
+ *                            retaining protocol-owned state synchronization
  *
  * With no session armed this is a pure passthrough and the game behaves
  * exactly as it would without us.
@@ -23,12 +23,16 @@
  */
 
 #include <dlfcn.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <gnu/libc-version.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -37,6 +41,7 @@
 #include "libretro.h"
 #include "netlink.h"
 #include "overlay.h"
+#include "sha256.h"
 
 #define SHIM_ENV_REAL_CORE "NETPLAY_REAL_CORE"
 #define SHIM_ENV_SESSION   "NETPLAY_SESSION"
@@ -54,16 +59,6 @@
 /* How often the two sides compare state. A divergence is otherwise silent. */
 #define HASH_INTERVAL 300
 
-/* Frame number reserved for the core-identity hash.
- *
- * It used to be sent as frame 0, which collides with the divergence hash the
- * host also sends at frame 0 (0 % HASH_INTERVAL == 0). Only the most recent
- * hash is kept, so the client compared whichever arrived last - reporting an
- * identity mismatch against a state hash, and losing the frame 0 state
- * comparison, which is the one that says whether the handshake left both sides
- * equal. */
-#define IDENTITY_FRAME NETLINK_IDENTITY_FRAME
-
 /* How often to report pacing, in advanced frames (~10s of game time). */
 #define PACING_INTERVAL 600
 
@@ -73,6 +68,12 @@
  * text across the whole screen. Below this the previous frame simply stays up,
  * which is what a dropped frame should look like. ~200ms at 60fps. */
 #define STALL_OVERLAY_FRAMES 12
+
+/* Recovery is a bounded transaction. The frame counter jumps beyond every
+ * input that could have been queued before the barrier, so a delayed pre-reset
+ * packet cannot be mistaken for input on the recovered timeline. */
+#define RECOVERY_TIMEOUT_MS 10000
+#define RECOVERY_FRAME_JUMP 512
 
 //////////////////////////////////////////////////////////////////////////////
 // logging - minarch redirects the emulator's stderr to $LOGS_PATH/<TAG>.txt
@@ -162,21 +163,47 @@ static retro_audio_sample_batch_t fe_audio_sample_batch;
 static retro_input_poll_t         fe_input_poll;
 static retro_input_state_t        fe_input_state;
 
-// Set while we are the ones calling core.unserialize (rollback). Any
-// unserialize that arrives without this set came from the frontend - rewind or
-// load state - and means our lockstep state no longer matches the peer's.
-static int shim_owns_unserialize = 0;
-
 // Shared-screen netplay: one instance each, same game, inputs synced. Distinct
 // from link play, where the cores exchange their own serial/RFU traffic.
 static int      netplay_mode = 0;
 static int      input_delay = INPUT_DELAY_DEFAULT;
 static int      netplay_synced = 0;
 static uint32_t netplay_frame = 0;
+static uint32_t timeline_start_frame = 0;
 static uint32_t frame_buttons[2];      // [0] = host's, [1] = client's
 static uint32_t local_inputs[256];     // our own, kept for the delay window
 static uint32_t last_scheduled;        // highest frame we have already sent
 static int      input_scheduled;
+
+typedef enum {
+	RECOVERY_IDLE = 0,
+	RECOVERY_CLIENT_WAIT_BEGIN,
+	RECOVERY_CLIENT_WAIT_STATE,
+	RECOVERY_CLIENT_WAIT_COMMIT,
+	RECOVERY_HOST_WAIT_ACK,
+} RecoveryPhase;
+
+static RecoveryPhase recovery_phase;
+static uint32_t recovery_epoch;
+static uint32_t recovery_resume_frame;
+static unsigned recovery_count;
+static int recovery_failed;
+static struct timeval recovery_started;
+static uint32_t connection_generation;
+static int connection_identity_sent;
+static int connection_identity_checked;
+static int connection_sync_pending;
+static int netplay_ever_synced;
+
+static uint8_t rom_sha256[32];
+static int rom_hash_ready;
+static char session_id[65];
+static char checkpoint_path[192];
+
+static void* checkpoint_candidate;
+static size_t checkpoint_candidate_len;
+static uint32_t checkpoint_candidate_frame;
+static uint32_t checkpoint_candidate_hash;
 
 // Pacing stats. Without these a "laggy" session is unattributable: from the
 // outside a core that cannot hit 60fps and a peer whose inputs arrive late look
@@ -191,6 +218,11 @@ static struct timeval stat_since;
 // No session file -> pure passthrough. Read once at load; the launcher decides
 // whether a session is armed before minarch ever starts.
 static int session_active = 0;
+/* Core-managed auxiliary saves (memory cards, high scores, etc.) bypass
+ * RETRO_MEMORY_SAVE_RAM. A shared-screen guest sees a fresh process-local
+ * directory in /tmp so those files can function during play but never touch
+ * the user's persistent save tree. */
+static char guest_save_dir[256];
 
 // Core options forced by the session, as `option.<key>=<value>` lines. gpSP's
 // link emulation is per-game (gpsp_serial: mul_poke, mul_aw1, mul_aw2, rfu) and
@@ -263,6 +295,32 @@ static void load_option_overrides(const char* session_path) {
 	fclose(f);
 
 	if (option_override_count) option_update_pending = 1;
+}
+
+static void load_session_id(const char* path) {
+	session_id[0] = checkpoint_path[0] = '\0';
+	FILE* f = fopen(path, "r");
+	if (!f) return;
+	char line[256];
+	while (fgets(line, sizeof(line), f)) {
+		char* end = strpbrk(line, "\r\n");
+		if (end) *end = '\0';
+		if (strncmp(line, "session_id=", 11)) continue;
+		const char* value = line + 11;
+		size_t n = strlen(value);
+		if (!n || n >= sizeof(session_id)) break;
+		bool safe = true;
+		for (size_t i = 0; i < n; i++)
+			if (!((value[i] >= '0' && value[i] <= '9') ||
+			      (value[i] >= 'a' && value[i] <= 'f') ||
+			      (value[i] >= 'A' && value[i] <= 'F'))) safe = false;
+		if (safe) snprintf(session_id, sizeof(session_id), "%s", value);
+		break;
+	}
+	fclose(f);
+	if (session_id[0])
+		snprintf(checkpoint_path, sizeof(checkpoint_path),
+		         "/tmp/netplay-host-%s.state", session_id);
 }
 
 // Mode is normally derived from the core (see core_wants_link). An explicit
@@ -340,9 +398,20 @@ static int core_wants_link(void) {
 //
 // Only ever consulted for shared-screen sessions; link-cable cores carry their
 // own traffic and never compare state.
-static const struct { const char* core; const char* key; const char* value; }
+static const struct {
+	const char* core;
+	const char* key;
+	const char* value;
+	bool session_may_override;
+}
 REQUIRED_OPTIONS[] = {
-	{ "pcsx-rearmed", "pcsx_rearmed_drc_thread", "disabled" },
+	{ "pcsx-rearmed", "pcsx_rearmed_drc_thread", "disabled", true },
+	/* PCSX otherwise writes its second, core-managed card behind the frontend's
+	 * back. Shared-screen sessions deliberately expose only card 1 through the
+	 * libretro save-memory buffer, which lets the host own persistence and lets
+	 * the guest use an in-memory copy without touching its filesystem. */
+	{ "pcsx-rearmed", "pcsx_rearmed_memcard1", "libretro", false },
+	{ "pcsx-rearmed", "pcsx_rearmed_memcard2", "none", false },
 };
 
 static void apply_required_options(void) {
@@ -356,12 +425,20 @@ static void apply_required_options(void) {
 
 		// The session file wins. Someone testing a theory about this option
 		// should not have it silently overwritten.
-		int already = 0;
+		int already = -1;
 		for (int j = 0; j < option_override_count; j++) {
-			if (!strcmp(option_override[j].key, REQUIRED_OPTIONS[i].key)) { already = 1; break; }
+			if (!strcmp(option_override[j].key, REQUIRED_OPTIONS[i].key)) { already = j; break; }
 		}
-		if (already) {
+		if (already >= 0 && REQUIRED_OPTIONS[i].session_may_override) {
 			shim_log("session already sets %s - leaving it alone\n", REQUIRED_OPTIONS[i].key);
+			continue;
+		}
+		if (already >= 0) {
+			snprintf(option_override[already].value,
+			         sizeof(option_override[already].value), "%s", REQUIRED_OPTIONS[i].value);
+			shim_log("forcing %s=%s (required for host-only save persistence)\n",
+			         REQUIRED_OPTIONS[i].key, REQUIRED_OPTIONS[i].value);
+			option_update_pending = 1;
 			continue;
 		}
 		if (option_override_count >= MAX_OPTION_OVERRIDES) {
@@ -372,7 +449,7 @@ static void apply_required_options(void) {
 		         sizeof(option_override[0].key), "%s", REQUIRED_OPTIONS[i].key);
 		snprintf(option_override[option_override_count].value,
 		         sizeof(option_override[0].value), "%s", REQUIRED_OPTIONS[i].value);
-		shim_log("forcing %s=%s (required for determinism in %s)\n",
+		shim_log("forcing %s=%s (required for shared-screen netplay in %s)\n",
 		         REQUIRED_OPTIONS[i].key, REQUIRED_OPTIONS[i].value, info.library_name);
 		option_override_count++;
 		option_update_pending = 1;
@@ -419,6 +496,10 @@ static const char* find_option_override(const char* key) {
 // a zeroed retro_system_info would segfault minarch, which strcpys
 // valid_extensions unchecked. Stock minarch exits when a core won't load; we
 // match that so the log says what happened.
+/* Frozen executable-sharing implementation. The setting remains visible, but
+ * unauthenticated peer binaries must not reach dlopen. Compatibility selection
+ * is now performed by the setup app using local, packaged core manifests. */
+#if 0
 /* CRC32 of a file, plus its ELF machine type. Enough to say whether two builds
  * are the same and whether the other one could even load here.
  *
@@ -536,6 +617,17 @@ static int session_share_cores(const char* path) {
 	return v;
 }
 
+/* Production waits long enough for a peer coming up over WiFi. Host tests that
+ * deliberately run one side can shorten this without baking test timing into
+ * the protocol. Values outside a useful range are ignored. */
+static int negotiate_timeout_ms(void) {
+	const char* value = getenv("NETPLAY_NEGOTIATE_TIMEOUT_MS");
+	if (!value || !value[0]) return 15000;
+	char* end = NULL;
+	long ms = strtol(value, &end, 10);
+	return end && *end == '\0' && ms >= 50 && ms <= 60000 ? (int)ms : 15000;
+}
+
 /* Where an adopted core is written. /tmp is RAM on these devices, which is the
  * right place: it is fast, and a borrowed core must not outlive the session or
  * quietly become what this device runs from then on. */
@@ -599,7 +691,8 @@ static const char* negotiate_core(const char* path, const char* session) {
 	 * path to the first frame, so it must not be able to hang a launch. */
 	NetLinkCoreId theirs;
 	int waited = 0;
-	while (!NetLink_peerCoreId(&theirs) && waited < 15000) {
+	int negotiate_ms = negotiate_timeout_ms();
+	while (!NetLink_peerCoreId(&theirs) && waited < negotiate_ms) {
 		usleep(100 * 1000);
 		waited += 100;
 	}
@@ -718,6 +811,7 @@ static const char* negotiate_core(const char* path, const char* session) {
 	shim_log("adopted the peer's core (%zu bytes)\n", len);
 	return ADOPTED_CORE_PATH;
 }
+#endif
 
 static void ensure_loaded(void) {
 	if (core.handle) return;
@@ -728,15 +822,9 @@ static void ensure_loaded(void) {
 		exit(EXIT_FAILURE);
 	}
 
-	// Core sharing has to be settled before the core is opened, because it
-	// decides *which file* to open. That forces the session to be configured
-	// and the link started here rather than at the end of this function.
 	const char* session = getenv(SHIM_ENV_SESSION);
 	session_active = (session && session[0] && NetLink_configure(session));
-	if (session_active) {
-		const char* chosen = negotiate_core(path, session);
-		if (chosen != path) path = chosen;
-	}
+	if (session_active) NetLink_start();
 
 	// RTLD_LOCAL keeps the real core's retro_* symbols out of the global
 	// namespace, where they would collide with the ones we export.
@@ -782,6 +870,7 @@ static void ensure_loaded(void) {
 
 	if (session_active) {
 		load_option_overrides(session);
+		load_session_id(session);
 
 		// get_system_info is resolved above, so the core can be asked what it is
 		// before anything else happens. Both sides run the same ROM, so they
@@ -802,13 +891,24 @@ static void ensure_loaded(void) {
 		// After the mode is known: only shared screen compares state, and only
 		// then does a nondeterministic core matter.
 		if (netplay_mode) apply_required_options();
+		if (netplay_mode && NetLink_getRole() == NETLINK_ROLE_CLIENT) {
+			snprintf(guest_save_dir, sizeof(guest_save_dir),
+			         "/tmp/netplay-guest-%s%ld",
+			         session_id[0] ? session_id : "process-", (long)getpid());
+			if (mkdir(guest_save_dir, 0700) != 0 && errno != EEXIST) {
+				shim_log("WARNING: cannot create volatile guest save directory %s: %s\n",
+				         guest_save_dir, strerror(errno));
+				guest_save_dir[0] = '\0';
+			} else {
+				shim_log("guest core-managed saves redirected to %s\n", guest_save_dir);
+			}
+		}
 	}
 
 	shim_log("wrapping %s (session=%s)\n", path, session_active ? "armed" : "none");
 
-	// The link is already up: negotiate_core started it, because the core
-	// identities have to be exchanged before the core is opened. Starting it a
-	// second time here would bind the listening socket twice.
+	// The transport starts before the core is opened so link-capable cores see a
+	// ready netpacket interface during their own initialization.
 }
 
 #undef RESOLVE
@@ -881,6 +981,11 @@ static bool shim_environment(unsigned cmd, void* data) {
 		}
 	}
 
+	if (cmd == RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY && guest_save_dir[0] && data) {
+		*(const char**)data = guest_save_dir;
+		return true;
+	}
+
 	if (cmd == RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE && session_active && data) {
 		bool fe_says = fe_environment ? fe_environment(cmd, data) : false;
 		if (option_update_pending) {
@@ -927,156 +1032,438 @@ static uint32_t core_identity(void) {
 	return h;
 }
 
-static void netplay_handshake(void) {
-	if (netplay_synced || !NetLink_isConnected()) return;
+#define AUTHORITATIVE_MAGIC 0x4E505356u /* NPSV */
+#define AUTHORITATIVE_VERSION 1u
 
-	if (NetLink_getRole() == NETLINK_ROLE_HOST) {
-		size_t sz = core.serialize_size();
-		if (!sz) {
-			shim_log("core cannot serialize - shared-screen netplay needs it\n");
-			netplay_mode = 0;
-			return;
-		}
-		void* buf = malloc(sz);
-		if (!buf) return;
+typedef struct __attribute__((packed)) {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t state_size;
+	uint32_t sram_size;
+	uint32_t rtc_size;
+} AuthoritativeHeader;
 
-		/* Sent on a reserved frame number so it cannot be confused with the
-		 * frame 0 divergence hash. */
-		NetLink_sendHash(IDENTITY_FRAME, core_identity());
+static uint32_t hash_bytes(const void* data, size_t len);
 
-		if (core.serialize(buf, sz) && NetLink_sendState(buf, sz)) {
-			// Adopt our own state, so both sides sit in the same post-load
-			// condition.
-			//
-			// A freshly booted state is not necessarily a fixpoint: for
-			// picodrive, serializing it, loading it back and serializing again
-			// differs by one byte (offset 140429 with Streets of Rage 2). The
-			// client loads what we just sent and therefore lands in that
-			// post-load condition. If we keep our never-loaded state, our hash
-			// differs from theirs from frame 0 and every divergence check
-			// reports DESYNC - for a session that is in fact running perfectly
-			// in step, which is exactly what it looked like: constant DESYNC
-			// with no visible divergence.
-			//
-			// Verified with shim/test/statecheck.c: both builds produce
-			// identical state from identical input, and once a state has been
-			// loaded the round trip is exact - so doing this once here is
-			// enough to make the two sides comparable for the whole session.
-			shim_owns_unserialize = 1;
-			bool adopted = core.unserialize(buf, sz);
-			shim_owns_unserialize = 0;
-			if (!adopted)
-				shim_log("could not adopt our own state - hashes may not compare\n");
+static bool persistent_memory_sizes(uint32_t* sram_size, uint32_t* rtc_size) {
+	size_t sram = core.get_memory_size(RETRO_MEMORY_SAVE_RAM);
+	size_t rtc = core.get_memory_size(RETRO_MEMORY_RTC);
+	if (sram > UINT32_MAX || rtc > UINT32_MAX) return false;
+	*sram_size = (uint32_t)sram;
+	*rtc_size = (uint32_t)rtc;
+	return true;
+}
 
-			netplay_synced = 1;
-			netplay_frame = 0;
-			last_scheduled = 0;
-			input_scheduled = 0;
-			shim_log("shared-screen netplay started, sent %zu byte state\n", sz);
-		}
-		free(buf);
-	} else {
-		void*  buf = NULL;
-		size_t len = 0;
-		if (!NetLink_takeState(&buf, &len)) return;
+static bool parse_authoritative_state(const void* data, size_t len,
+		AuthoritativeHeader* parsed) {
+	if (!data || len < sizeof(AuthoritativeHeader)) return false;
+	AuthoritativeHeader wire;
+	memcpy(&wire, data, sizeof(wire));
+	AuthoritativeHeader h = {
+		.magic = ntohl(wire.magic),
+		.version = ntohl(wire.version),
+		.state_size = ntohl(wire.state_size),
+		.sram_size = ntohl(wire.sram_size),
+		.rtc_size = ntohl(wire.rtc_size),
+	};
+	uint64_t payload64 = (uint64_t)h.state_size + h.sram_size + h.rtc_size;
+	if (h.magic != AUTHORITATIVE_MAGIC || h.version != AUTHORITATIVE_VERSION ||
+	    payload64 > NETLINK_MAX_STATE - sizeof(AuthoritativeHeader) ||
+	    len != sizeof(AuthoritativeHeader) + (size_t)payload64)
+		return false;
+	if (parsed) *parsed = h;
+	return true;
+}
 
-		// Check the size before the core sees it, not after.
-		//
-		// len is whatever the peer declared. Cores read fixed offsets out of a
-		// state blob, so a host built differently - exactly the case this code
-		// exists to detect - would hand us a short buffer and the core would
-		// read past its end. The mismatch used to be reported only after the
-		// load had already happened.
-		size_t want = core.serialize_size();
-		if (want && len != want) {
-			shim_log("refusing peer state: host %zu bytes, ours %zu - "
-			         "these builds cannot exchange state\n", len, want);
-			free(buf);
-			netplay_mode = 0;      // fall back rather than corrupt the session
-			return;
-		}
+/* Package the core state together with the raw persistent-memory regions. The
+ * files that minarch used to populate those regions (.sav, .srm, compressed or
+ * otherwise) never enter the protocol. */
+static bool capture_authoritative_state(void** out, size_t* out_len, uint32_t* out_hash) {
+	size_t state_size = core.serialize_size();
+	uint32_t sram_size, rtc_size;
+	if (!state_size || state_size > UINT32_MAX ||
+	    !persistent_memory_sizes(&sram_size, &rtc_size)) return false;
+	uint64_t payload64 = (uint64_t)state_size + sram_size + rtc_size;
+	if (payload64 > NETLINK_MAX_STATE - sizeof(AuthoritativeHeader)) return false;
+	size_t payload = (size_t)payload64;
 
-		shim_owns_unserialize = 1;
-		bool ok = core.unserialize(buf, len);
-		shim_owns_unserialize = 0;
+	void* sram = sram_size ? core.get_memory_data(RETRO_MEMORY_SAVE_RAM) : NULL;
+	void* rtc = rtc_size ? core.get_memory_data(RETRO_MEMORY_RTC) : NULL;
+	if ((sram_size && !sram) || (rtc_size && !rtc)) return false;
 
-		// Does serialize(unserialize(x)) == x on this device?
-		//
-		// This separates the two explanations for a state hash that never
-		// matches. We have just loaded the host's exact bytes, so at this
-		// instant the two machines hold identical emulator state by
-		// construction. If re-serializing reproduces those bytes, the hash is a
-		// fair comparison and any later mismatch is real divergence. If it does
-		// not, the blob carries something not shared between the two builds -
-		// a pointer, padding, anything host-specific - and every hash after
-		// this compares uncomparable bytes, so DESYNC would be reported for a
-		// session that is in fact running perfectly in step.
-		if (ok) {
-			size_t sz = core.serialize_size();
-			void* check = (sz == len) ? malloc(sz) : NULL;
-			if (check) {
-				memset(check, 0, sz);
-				if (core.serialize(check, sz)) {
-					const uint8_t* a = buf;
-					const uint8_t* b = check;
-					size_t diff = 0, first = (size_t)-1;
-					for (size_t i = 0; i < sz; i++) {
-						if (a[i] != b[i]) { if (first == (size_t)-1) first = i; diff++; }
-					}
-					if (diff)
-						shim_log("state round-trip DIFFERS: %zu of %zu bytes, first at offset %zu "
-						         "- state hashes are not comparable between these builds\n",
-						         diff, sz, first);
-					else
-						shim_log("state round-trip is exact - hashes are comparable\n");
+	size_t total = sizeof(AuthoritativeHeader) + payload;
+	uint8_t* buf = malloc(total);
+	if (!buf) return false;
+	AuthoritativeHeader wire = {
+		.magic = htonl(AUTHORITATIVE_MAGIC),
+		.version = htonl(AUTHORITATIVE_VERSION),
+		.state_size = htonl((uint32_t)state_size),
+		.sram_size = htonl(sram_size),
+		.rtc_size = htonl(rtc_size),
+	};
+	memcpy(buf, &wire, sizeof(wire));
+	uint8_t* state = buf + sizeof(wire);
+	memset(state, 0, state_size);
+	if (!core.serialize(state, state_size)) { free(buf); return false; }
+	if (sram_size) memcpy(state + state_size, sram, sram_size);
+	if (rtc_size) memcpy(state + state_size + sram_size, rtc, rtc_size);
 
-					// Undo this diagnostic's own footprint. It costs an extra
-					// serialize that the host does not make, and serialize is
-					// not side-effect free - so measuring the handshake would
-					// otherwise perturb the very thing it measures.
-					shim_owns_unserialize = 1;
-					core.unserialize(buf, len);
-					shim_owns_unserialize = 0;
-				}
-				free(check);
-			}
-		}
+	*out = buf;
+	*out_len = total;
+	if (out_hash) *out_hash = hash_bytes(buf, total);
+	return true;
+}
 
-		free(buf);
+static bool apply_authoritative_state(const void* data, size_t len) {
+	AuthoritativeHeader h;
+	uint32_t local_sram, local_rtc;
+	if (!parse_authoritative_state(data, len, &h) ||
+	    h.state_size != core.serialize_size() ||
+	    !persistent_memory_sizes(&local_sram, &local_rtc) ||
+	    h.sram_size != local_sram || h.rtc_size != local_rtc)
+		return false;
 
-		if (ok) {
-			netplay_synced = 1;
-			netplay_frame = 0;
-			last_scheduled = 0;
-			input_scheduled = 0;
+	const uint8_t* state = (const uint8_t*)data + sizeof(AuthoritativeHeader);
+	if (!core.unserialize(state, h.state_size)) return false;
+	void* sram = h.sram_size ? core.get_memory_data(RETRO_MEMORY_SAVE_RAM) : NULL;
+	void* rtc = h.rtc_size ? core.get_memory_data(RETRO_MEMORY_RTC) : NULL;
+	if ((h.sram_size && !sram) || (h.rtc_size && !rtc)) return false;
+	if (h.sram_size) memcpy(sram, state + h.state_size, h.sram_size);
+	if (h.rtc_size) memcpy(rtc, state + h.state_size + h.sram_size, h.rtc_size);
+	return true;
+}
 
-			uint32_t peer_id;
-			if (NetLink_takeIdentity(&peer_id)) {
-				uint32_t mine = core_identity();
-				if (mine != peer_id)
-					// Reported, never enforced. The identity folds in
-					// library_version, so builds that differ only in flags -
-					// which may still compute identically - trip it.
-					shim_log("core identity differs: host %08x, ours %08x "
-					         "(compare the identity lines on both devices)\n", peer_id, mine);
-				else
-					shim_log("core identity matches peer (%08x)\n", mine);
-			}
+#define CHECKPOINT_MAGIC 0x4E50434Bu /* NPCK */
+typedef struct {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t core_identity;
+	uint32_t state_size;
+	uint32_t frame;
+	uint32_t state_hash;
+	uint8_t rom_sha256[32];
+} CheckpointHeader;
 
-			// If our own state is a different size from the one we just took,
-			// the two builds do not share a save-state format. Every later hash
-			// compares different-sized blobs, so divergence is guaranteed and
-			// no amount of matching source or flags will fix it.
-			size_t mine_sz = core.serialize_size();
-			if (mine_sz != len)
-				shim_log("WARNING: state size mismatch - host %zu, ours %zu. "
-				         "These builds cannot exchange state.\n", len, mine_sz);
+static uint32_t hash_bytes(const void* data, size_t len) {
+	uint32_t h = 2166136261u;
+	const uint8_t* p = data;
+	for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 16777619u; }
+	return h;
+}
 
-			shim_log("shared-screen netplay started, adopted %zu byte state\n", len);
-		} else {
-			shim_log("could not adopt the host state - cores may differ\n");
+static void set_checkpoint_candidate(void* data, size_t len, uint32_t frame, uint32_t hash) {
+	free(checkpoint_candidate);
+	checkpoint_candidate = data;
+	checkpoint_candidate_len = len;
+	checkpoint_candidate_frame = frame;
+	checkpoint_candidate_hash = hash;
+}
+
+static bool promote_checkpoint(void) {
+	if (!checkpoint_path[0] || !checkpoint_candidate || !checkpoint_candidate_len) return false;
+	char tmp[224];
+	snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", checkpoint_path, (long)getpid());
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0) return false;
+	CheckpointHeader h = {
+		.magic = CHECKPOINT_MAGIC, .version = 2,
+		.core_identity = core_identity(),
+		.state_size = (uint32_t)checkpoint_candidate_len,
+		.frame = checkpoint_candidate_frame,
+		.state_hash = checkpoint_candidate_hash,
+	};
+	memcpy(h.rom_sha256, rom_sha256, sizeof(h.rom_sha256));
+	const uint8_t* parts[2] = { (const uint8_t*)&h, checkpoint_candidate };
+	size_t lengths[2] = { sizeof(h), checkpoint_candidate_len };
+	bool ok = true;
+	for (int part = 0; part < 2 && ok; part++) {
+		const uint8_t* p = parts[part];
+		size_t left = lengths[part];
+		while (left) {
+			ssize_t n = write(fd, p, left);
+			if (n > 0) { p += n; left -= (size_t)n; }
+			else if (n < 0 && errno == EINTR) continue;
+			else { ok = false; break; }
 		}
 	}
+	if (ok) ok = fsync(fd) == 0;
+	if (close(fd) != 0) ok = false;
+	if (ok) ok = rename(tmp, checkpoint_path) == 0;
+	if (!ok) unlink(tmp);
+	if (ok) shim_log("confirmed host checkpoint promoted at frame %u\n", h.frame);
+	else shim_log("could not persist confirmed host checkpoint: %s\n", strerror(errno));
+	return ok;
+}
+
+static bool load_checkpoint(void** data, size_t* len, uint32_t* frame) {
+	if (!checkpoint_path[0]) return false;
+	FILE* f = fopen(checkpoint_path, "rb");
+	if (!f) return false;
+	CheckpointHeader h;
+	bool ok = fread(&h, 1, sizeof(h), f) == sizeof(h) &&
+	          h.magic == CHECKPOINT_MAGIC && h.version == 2 &&
+	          h.core_identity == core_identity() &&
+	          h.state_size <= NETLINK_MAX_STATE &&
+	          !memcmp(h.rom_sha256, rom_sha256, sizeof(h.rom_sha256));
+	void* buf = ok ? malloc(h.state_size) : NULL;
+	if (!buf || fread(buf, 1, h.state_size, f) != h.state_size) ok = false;
+	if (ok && (!parse_authoritative_state(buf, h.state_size, NULL) ||
+	           hash_bytes(buf, h.state_size) != h.state_hash)) ok = false;
+	if (fgetc(f) != EOF) ok = false;
+	fclose(f);
+	if (!ok) { free(buf); shim_log("ignored invalid or stale host checkpoint\n"); return false; }
+	*data = buf; *len = h.state_size; *frame = h.frame;
+	shim_log("restored last confirmed host checkpoint from frame %u\n", h.frame);
+	return true;
+}
+
+static void reset_netplay_timeline(uint32_t frame);
+static void recovery_clock_start(void);
+
+static bool identity_matches(const NetLinkSessionIdentity* peer) {
+	uint32_t mine = core_identity();
+	size_t state_size = core.serialize_size();
+	uint32_t sram_size = 0, rtc_size = 0;
+	if (!persistent_memory_sizes(&sram_size, &rtc_size)) return false;
+	if (memcmp(peer->rom_sha256, rom_sha256, 32)) {
+		shim_log("refusing peer: ROM content hashes differ\n");
+		return false;
+	}
+	if (peer->core_identity != mine || peer->state_size != state_size ||
+	    peer->sram_size != sram_size || peer->rtc_size != rtc_size) {
+		shim_log("refusing peer: core/state/persistent-memory identity differs "
+		         "(peer %08x/%u/%u/%u, ours %08x/%zu/%u/%u)\n",
+		         peer->core_identity, peer->state_size, peer->sram_size, peer->rtc_size,
+		         mine, state_size, sram_size, rtc_size);
+		return false;
+	}
+	return true;
+}
+
+/* Every TCP generation is a new synchronization barrier. This covers both a
+ * guest relaunch (the live host donates its current state) and a host relaunch
+ * (the new host first loads its last peer-confirmed checkpoint). */
+static void netplay_handshake(void) {
+	if (!NetLink_isConnected() || !rom_hash_ready) return;
+	uint32_t generation = NetLink_connectionGeneration();
+	if (generation != connection_generation) {
+		connection_generation = generation;
+		connection_identity_sent = connection_identity_checked = 0;
+		connection_sync_pending = 1;
+		netplay_synced = 0;
+		recovery_failed = 0;
+		recovery_started.tv_sec = recovery_started.tv_usec = 0;
+		recovery_phase = NetLink_getRole() == NETLINK_ROLE_CLIENT
+		               ? RECOVERY_CLIENT_WAIT_BEGIN : RECOVERY_IDLE;
+		NetLink_resetSync();
+		shim_log("connection %u requires an authoritative sync\n", generation);
+	}
+
+	if (!connection_identity_sent) {
+		NetLinkSessionIdentity mine;
+		memset(&mine, 0, sizeof(mine));
+		memcpy(mine.rom_sha256, rom_sha256, 32);
+		mine.core_identity = core_identity();
+		mine.state_size = (uint32_t)core.serialize_size();
+		if (!persistent_memory_sizes(&mine.sram_size, &mine.rtc_size)) {
+			recovery_failed = 1;
+			return;
+		}
+		connection_identity_sent = NetLink_sendSessionIdentity(&mine);
+	}
+
+	if (!connection_identity_checked) {
+		NetLinkSessionIdentity peer;
+		if (!NetLink_takeSessionIdentity(&peer)) return;
+		if (!identity_matches(&peer)) {
+			recovery_failed = 1;
+			return;
+		}
+		connection_identity_checked = 1;
+		shim_log("ROM and core identity match peer\n");
+	}
+
+	if (!connection_sync_pending || NetLink_getRole() != NETLINK_ROLE_HOST ||
+	    recovery_phase != RECOVERY_IDLE) return;
+
+	size_t sz = 0;
+	void* buf = NULL;
+	uint32_t source_frame = 0;
+	bool restored = false;
+	if (!netplay_ever_synced)
+		restored = load_checkpoint(&buf, &sz, &source_frame);
+	if (!restored) {
+		if (!capture_authoritative_state(&buf, &sz, NULL)) return;
+		source_frame = netplay_ever_synced ? netplay_frame : 0;
+	}
+	if (!apply_authoritative_state(buf, sz)) {
+		free(buf); recovery_failed = 1;
+		shim_log("host could not adopt synchronization state\n");
+		return;
+	}
+
+	recovery_epoch++;
+	if (!recovery_epoch) recovery_epoch++;
+	recovery_resume_frame = (restored || netplay_ever_synced)
+	                      ? source_frame + RECOVERY_FRAME_JUMP : 0;
+	if (!NetLink_beginResync(recovery_epoch, recovery_resume_frame) ||
+	    !NetLink_sendState(buf, sz)) {
+		free(buf); return;
+	}
+	set_checkpoint_candidate(buf, sz, recovery_resume_frame, hash_bytes(buf, sz));
+	reset_netplay_timeline(recovery_resume_frame);
+	recovery_phase = RECOVERY_HOST_WAIT_ACK;
+	recovery_clock_start();
+	shim_log("authoritative %s state sent for connection %u; resume frame %u\n",
+	         restored ? "checkpoint" : (netplay_ever_synced ? "live" : "initial"),
+	         generation, recovery_resume_frame);
+}
+
+static void reset_netplay_timeline(uint32_t frame) {
+	netplay_frame = frame;
+	timeline_start_frame = frame;
+	memset(local_inputs, 0, sizeof(local_inputs));
+	memset(frame_buttons, 0, sizeof(frame_buttons));
+	last_scheduled = 0;
+	input_scheduled = 0;
+	stall_run = 0;
+	stat_frames = stat_stalls = stat_stall_max = 0;
+	memset(&stat_since, 0, sizeof(stat_since));
+	NetLink_resetSync();
+}
+
+static void recovery_clock_start(void) {
+	gettimeofday(&recovery_started, NULL);
+}
+
+static bool recovery_timed_out(void) {
+	if (!recovery_started.tv_sec) return false;
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	long ms = (now.tv_sec - recovery_started.tv_sec) * 1000L
+	        + (now.tv_usec - recovery_started.tv_usec) / 1000L;
+	return ms > RECOVERY_TIMEOUT_MS;
+}
+
+/* Advance an authoritative-state recovery transaction at a frame boundary.
+ * True means the core must remain paused for this retro_run call. */
+static bool netplay_recovery_tick(void) {
+	if (recovery_failed) return true;
+
+	if (recovery_phase != RECOVERY_IDLE && recovery_timed_out()) {
+		recovery_failed = 1;
+		shim_log("authoritative resync timed out - session cannot continue safely\n");
+		return true;
+	}
+
+	if (NetLink_getRole() == NETLINK_ROLE_HOST) {
+		uint32_t mismatch_frame;
+		if (recovery_phase == RECOVERY_IDLE &&
+		    NetLink_takeResyncRequest(&mismatch_frame)) {
+			size_t sz = 0;
+			void* buf = NULL;
+			if (!capture_authoritative_state(&buf, &sz, NULL)) {
+				recovery_failed = 1;
+				shim_log("cannot create authoritative state for resync\n");
+				return true;
+			}
+
+			recovery_epoch++;
+			if (!recovery_epoch) recovery_epoch++;
+			recovery_resume_frame = netplay_frame + RECOVERY_FRAME_JUMP;
+			recovery_clock_start();
+
+			bool sent = NetLink_beginResync(recovery_epoch, recovery_resume_frame) &&
+			            NetLink_sendState(buf, sz);
+			bool adopted = apply_authoritative_state(buf, sz);
+			free(buf);
+
+			if (!sent || !adopted) {
+				recovery_failed = 1;
+				shim_log("authoritative resync state could not be sent or adopted\n");
+				return true;
+			}
+
+			reset_netplay_timeline(recovery_resume_frame);
+			recovery_phase = RECOVERY_HOST_WAIT_ACK;
+			shim_log("authoritative resync %u sent after mismatch at frame %u; "
+			         "resume frame %u\n", recovery_epoch, mismatch_frame,
+			         recovery_resume_frame);
+			return true;
+		}
+
+		if (recovery_phase == RECOVERY_HOST_WAIT_ACK) {
+			uint32_t epoch;
+			bool loaded;
+			if (NetLink_takeResyncAck(&epoch, &loaded) && epoch == recovery_epoch) {
+				if (!loaded || !NetLink_commitResync(epoch)) {
+					recovery_failed = 1;
+					shim_log("client could not adopt authoritative resync %u\n", epoch);
+					return true;
+				}
+				if (connection_sync_pending) {
+					promote_checkpoint();
+					netplay_synced = netplay_ever_synced = 1;
+					connection_sync_pending = 0;
+				}
+				recovery_phase = RECOVERY_IDLE;
+				recovery_started.tv_sec = recovery_started.tv_usec = 0;
+				recovery_count++;
+				shim_log("authoritative resync %u committed (%u %s this session)\n",
+				         epoch, recovery_count, recovery_count == 1 ? "recovery" : "recoveries");
+			}
+			return true;
+		}
+		return false;
+	}
+
+	if (recovery_phase == RECOVERY_CLIENT_WAIT_BEGIN) {
+		uint32_t epoch, frame;
+		if (NetLink_takeResyncBegin(&epoch, &frame)) {
+			recovery_epoch = epoch;
+			recovery_resume_frame = frame;
+			recovery_phase = RECOVERY_CLIENT_WAIT_STATE;
+			shim_log("authoritative resync %u beginning; resume frame %u\n",
+			         epoch, frame);
+		}
+	}
+
+	if (recovery_phase == RECOVERY_CLIENT_WAIT_STATE) {
+		void* buf = NULL;
+		size_t len = 0;
+		if (NetLink_takeState(&buf, &len)) {
+			bool loaded = apply_authoritative_state(buf, len);
+			free(buf);
+
+			if (loaded) reset_netplay_timeline(recovery_resume_frame);
+			if (!NetLink_ackResync(recovery_epoch, loaded) || !loaded) {
+				recovery_failed = 1;
+				shim_log("could not adopt authoritative resync %u (%zu-byte bundle)\n",
+				         recovery_epoch, len);
+				return true;
+			}
+			recovery_phase = RECOVERY_CLIENT_WAIT_COMMIT;
+			shim_log("authoritative resync %u adopted; waiting for commit\n", recovery_epoch);
+		}
+	}
+
+	if (recovery_phase == RECOVERY_CLIENT_WAIT_COMMIT) {
+		uint32_t epoch;
+		if (NetLink_takeResyncCommit(&epoch) && epoch == recovery_epoch) {
+			if (connection_sync_pending) {
+				netplay_synced = netplay_ever_synced = 1;
+				connection_sync_pending = 0;
+			}
+			recovery_phase = RECOVERY_IDLE;
+			recovery_started.tv_sec = recovery_started.tv_usec = 0;
+			recovery_count++;
+			shim_log("authoritative resync %u committed (%u %s this session)\n",
+			         epoch, recovery_count, recovery_count == 1 ? "recovery" : "recoveries");
+			return true;
+		}
+	}
+
+	return recovery_phase != RECOVERY_IDLE;
 }
 
 // Report how the session is actually pacing. Attribution is the whole point:
@@ -1108,29 +1495,28 @@ static void netplay_reportPacing(void) {
 }
 
 // Cheap rolling checksum; we only need to notice divergence, not locate it.
-static uint32_t state_hash(void) {
-	size_t sz = core.serialize_size();
-	if (!sz) return 0;
-	static void*  buf;
-	static size_t cap;
-	if (sz > cap) {
-		void* g = realloc(buf, sz);
-		if (!g) return 0;
-		buf = g; cap = sz;
-	}
-	// Zero first. Cores need not write every byte of the buffer - struct
-	// padding is commonly left untouched - so hashing whatever realloc handed
-	// us varies run to run and would report divergence that is not there.
-	memset(buf, 0, sz);
-	if (!core.serialize(buf, sz)) return 0;
-
-	uint32_t h = 2166136261u;               /* FNV-1a */
-	const uint8_t* p = buf;
-	for (size_t i = 0; i < sz; i++) { h ^= p[i]; h *= 16777619u; }
-	return h;
+static bool capture_state(void** out, size_t* out_len, uint32_t* out_hash) {
+	return capture_authoritative_state(out, out_len, out_hash);
 }
 
-static void netplay_checkDivergence(void) {
+static bool netplay_checkDivergence(void) {
+	#define OWN_HASHES 8
+	static uint32_t own_frame[OWN_HASHES];
+	static uint32_t own_hash[OWN_HASHES];
+	static int own_valid[OWN_HASHES];
+
+	if (NetLink_getRole() == NETLINK_ROLE_HOST) {
+		uint32_t frame, hash;
+		bool matched;
+		while (NetLink_takeCheckpointAck(&frame, &hash, &matched)) {
+			if (matched && checkpoint_candidate &&
+			    frame == checkpoint_candidate_frame && hash == checkpoint_candidate_hash)
+				promote_checkpoint();
+			else if (!matched)
+				shim_log("guest rejected checkpoint at frame %u\n", frame);
+		}
+	}
+
 	// Both sides hash at exactly the same frames.
 	//
 	// retro_serialize is not guaranteed to be side-effect free, and picodrive's
@@ -1143,47 +1529,51 @@ static void netplay_checkDivergence(void) {
 	//
 	// So hashing is unconditional and identically timed on both sides, and the
 	// comparison is done separately, whenever the peer's hash turns up.
-	if (netplay_frame % HASH_INTERVAL != 0) return;
-
-	uint32_t mine = state_hash();
-
-	if (NetLink_getRole() == NETLINK_ROLE_HOST) {
-		if (netplay_frame == 0) shim_log("state at frame 0: %08x\n", mine);
-		NetLink_sendHash(netplay_frame, mine);
-		return;
+	if (netplay_frame % HASH_INTERVAL == 0) {
+		void* snapshot = NULL;
+		size_t snapshot_len = 0;
+		uint32_t mine = 0;
+		if (!capture_state(&snapshot, &snapshot_len, &mine)) return false;
+		if (NetLink_getRole() == NETLINK_ROLE_HOST) {
+			if (netplay_frame == 0) shim_log("state at frame 0: %08x\n", mine);
+			set_checkpoint_candidate(snapshot, snapshot_len, netplay_frame, mine);
+			NetLink_sendHash(netplay_frame, mine);
+			return false;
+		}
+		free(snapshot);
+		unsigned slot = (netplay_frame / HASH_INTERVAL) % OWN_HASHES;
+		own_frame[slot] = netplay_frame;
+		own_hash[slot] = mine;
+		own_valid[slot] = 1;
 	}
 
-	// Keep our own hashes so a late-arriving peer hash can still be compared
-	// against the right frame. Eight covers 2400 frames of lateness.
-	#define OWN_HASHES 8
-	static uint32_t own_frame[OWN_HASHES];
-	static uint32_t own_hash[OWN_HASHES];
-	static int      own_valid[OWN_HASHES];
-
-	unsigned slot = (netplay_frame / HASH_INTERVAL) % OWN_HASHES;
-	own_frame[slot] = netplay_frame;
-	own_hash[slot]  = mine;
-	own_valid[slot] = 1;
-
+	if (NetLink_getRole() == NETLINK_ROLE_HOST) return false;
 	uint32_t f, h;
-	if (!NetLink_takeHash(&f, &h)) return;
-
-	unsigned s = (f / HASH_INTERVAL) % OWN_HASHES;
-	if (!own_valid[s] || own_frame[s] != f) {
-		// We never hashed that frame, or it has aged out of the ring.
-		shim_log("no local hash for frame %u to compare (now at %u)\n", f, netplay_frame);
-		return;
+	while (NetLink_takeHash(&f, &h)) {
+		unsigned s = (f / HASH_INTERVAL) % OWN_HASHES;
+		if (!own_valid[s] || own_frame[s] != f) {
+			shim_log("no local hash for frame %u to compare (now at %u)\n", f, netplay_frame);
+			continue;
+		}
+		if (f == 0)
+			shim_log("state at frame 0: ours %08x, host %08x - handshake %s\n",
+			         own_hash[s], h,
+			         own_hash[s] == h ? "equalised both sides" : "did NOT equalise");
+		if (own_hash[s] != h) {
+			NetLink_ackCheckpoint(f, h, false);
+			shim_log("DESYNC at frame %u (host %08x, ours %08x)\n", f, h, own_hash[s]);
+			if (recovery_phase == RECOVERY_IDLE && NetLink_requestResync(f)) {
+				recovery_phase = RECOVERY_CLIENT_WAIT_BEGIN;
+				recovery_clock_start();
+				shim_log("requested authoritative state from host\n");
+				return true;
+			}
+		} else {
+			NetLink_ackCheckpoint(f, h, true);
+			shim_log("in sync at frame %u (%08x)\n", f, own_hash[s]);
+		}
 	}
-
-	if (f == 0)
-		shim_log("state at frame 0: ours %08x, host %08x - handshake %s\n",
-		         own_hash[s], h,
-		         own_hash[s] == h ? "equalised both sides" : "did NOT equalise");
-
-	if (own_hash[s] != h)
-		shim_log("DESYNC at frame %u (host %08x, ours %08x)\n", f, h, own_hash[s]);
-	else
-		shim_log("in sync at frame %u (%08x)\n", f, own_hash[s]);
+	return false;
 }
 
 // Drive the core's netpacket callbacks to match the link state. Called once per
@@ -1471,6 +1861,9 @@ void retro_deinit(void) {
 		netpacket_started = 0;
 	}
 	if (session_active) NetLink_stop();
+	free(checkpoint_candidate);
+	checkpoint_candidate = NULL;
+	checkpoint_candidate_len = 0;
 
 	core.deinit();
 }
@@ -1516,6 +1909,17 @@ void retro_run(void) {
 		NetLink_markFrame();
 		netplay_handshake();
 
+		if (netplay_recovery_tick()) {
+			if (fe_input_poll) fe_input_poll();
+			static unsigned recovery_wait;
+			present_paused_frame(recovery_wait++, recovery_failed
+			                     ? "Resync failed - exit the game."
+			                     : (netplay_synced ? "Resynchronizing from host..."
+			                                       : "Rejoining from host..."));
+			present_paused_audio();
+			return;
+		}
+
 		if (!netplay_synced) {
 			// Nothing to show yet and nothing to run; keep the frontend alive.
 			if (fe_input_poll) fe_input_poll();
@@ -1542,10 +1946,12 @@ void retro_run(void) {
 
 		// Our own input for the current frame was decided INPUT_DELAY frames
 		// ago; the first few frames are primed neutral.
-		uint32_t mine = (netplay_frame < (uint32_t)input_delay) ? 0 : local_inputs[netplay_frame % 256];
+		uint32_t mine = (netplay_frame - timeline_start_frame < (uint32_t)input_delay)
+		              ? 0 : local_inputs[netplay_frame % 256];
 
 		uint32_t theirs = 0;
-		if (netplay_frame >= (uint32_t)input_delay && !NetLink_getRemoteInput(netplay_frame, &theirs)) {
+		if (netplay_frame - timeline_start_frame >= (uint32_t)input_delay &&
+		    !NetLink_getRemoteInput(netplay_frame, &theirs)) {
 			// Peer input for this frame has not arrived. Stall rather than run
 			// ahead: advancing without it would desync immediately.
 			if (fe_input_poll) fe_input_poll();
@@ -1570,7 +1976,12 @@ void retro_run(void) {
 		frame_buttons[0] = host ? mine : theirs;
 		frame_buttons[1] = host ? theirs : mine;
 
-		netplay_checkDivergence();
+		if (netplay_checkDivergence()) {
+			if (fe_input_poll) fe_input_poll();
+			present_paused_frame(0, "Desync detected - resynchronizing...");
+			present_paused_audio();
+			return;
+		}
 		netplay_frame++;
 		stat_frames++;
 		netplay_reportPacing();
@@ -1608,22 +2019,25 @@ void retro_run(void) {
 
 size_t retro_serialize_size(void) {
 	if (!core.handle) return 0;
+	/* Save states are deliberately unavailable for every armed session. Returning
+	 * zero is the libretro capability signal minarch uses to omit its save/load
+	 * actions. Protocol synchronization calls core.serialize_* directly and is
+	 * unaffected; battery-backed SRAM remains normal. */
+	if (session_active) return 0;
 	return core.serialize_size();
 }
 
 bool retro_serialize(void* data, size_t size) {
 	if (!core.handle) return false;
+	if (session_active) return false;
 	return core.serialize(data, size);
 }
 
 bool retro_unserialize(const void* data, size_t size) {
 	if (!core.handle) return false;
-
-	// A load we did not initiate is the frontend rewinding or loading a state.
-	// Both silently break lockstep, so a live session has to react.
-	if (session_active && !shim_owns_unserialize) {
-		// TODO(netplay): resync from the peer, or drop the link with an overlay.
-		shim_log("frontend-initiated unserialize during session - would desync\n");
+	if (session_active) {
+		shim_log("frontend save-state load blocked during session\n");
+		return false;
 	}
 
 	return core.unserialize(data, size);
@@ -1639,14 +2053,90 @@ void retro_cheat_set(unsigned index, bool enabled, const char* code) {
 	core.cheat_set(index, enabled, code);
 }
 
+static bool hash_content_path(Sha256* hash, const char* path, unsigned depth) {
+	if (depth > 4) return false;
+	FILE* f = fopen(path, "rb");
+	if (!f) return false;
+	uint8_t buf[32768];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), f)) != 0) sha256_update(hash, buf, n);
+	bool ok = !ferror(f);
+	fclose(f);
+	if (!ok) return false;
+
+	const char* ext = strrchr(path, '.');
+	bool cue = ext && !strcasecmp(ext, ".cue");
+	bool m3u = ext && (!strcasecmp(ext, ".m3u") || !strcasecmp(ext, ".m3u8"));
+	if (!cue && !m3u) return true;
+	f = fopen(path, "r");
+	if (!f) return false;
+	char dir[1024], line[2048];
+	snprintf(dir, sizeof(dir), "%s", path);
+	char* slash = strrchr(dir, '/');
+	if (slash) *slash = '\0'; else snprintf(dir, sizeof(dir), ".");
+	while (ok && fgets(line, sizeof(line), f)) {
+		char* ref = line;
+		char* end = strpbrk(ref, "\r\n"); if (end) *end = '\0';
+		if (cue) {
+			while (*ref == ' ' || *ref == '\t') ref++;
+			if (strncasecmp(ref, "FILE", 4) || (ref[4] != ' ' && ref[4] != '\t')) continue;
+			ref += 4; while (*ref == ' ' || *ref == '\t') ref++;
+			if (*ref == '"') { ref++; end = strchr(ref, '"'); }
+			else { end = strpbrk(ref, " \t"); }
+			if (end) *end = '\0';
+		} else {
+			while (*ref == ' ' || *ref == '\t') ref++;
+			if (!*ref || *ref == '#') continue;
+			end = ref + strlen(ref);
+			while (end > ref && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+		}
+		if (!*ref) continue;
+		char child[2048];
+		if (ref[0] == '/') snprintf(child, sizeof(child), "%s", ref);
+		else snprintf(child, sizeof(child), "%s/%s", dir, ref);
+		static const uint8_t separator[] = { 0, 'R', 'E', 'F', 0 };
+		sha256_update(hash, separator, sizeof(separator));
+		ok = hash_content_path(hash, child, depth + 1);
+	}
+	fclose(f);
+	return ok;
+}
+
+static bool hash_game_content(const struct retro_game_info* game, uint8_t out[32]) {
+	Sha256 hash;
+	sha256_init(&hash);
+	if (game && game->data && game->size) {
+		sha256_update(&hash, game->data, game->size);
+	} else if (game && game->path) {
+		if (!hash_content_path(&hash, game->path, 0)) return false;
+	} else return false;
+	sha256_final(&hash, out);
+	return true;
+}
+
 bool retro_load_game(const struct retro_game_info* game) {
 	ensure_loaded();
+	if (session_active && netplay_mode) {
+		rom_hash_ready = hash_game_content(game, rom_sha256);
+		if (!rom_hash_ready) {
+			shim_log("cannot hash ROM content - shared-screen netplay disabled\n");
+			netplay_mode = 0;
+		} else {
+			shim_log("ROM SHA-256: %02x%02x%02x%02x...%02x%02x%02x%02x\n",
+			         rom_sha256[0], rom_sha256[1], rom_sha256[2], rom_sha256[3],
+			         rom_sha256[28], rom_sha256[29], rom_sha256[30], rom_sha256[31]);
+		}
+	} else rom_hash_ready = 0;
 	return core.load_game(game);
 }
 
 bool retro_load_game_special(unsigned game_type, const struct retro_game_info* info, size_t num_info) {
 	ensure_loaded();
 	if (!core.load_game_special) return false;
+	if (session_active && netplay_mode) {
+		shim_log("multi-content games do not yet have a complete ROM-set hash - shared-screen netplay disabled\n");
+		netplay_mode = 0;
+	}
 	return core.load_game_special(game_type, info, num_info);
 }
 
@@ -1662,10 +2152,23 @@ unsigned retro_get_region(void) {
 
 void* retro_get_memory_data(unsigned id) {
 	if (!core.handle) return NULL;
+	/* Minarch uses these entry points for both its startup read and its
+	 * menu/sleep/exit writes. On a shared-screen guest, hide persistent memory
+	 * from the frontend in both directions. Protocol code above deliberately
+	 * calls core.get_memory_* directly, so the guest core still receives and
+	 * uses the host's authoritative in-memory copy. */
+	if (session_active && netplay_mode &&
+	    NetLink_getRole() == NETLINK_ROLE_CLIENT &&
+	    (id == RETRO_MEMORY_SAVE_RAM || id == RETRO_MEMORY_RTC))
+		return NULL;
 	return core.get_memory_data(id);
 }
 
 size_t retro_get_memory_size(unsigned id) {
 	if (!core.handle) return 0;
+	if (session_active && netplay_mode &&
+	    NetLink_getRole() == NETLINK_ROLE_CLIENT &&
+	    (id == RETRO_MEMORY_SAVE_RAM || id == RETRO_MEMORY_RTC))
+		return 0;
 	return core.get_memory_size(id);
 }

@@ -16,12 +16,13 @@
 #include <unistd.h>
 
 #define NETLINK_MAGIC    0x4E504C4BU /* 'NPLK' */
-#define NETLINK_PROTOCOL 3
+#define NETLINK_PROTOCOL 7
 
 #define QUEUE_SIZE    512
 /* Inputs are indexed by frame; the ring only has to outlast the input delay
  * plus any burst of catch-up packets. */
 #define INPUT_RING    256
+#define HASH_RING       8
 #define STATE_CHUNK   1024
 /* Stop reading the socket above this; TCP holds the rest for us. */
 #define QUEUE_HIGH_WATER (QUEUE_SIZE - 64)
@@ -49,7 +50,12 @@ enum {
 	CMD_INPUT  = 0x05, /* {frame, buttons} */
 	CMD_STATE  = 0x06, /* {total, offset, bytes} */
 	CMD_HASH   = 0x07, /* {frame, hash} */
-	CMD_CORE   = 0x08, /* {total, offset, bytes} - same shape as CMD_STATE */
+	CMD_RESYNC_REQUEST = 0x08, /* {mismatched frame} */
+	CMD_RESYNC_BEGIN   = 0x09, /* {epoch, resume_frame}; CMD_STATE follows */
+	CMD_RESYNC_ACK     = 0x0A, /* {epoch, loaded} */
+	CMD_RESYNC_COMMIT  = 0x0B, /* {epoch} */
+	CMD_SESSION_IDENTITY = 0x0C, /* {rom sha256, core id, state size} */
+	CMD_CHECKPOINT_ACK = 0x0D, /* {frame, hash, matched} */
 };
 
 typedef struct __attribute__((packed)) {
@@ -61,15 +67,6 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
 	uint32_t magic;
 	uint32_t protocol;
-	/* Core identity, so a build mismatch is known before a frame is emulated
-	 * rather than discovered as a desync ten minutes in. */
-	uint32_t core_crc;
-	uint32_t core_size;
-	uint16_t core_machine;
-	uint8_t  core_can_send;
-	char     core_version[NETLINK_VERSION_LEN];
-	uint32_t core_glibc;
-	uint32_t runtime_glibc;
 } NetLinkHello;
 
 typedef struct {
@@ -107,28 +104,26 @@ static struct {
 
 	uint8_t* state_buf;
 	size_t   state_len;
-	/* Core transfer: same shape as the state slot, kept separate because the
-	 * two overlap in time - the core arrives before the state does. */
-	uint8_t* core_buf;
-	size_t   core_len;
-	size_t   core_have;
-	bool     core_ready;
-	NetLinkCoreId core_id;
-	NetLinkCoreId peer_core_id;
-	bool     peer_core_known;
 	size_t   state_have;
 	bool     state_ready;
 
-	uint32_t peer_hash_frame;
-	uint32_t peer_hash;
-	bool     peer_hash_ready;
+	struct {
+		uint32_t frame;
+		uint32_t hash;
+	} peer_hashes[HASH_RING];
+	unsigned peer_hash_head;
+	unsigned peer_hash_count;
 
-	/* The identity hash needs its own slot. Sharing one with the divergence
-	 * hashes meant the host's frame 0 hash - sent in the same retro_run - had
-	 * already overwritten it before the client looked, so neither the identity
-	 * check nor the frame 0 handshake verdict ever ran. */
-	uint32_t peer_identity;
-	bool     peer_identity_ready;
+	uint32_t resync_request_frame;
+	bool     resync_request_ready;
+	uint32_t resync_begin_epoch;
+	uint32_t resync_begin_frame;
+	bool     resync_begin_ready;
+	uint32_t resync_ack_epoch;
+	bool     resync_ack_loaded;
+	bool     resync_ack_ready;
+	uint32_t resync_commit_epoch;
+	bool     resync_commit_ready;
 
 	struct timeval last_run;      /* last retro_run, per NetLink_markFrame */
 	struct timeval peer_paused_at;
@@ -138,6 +133,14 @@ static struct {
 
 	bool connect_event;
 	bool disconnect_event;
+	uint32_t connection_generation;
+
+	NetLinkSessionIdentity peer_session_identity;
+	bool peer_session_identity_ready;
+	uint32_t checkpoint_ack_frame;
+	uint32_t checkpoint_ack_hash;
+	bool checkpoint_ack_matched;
+	bool checkpoint_ack_ready;
 
 	struct timeval last_rx;
 	struct timeval last_tx;
@@ -168,10 +171,17 @@ static void nl_log(const char* fmt, ...) {
 
 static bool write_all(int fd, const void* buf, size_t len) {
 	const uint8_t* p = buf;
+	struct timeval start;
+	gettimeofday(&start, NULL);
 	while (len) {
 		ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
 		if (n > 0) { p += n; len -= (size_t)n; continue; }
-		if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+		if (n < 0 && errno == EINTR) continue;
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			if (ms_since(&start) > TIMEOUT_MS) return false;
+			usleep(1000);
+			continue;
+		}
 		return false;
 	}
 	return true;
@@ -311,14 +321,7 @@ uint16_t NetLink_remoteClientId(void) {
 static bool exchange_hello(int fd) {
 	NetLinkHello mine = {
 		.magic = htonl(NETLINK_MAGIC), .protocol = htonl(NETLINK_PROTOCOL),
-		.core_crc     = htonl(nl.core_id.crc),
-		.core_size    = htonl(nl.core_id.size),
-		.core_machine = htons(nl.core_id.machine),
-		.core_can_send = nl.core_id.can_send,
-		.core_glibc    = htonl(nl.core_id.core_glibc),
-		.runtime_glibc = htonl(nl.core_id.runtime_glibc),
 	};
-	memcpy(mine.core_version, nl.core_id.version, NETLINK_VERSION_LEN);
 	NetLinkHeader hdr = { .cmd = CMD_HELLO, .size = htons(sizeof(mine)), .client_id = 0 };
 
 	if (!write_all(fd, &hdr, sizeof(hdr)) || !write_all(fd, &mine, sizeof(mine))) return false;
@@ -341,24 +344,6 @@ static bool exchange_hello(int fd) {
 		return false;
 	}
 
-	pthread_mutex_lock(&nl.lock);
-	nl.peer_core_id.crc      = ntohl(theirs.core_crc);
-	nl.peer_core_id.size     = ntohl(theirs.core_size);
-	nl.peer_core_id.machine  = ntohs(theirs.core_machine);
-	nl.peer_core_id.can_send = theirs.core_can_send;
-	nl.peer_core_id.core_glibc    = ntohl(theirs.core_glibc);
-	nl.peer_core_id.runtime_glibc = ntohl(theirs.runtime_glibc);
-	memcpy(nl.peer_core_id.version, theirs.core_version, NETLINK_VERSION_LEN);
-	nl.peer_core_id.version[NETLINK_VERSION_LEN - 1] = '\0';
-	nl.peer_core_known = true;
-	pthread_mutex_unlock(&nl.lock);
-
-	nl_log("peer core: crc=%08x size=%u machine=%u version='%s' needs glibc %u.%u, has %u.%u%s\n",
-	       ntohl(theirs.core_crc), ntohl(theirs.core_size), ntohs(theirs.core_machine),
-	       nl.peer_core_id.version,
-	       ntohl(theirs.core_glibc) / 1000, ntohl(theirs.core_glibc) % 1000,
-	       ntohl(theirs.runtime_glibc) / 1000, ntohl(theirs.runtime_glibc) % 1000,
-	       theirs.core_can_send ? " (can share)" : "");
 	return true;
 }
 
@@ -493,8 +478,12 @@ static void* worker(void* arg) {
 
 			pthread_mutex_lock(&nl.lock);
 			nl.fd = fd;
+			nl.peer_session_identity_ready = false;
+			nl.checkpoint_ack_ready = false;
 			nl.connected = true;
 			nl.connect_event = true;
+			nl.connection_generation++;
+			if (!nl.connection_generation) nl.connection_generation++;
 			gettimeofday(&nl.last_rx, NULL);
 			gettimeofday(&nl.last_tx, NULL);
 			pthread_mutex_unlock(&nl.lock);
@@ -627,22 +616,33 @@ static void* worker(void* arg) {
 			size_t   n     = size - 8;
 
 			pthread_mutex_lock(&nl.lock);
-			if (!nl.state_buf || nl.state_len != total) {
+			bool valid = total != 0 && total <= NETLINK_MAX_STATE &&
+			             off <= total && n <= total - off;
+			if (!valid) {
+				nl_log("bad state chunk (total=%u off=%u n=%zu) - ignoring\n", total, off, n);
+			} else if (!nl.state_buf || nl.state_len != total || off == 0) {
 				free(nl.state_buf);
-	free(nl.core_buf);
 				nl.state_buf = malloc(total);
 				nl.state_len = total;
 				nl.state_have = 0;
 				nl.state_ready = false;
 			}
-			if (nl.state_buf && off + n <= total) {
+			if (valid && nl.state_buf && nl.state_len == total && off == nl.state_have) {
 				memcpy(nl.state_buf + off, buf + 8, n);
 				nl.state_have += n;
 				if (nl.state_have >= total) nl.state_ready = true;
+			} else if (valid && nl.state_buf && off != nl.state_have) {
+				nl_log("out-of-order state chunk (wanted=%zu got=%u) - discarding\n",
+				       nl.state_have, off);
+				free(nl.state_buf);
+				nl.state_buf = NULL;
+				nl.state_len = nl.state_have = 0;
+				nl.state_ready = false;
 			}
 			pthread_mutex_unlock(&nl.lock);
 		}
 
+#if 0 /* Frozen executable transfer path. */
 		if (hdr.cmd == CMD_CORE && size > 8) {
 			uint32_t total = ntohl(*(uint32_t*)buf);
 			uint32_t off   = ntohl(*(uint32_t*)(buf + 4));
@@ -672,19 +672,78 @@ static void* worker(void* arg) {
 				pthread_mutex_unlock(&nl.lock);
 			}
 		}
+#endif
 
 		if (hdr.cmd == CMD_HASH && size == 8) {
 			pthread_mutex_lock(&nl.lock);
 			uint32_t hf = ntohl(*(uint32_t*)buf);
 			uint32_t hv = ntohl(*(uint32_t*)(buf + 4));
-			if (hf == NETLINK_IDENTITY_FRAME) {
-				nl.peer_identity = hv;
-				nl.peer_identity_ready = true;
-			} else {
-				nl.peer_hash_frame = hf;
-				nl.peer_hash = hv;
-				nl.peer_hash_ready = true;
-			}
+			/* Keep every checkpoint until the emulator thread consumes it.
+				 * A single slot let a newer hash overwrite a late older one. */
+				if (nl.peer_hash_count == HASH_RING) {
+					nl.peer_hash_head = (nl.peer_hash_head + 1) % HASH_RING;
+					nl.peer_hash_count--;
+					nl_log("state-hash queue full - dropped oldest checkpoint\n");
+				}
+				unsigned slot = (nl.peer_hash_head + nl.peer_hash_count) % HASH_RING;
+				nl.peer_hashes[slot].frame = hf;
+				nl.peer_hashes[slot].hash = hv;
+			nl.peer_hash_count++;
+			pthread_mutex_unlock(&nl.lock);
+		}
+
+		if (hdr.cmd == CMD_RESYNC_REQUEST && size == 4) {
+			pthread_mutex_lock(&nl.lock);
+			nl.resync_request_frame = ntohl(*(uint32_t*)buf);
+			nl.resync_request_ready = true;
+			pthread_mutex_unlock(&nl.lock);
+		}
+
+		if (hdr.cmd == CMD_RESYNC_BEGIN && size == 8) {
+			pthread_mutex_lock(&nl.lock);
+			nl.resync_begin_epoch = ntohl(*(uint32_t*)buf);
+			nl.resync_begin_frame = ntohl(*(uint32_t*)(buf + 4));
+			nl.resync_begin_ready = true;
+			/* BEGIN owns the state stream which follows it. */
+			free(nl.state_buf);
+			nl.state_buf = NULL;
+			nl.state_len = nl.state_have = 0;
+			nl.state_ready = false;
+			pthread_mutex_unlock(&nl.lock);
+		}
+
+		if (hdr.cmd == CMD_RESYNC_ACK && size == 8) {
+			pthread_mutex_lock(&nl.lock);
+			nl.resync_ack_epoch = ntohl(*(uint32_t*)buf);
+			nl.resync_ack_loaded = ntohl(*(uint32_t*)(buf + 4)) != 0;
+			nl.resync_ack_ready = true;
+			pthread_mutex_unlock(&nl.lock);
+		}
+
+		if (hdr.cmd == CMD_RESYNC_COMMIT && size == 4) {
+			pthread_mutex_lock(&nl.lock);
+			nl.resync_commit_epoch = ntohl(*(uint32_t*)buf);
+			nl.resync_commit_ready = true;
+			pthread_mutex_unlock(&nl.lock);
+		}
+
+		if (hdr.cmd == CMD_SESSION_IDENTITY && size == 48) {
+			pthread_mutex_lock(&nl.lock);
+			memcpy(nl.peer_session_identity.rom_sha256, buf, 32);
+			nl.peer_session_identity.core_identity = ntohl(*(uint32_t*)(buf + 32));
+			nl.peer_session_identity.state_size = ntohl(*(uint32_t*)(buf + 36));
+			nl.peer_session_identity.sram_size = ntohl(*(uint32_t*)(buf + 40));
+			nl.peer_session_identity.rtc_size = ntohl(*(uint32_t*)(buf + 44));
+			nl.peer_session_identity_ready = true;
+			pthread_mutex_unlock(&nl.lock);
+		}
+
+		if (hdr.cmd == CMD_CHECKPOINT_ACK && size == 12) {
+			pthread_mutex_lock(&nl.lock);
+			nl.checkpoint_ack_frame = ntohl(*(uint32_t*)buf);
+			nl.checkpoint_ack_hash = ntohl(*(uint32_t*)(buf + 4));
+			nl.checkpoint_ack_matched = ntohl(*(uint32_t*)(buf + 8)) != 0;
+			nl.checkpoint_ack_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
 
@@ -776,6 +835,13 @@ bool NetLink_consumeDisconnectEvent(void) {
 	return e;
 }
 
+uint32_t NetLink_connectionGeneration(void) {
+	pthread_mutex_lock(&nl.lock);
+	uint32_t generation = nl.connection_generation;
+	pthread_mutex_unlock(&nl.lock);
+	return generation;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // shared-screen netplay
 //////////////////////////////////////////////////////////////////////////////
@@ -787,7 +853,10 @@ void NetLink_resetSync(void) {
 	nl.state_buf = NULL;
 	nl.state_len = nl.state_have = 0;
 	nl.state_ready = false;
-	nl.peer_hash_ready = false;
+	nl.peer_hash_head = nl.peer_hash_count = 0;
+	nl.checkpoint_ack_ready = false;
+	nl.resync_request_ready = nl.resync_begin_ready = false;
+	nl.resync_ack_ready = nl.resync_commit_ready = false;
 	pthread_mutex_unlock(&nl.lock);
 }
 
@@ -826,6 +895,7 @@ bool NetLink_sendState(const void* data, size_t len) {
 	return true;
 }
 
+#if 0 /* Frozen executable-sharing API. */
 void NetLink_setCoreId(const NetLinkCoreId* id) {
 	pthread_mutex_lock(&nl.lock);
 	nl.core_id = *id;
@@ -872,6 +942,7 @@ bool NetLink_takeCore(void** data, size_t* len) {
 	pthread_mutex_unlock(&nl.lock);
 	return true;
 }
+#endif
 
 bool NetLink_takeState(void** data, size_t* len) {
 	pthread_mutex_lock(&nl.lock);
@@ -892,22 +963,124 @@ void NetLink_sendHash(uint32_t frame, uint32_t hash) {
 	pthread_mutex_unlock(&nl.lock);
 }
 
-bool NetLink_takeIdentity(uint32_t* identity) {
+bool NetLink_sendSessionIdentity(const NetLinkSessionIdentity* identity) {
+	uint8_t wire[48];
+	memcpy(wire, identity->rom_sha256, 32);
+	uint32_t v = htonl(identity->core_identity); memcpy(wire + 32, &v, 4);
+	v = htonl(identity->state_size); memcpy(wire + 36, &v, 4);
+	v = htonl(identity->sram_size); memcpy(wire + 40, &v, 4);
+	v = htonl(identity->rtc_size); memcpy(wire + 44, &v, 4);
 	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.peer_identity_ready;
-	if (ok) { *identity = nl.peer_identity; nl.peer_identity_ready = false; }
+	bool ok = nl.connected && send_framed(CMD_SESSION_IDENTITY, wire, sizeof(wire), NetLink_localClientId());
+	pthread_mutex_unlock(&nl.lock);
+	return ok;
+}
+
+bool NetLink_takeSessionIdentity(NetLinkSessionIdentity* identity) {
+	pthread_mutex_lock(&nl.lock);
+	bool ok = nl.peer_session_identity_ready;
+	if (ok) { *identity = nl.peer_session_identity; nl.peer_session_identity_ready = false; }
+	pthread_mutex_unlock(&nl.lock);
+	return ok;
+}
+
+bool NetLink_ackCheckpoint(uint32_t frame, uint32_t hash, bool matched) {
+	uint32_t wire[3] = { htonl(frame), htonl(hash), htonl(matched ? 1u : 0u) };
+	pthread_mutex_lock(&nl.lock);
+	bool ok = nl.connected && send_framed(CMD_CHECKPOINT_ACK, wire, sizeof(wire), NetLink_localClientId());
+	pthread_mutex_unlock(&nl.lock);
+	return ok;
+}
+
+bool NetLink_takeCheckpointAck(uint32_t* frame, uint32_t* hash, bool* matched) {
+	pthread_mutex_lock(&nl.lock);
+	bool ok = nl.checkpoint_ack_ready;
+	if (ok) {
+		*frame = nl.checkpoint_ack_frame;
+		*hash = nl.checkpoint_ack_hash;
+		*matched = nl.checkpoint_ack_matched;
+		nl.checkpoint_ack_ready = false;
+	}
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
 }
 
 bool NetLink_takeHash(uint32_t* frame, uint32_t* hash) {
 	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.peer_hash_ready;
+	bool ok = nl.peer_hash_count != 0;
 	if (ok) {
-		*frame = nl.peer_hash_frame;
-		*hash  = nl.peer_hash;
-		nl.peer_hash_ready = false;
+		*frame = nl.peer_hashes[nl.peer_hash_head].frame;
+		*hash  = nl.peer_hashes[nl.peer_hash_head].hash;
+		nl.peer_hash_head = (nl.peer_hash_head + 1) % HASH_RING;
+		nl.peer_hash_count--;
 	}
+	pthread_mutex_unlock(&nl.lock);
+	return ok;
+}
+
+static bool send_u32_control(uint8_t cmd, uint32_t value) {
+	uint32_t wire = htonl(value);
+	pthread_mutex_lock(&nl.lock);
+	bool ok = nl.connected && send_framed(cmd, &wire, sizeof(wire), NetLink_localClientId());
+	pthread_mutex_unlock(&nl.lock);
+	return ok;
+}
+
+bool NetLink_requestResync(uint32_t frame) { return send_u32_control(CMD_RESYNC_REQUEST, frame); }
+bool NetLink_commitResync(uint32_t epoch)  { return send_u32_control(CMD_RESYNC_COMMIT, epoch); }
+
+bool NetLink_beginResync(uint32_t epoch, uint32_t resume_frame) {
+	uint32_t wire[2] = { htonl(epoch), htonl(resume_frame) };
+	pthread_mutex_lock(&nl.lock);
+	bool ok = nl.connected && send_framed(CMD_RESYNC_BEGIN, wire, sizeof(wire), NetLink_localClientId());
+	pthread_mutex_unlock(&nl.lock);
+	return ok;
+}
+
+bool NetLink_ackResync(uint32_t epoch, bool loaded) {
+	uint32_t wire[2] = { htonl(epoch), htonl(loaded ? 1u : 0u) };
+	pthread_mutex_lock(&nl.lock);
+	bool ok = nl.connected && send_framed(CMD_RESYNC_ACK, wire, sizeof(wire), NetLink_localClientId());
+	pthread_mutex_unlock(&nl.lock);
+	return ok;
+}
+
+bool NetLink_takeResyncRequest(uint32_t* frame) {
+	pthread_mutex_lock(&nl.lock);
+	bool ok = nl.resync_request_ready;
+	if (ok) { *frame = nl.resync_request_frame; nl.resync_request_ready = false; }
+	pthread_mutex_unlock(&nl.lock);
+	return ok;
+}
+
+bool NetLink_takeResyncBegin(uint32_t* epoch, uint32_t* resume_frame) {
+	pthread_mutex_lock(&nl.lock);
+	bool ok = nl.resync_begin_ready;
+	if (ok) {
+		*epoch = nl.resync_begin_epoch;
+		*resume_frame = nl.resync_begin_frame;
+		nl.resync_begin_ready = false;
+	}
+	pthread_mutex_unlock(&nl.lock);
+	return ok;
+}
+
+bool NetLink_takeResyncAck(uint32_t* epoch, bool* loaded) {
+	pthread_mutex_lock(&nl.lock);
+	bool ok = nl.resync_ack_ready;
+	if (ok) {
+		*epoch = nl.resync_ack_epoch;
+		*loaded = nl.resync_ack_loaded;
+		nl.resync_ack_ready = false;
+	}
+	pthread_mutex_unlock(&nl.lock);
+	return ok;
+}
+
+bool NetLink_takeResyncCommit(uint32_t* epoch) {
+	pthread_mutex_lock(&nl.lock);
+	bool ok = nl.resync_commit_ready;
+	if (ok) { *epoch = nl.resync_commit_epoch; nl.resync_commit_ready = false; }
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
 }

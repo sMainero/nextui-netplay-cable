@@ -3,8 +3,9 @@
 #
 # Needs a NextUI checkout: the UI uses GFX_/PAD_ from common/api.c, which is
 # compiled straight into minarch and so unreachable from the shim. We compile
-# our own copy, exactly as the original pak's app did - at runtime this depends
-# only on libmsettings and SDL, not on a matching NextUI build.
+# our own copy, exactly as the original pak's app did. The source and platform
+# flags must come from the matching NextUI tree because platform.c is part of
+# the app and is not a stable external SDK.
 #
 #   make PLATFORM=tg5040 NEXTUI=/path/to/NextUI
 ###########################################################
@@ -27,6 +28,11 @@ WS       = $(NEXTUI)/workspace
 COMMON   = $(WS)/all/common
 PLATDIR  = $(WS)/$(PLATFORM)/platform
 
+# This is the platform ABI contract: CPU tuning, SDL/GLES include paths and the
+# exact platform libraries. Reconstructing it here had already made tg5050 and
+# my355 generic aarch64 builds and missed h700's GLES linking exception.
+include $(PLATDIR)/makefile.env
+
 SOURCE   = main.c netsetup.c \
            $(COMMON)/api.c $(COMMON)/utils.c $(COMMON)/config.c $(COMMON)/scaler.c \
            $(PLATDIR)/platform.c
@@ -39,24 +45,12 @@ INCDIR   = -I. -I$(COMMON) -I$(PLATDIR) -I$(WS)/$(PLATFORM)/libmsettings
 ifneq (,$(SDKPREFIX))
 INCDIR  += -I$(SDKPREFIX)/include
 endif
-CFLAGS  += $(INCDIR) -DPLATFORM=\"$(PLATFORM)\" -std=gnu99 -O2
-CFLAGS  += -DUSE_SDL2 -DUSE_GLES -DGL_GLEXT_PROTOTYPES
-CFLAGS  += -I$(PREFIX)/include -I$(PREFIX_LOCAL)/include
-LDFLAGS += -L$(PREFIX)/lib -L$(PREFIX_LOCAL)/lib -L$(PREFIX)/lib/$(CROSS_TRIPLE)
+CFLAGS  += $(OPT) $(INCDIR) -DPLATFORM=\"$(PLATFORM)\" -std=gnu99
 LDFLAGS += -L$(WS)/$(PLATFORM)/libmsettings
 ifneq (,$(SDKPREFIX))
 LDFLAGS += -L$(SDKPREFIX)/lib
 endif
-LDFLAGS += $(shell pkg-config --libs sdl2 glesv2 2>/dev/null || echo "-lSDL2 -lGLESv2")
-LDFLAGS += -lSDL2_image -lSDL2_ttf -lmsettings -lsamplerate -lzip -lm -lpthread -ldl -lz
-
-# ALSA only where the sysroot actually has it. my355's does not, and SDL pulls
-# in whatever audio backend it was built against anyway - so naming it
-# unconditionally just fails the link on one platform out of five.
-HAVE_ASOUND := $(shell $(CROSS_COMPILE)gcc -lasound -shared -o /dev/null 2>/dev/null && echo 1)
-ifeq ($(HAVE_ASOUND),1)
-LDFLAGS += -lasound
-endif
+LDFLAGS += -lmsettings -lsamplerate -lzip
 
 PRODUCT = ../bin/$(PLATFORM)/$(TARGET)
 

@@ -35,15 +35,17 @@ out entirely), and its gpsp lacks the original pak's two RFU fixes.
   each way. Also Pokémon.
 - **GB link** (gambatte, Tetris): connects and plays, latency-bound.
 - **Shared-screen netplay**: Streets of Rage, Streets of Rage 2 and Gunstar
-  Heroes all ran with synced inputs. SoR2 "worked fairly well". All eventually
-  desynced - see [Determinism](#determinism).
+  Heroes all ran with synced inputs. Periodic disagreement now triggers a
+  host-authoritative state barrier instead of leaving the screens diverged.
 - **Session app**: host/join, UDP discovery, arming, on both devices.
 - Two independent emulator instances per process - see [Dual instance](#dual-instance).
 
 ### Verified host-side only
 
 Three suites (`shim/test/run.sh`, `shim/test/link.sh`, `launcher/test.sh`), each
-regression confirmed to fail against the bug it covers.
+regression confirmed to fail against the bug it covers. The loopback suite also
+forces a desync, restarts each role independently, verifies host checkpoint
+restore, and rejects different ROM content before state loading.
 
 ### Also working on hardware
 
@@ -299,7 +301,13 @@ cores exchange messages, which is why Brick↔A30 GBA link works across two
 architectures, and why Tetris over gambatte ran 13½ minutes clean while MD was
 still desyncing.
 
-## Sharing cores between devices
+## Sharing cores between devices (frozen historical design)
+
+> **Current behavior:** executable transfer is compiled out. The option remains
+> in Settings and defaults off. Devices exchange metadata only: matching
+> installed builds remain first choice; otherwise, when enabled on both sides,
+> both select their own locally packaged compatibility core. The transfer design
+> and measurements below are retained as history, not as active behavior.
 
 If two devices want to play and their builds differ, one can simply **send the
 other its core**. This is a better answer to build drift than pinning, because it
@@ -368,7 +376,7 @@ Practical: fceumm is ~3MB, a couple of seconds over the ad hoc link (1.7/4.3ms
 RTT, 78ms TCP connect). `cores/staged/` and the existing state-transfer path are
 the natural models.
 
-### What was built
+### What was built before the freeze
 
 Two halves, because the negotiation has to be settled before a core is opened
 and the app cannot know which core a game will use until one is launched.
@@ -498,7 +506,14 @@ Implemented. One instance per device, same game, inputs synced.
 - **State handshake**: the host serialises and ships its state (chunked); the
   client adopts it. Without this the two differ from frame one.
 - **Divergence detection**: FNV-1a state hash every 300 frames, compared and
-  logged. Never applied - no state crosses the wire after the handshake.
+  logged. On a mismatch the client requests an authoritative snapshot; both
+  devices pause, load the host's exact state, discard the old input timeline,
+  and resume only after an acknowledged commit.
+- **Save states unavailable while armed**: the shim reports a serialization
+  size of zero and rejects frontend save/load calls. Stock minarch hardcodes
+  its Save and Load menu rows, so they remain visible but fail closed; actually
+  removing the rows requires shipping a patched frontend. Direct calls into the
+  wrapped core remain available for handshake and recovery.
 - **Port mapping**: stock minarch returns 0 for every port above 0, so the shim
   serves both ports from the synced buffers. Port 0 is the host's input on both
   devices.
@@ -664,12 +679,9 @@ minarch through PATH.
 
 ## Known gaps
 
-- **Core mismatch enforcement is commented out** (`DISABLED FOR TESTING` in
-  `app/main.c`) so testing is not obstructed. Re-enable before release.
 - The shim's `DESYNC` hash needs a volatile-field exclusion list.
 - `CORE MISMATCH` folds in `library_version`, so it flags builds differing only
   in flags - now reported, never enforced.
-- No divergence *recovery*, only detection.
 - **pcsx_rearmed cross-architecture is untested.** Same-architecture determinism
   is established (with `drc_thread` off); my282-to-arm64 is not. Blocked on
   having the same revision built for both - the A30 currently runs `94f15b3`,
@@ -677,20 +689,13 @@ minarch through PATH.
 - **The A30's deployed cores predate its own pins.** `my282/cores/makefile` pins
   pcsx_rearmed to `050981b`; the device reports `94f15b3`. Rebuild and redeploy,
   or the pinning is documentation rather than fact.
-- **Guest mode is designed, not built.** Core sharing, which it assumes, is
-  done - see below.
+- **Guest mode is designed, not built.** Its former dependency on executable
+  core sharing must be redesigned around packaged compatibility cores.
 - **snes9x on the A30 has thin margins.** 2.1x realtime headless, on an ordinary
   ROM; SuperFX and SA-1 titles are much heavier and untested.
 - **Hosting still requires `udhcpd`**, which the A30 lacks. Removable: the
   client already knows the host is at `10.0.0.1`, so a static `10.0.0.2` would
   drop the dependency and widen hosting to any device that can raise an AP.
-- **Pressing Host or Join while already in-session** silently re-arms and can
-  orphan the peer. Needs a confirmation.
-- **The Join list can show one host twice** - once from its announcement, once
-  from its SSID - and picking the wrong entry silently selects the worse
-  transport at `delay 10`.
-- **The armed screen reports the house address when hosting ad hoc**, which is
-  the one address a joining device cannot use. Should read `10.0.0.1`.
 - The watchdog still uses a blocking `udhcpc -t 8`. Harmless - it runs detached,
   where ~24s costs nothing - but it is the same call the app had to bound.
 
@@ -698,12 +703,10 @@ minarch through PATH.
 
 1. **Static addressing** to drop `udhcpd`, so hosting is not gated on a binary
    half the measured fleet lacks.
-2. The two Join/armed-screen display bugs above - small, and both actively
-   mislead about which transport is in use.
-3. Confirmation when Host or Join is pressed mid-session.
-4. Volatile-field exclusion for the state hash.
-5. Ship or pin fceumm - the only remaining core whose release drift changes
+2. Volatile-field exclusion for the state hash.
+3. Ship or pin fceumm - the only remaining core whose release drift changes
    behaviour without changing state size is pcsx_rearmed, and fceumm is the
    cheapest to bundle (pure C, ~3MB).
-6. Core sharing, then guest mode - in that order, since guest mode assumes it.
-7. Dual instance for GB link, if the latency ceiling proves annoying enough.
+4. Authentication/signing before reconsidering core sharing; redesign guest
+   mode around packaged compatibility cores in the meantime.
+5. Dual instance for GB link, if the latency ceiling proves annoying enough.

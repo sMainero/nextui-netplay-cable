@@ -40,8 +40,8 @@ static Screen screen = SCREEN_MENU;
 static int    menu_sel = 0;
 static int    sub_sel = 0;
 static char   status[128] = "";
-/* Appended to the armed line: whether cores had to be exchanged is exactly the
- * kind of thing that is invisible until a session desyncs. */
+/* Appended to the armed line: whether local compatibility cores were selected
+ * is exactly the kind of thing that is otherwise invisible until a desync. */
 static char   core_note[64] = "";
 
 static NS_Check checks[8];
@@ -60,6 +60,28 @@ static NS_Peer adhoc[NS_MAX_PEERS];
 static int     adhoc_count = 0;
 static int     join_total = 0;      /* peer_count + adhoc_count */
 static NS_Peer* join_at(int i) { return i < peer_count ? &peers[i] : &adhoc[i - peer_count]; }
+
+/* A hotspot can be visible both through its last broadcast announcement and
+ * through the WiFi scan. They are two sightings of one host, not two choices.
+ * Prefer the announcement: it carries platform metadata and credentials. */
+static void dedupe_adhoc(void) {
+	int kept = 0;
+	for (int i = 0; i < adhoc_count; i++) {
+		bool duplicate = false;
+		for (int j = 0; j < peer_count; j++) {
+			if (peers[j].hotspot && peers[j].ssid[0] &&
+			    !strcmp(peers[j].ssid, adhoc[i].ssid)) {
+				duplicate = true;
+				break;
+			}
+		}
+		if (!duplicate) {
+			if (kept != i) adhoc[kept] = adhoc[i];
+			kept++;
+		}
+	}
+	adhoc_count = kept;
+}
 
 static char local_ip[NS_IP_LEN] = "?";
 static char hs_ssid[NS_SSID_LEN];
@@ -124,7 +146,7 @@ static int draw_row(SDL_Surface* screen_s, const char* text, int y, bool selecte
 enum { MENU_HOST, MENU_JOIN, MENU_TOOLS, MENU_COUNT };
 enum { HOST_ADHOC, HOST_WIFI, HOST_COUNT };
 enum { TOOL_SETTINGS, TOOL_CHECKS, TOOL_FIXWIFI, TOOL_OFF, TOOL_COUNT };
-enum { SET_SHARE, SET_SIMPLE, SET_INSTANCED, SET_COUNT };
+enum { SET_SHARE, SET_COMPAT, SET_SIMPLE, SET_INSTANCED, SET_COUNT };
 
 static const char* menu_label(int item) {
 	switch (item) {
@@ -170,7 +192,10 @@ static void setting_row(char* out, int len, int item) {
 	NS_Settings* c = NS_settings();
 	switch (item) {
 	case SET_SHARE:
-		snprintf(out, len, "Share compatible cores:  %s", c->share_cores ? "Yes" : "No");
+		snprintf(out, len, "Share cores:  %s", c->share_cores ? "Yes" : "No");
+		break;
+	case SET_COMPAT:
+		snprintf(out, len, "Use compatibility cores:  %s", c->compatibility_cores ? "Yes" : "No");
 		break;
 	case SET_SIMPLE:
 		snprintf(out, len, "Simple client:  %s", c->simple_client ? "Yes" : "No");
@@ -323,7 +348,9 @@ static void render(SDL_Surface* s) {
 		const char* hint = "";
 		switch (settings_sel) {
 		case SET_SHARE:
-			hint = "Send our core to a peer whose build differs."; break;
+			hint = "Frozen for now; no core files are transferred."; break;
+		case SET_COMPAT:
+			hint = "Use pak cores only when installed builds differ."; break;
 		case SET_SIMPLE:
 			hint = "Host supplies the game; this device just joins."; break;
 		case SET_INSTANCED:
@@ -450,31 +477,27 @@ static void render(SDL_Surface* s) {
 static void do_arm(NS_Role role, const char* peer) {
 	char err[96] = "";
 
-	// DISABLED FOR TESTING - re-enable before release.
-	// Refusing to arm on a platform mismatch gets in the way of trying
-	// things; a mismatch is now only reported in the game's log.
-	// Shared-screen netplay needs both devices to compute the same thing, which
-	// means the same core built the same way. NextUI builds each platform
-	// separately: picodrive uses a hand-written 68k recompiler on armv7 and a
-	// portable C core on aarch64, and SFC is snes9x on one target and
-	// snes9x2005 on another. Different platforms diverge within seconds.
-	// Link play has no such requirement - each side runs its own game and the
-	// cores exchange messages, so mixed devices are fine there.
-//	if (mode == NS_MODE_NETPLAY && role == NS_ROLE_CLIENT &&
-//	    strcmp(peers[peer_sel].platform, NS_platform()) != 0) {
-//		snprintf(status, sizeof(status),
-//		         "Shared screen needs two %s devices (host is %s). Try link cable.",
-//		         NS_platform(), peers[peer_sel].platform);
-//		screen = SCREEN_MENU;
-//		return;
-//	}
+	/* Never overwrite a live session. Re-arming used to orphan the existing
+	 * peer and could replace its transport underneath a running game. */
+	if (NS_isArmed()) {
+		snprintf(status, sizeof(status), "End the current session with X first.");
+		screen = SCREEN_MENU;
+		return;
+	}
 
-//	check_count = NS_runChecks(checks, 8, &check_worst);
-//	if (check_worst == NS_CHECK_FAIL) {
-//		snprintf(status, sizeof(status), "Checks failed - not arming");
-//		screen = SCREEN_CHECKS;
-//		return;
-//	}
+	/* These are launch-path invariants, not optional diagnostics. If one fails,
+	 * arming would appear successful but games would either bypass the shim or
+	 * use the wrong save path. Cross-platform compatibility is decided by the
+	 * core manifest exchange below, so the old crude platform check is gone. */
+	check_count = NS_runChecks(checks, 8, &check_worst);
+	if (check_worst == NS_CHECK_FAIL) {
+		NS_announceStop();
+		NS_hotspotStop();
+		hosting_hotspot = 0;
+		snprintf(status, sizeof(status), "Checks failed - not arming");
+		screen = SCREEN_CHECKS;
+		return;
+	}
 
 	if (!NS_arm(role, peer, err, sizeof(err))) {
 		snprintf(status, sizeof(status), "%s", err[0] ? err : "could not arm");
@@ -489,19 +512,25 @@ static void do_arm(NS_Role role, const char* peer) {
 	/* Settle the builds now, while the user is still choosing a game, rather
 	 * than in front of a launch. The host serves from its hosting tick; the
 	 * client drives the exchange here. */
-	NS_coreStagedClear();
 	if (role == NS_ROLE_HOST) {
-		NS_coreServeStart();
-	} else if (NS_settings()->share_cores) {
+		NS_compatServeStart();
+	} else if (NS_settings()->compatibility_cores) {
 		set_progress("Checking cores", "Comparing builds with the host.");
 		draw_progress("Comparing builds", 1, 1);
 		char cerr[128] = "";
-		int staged = NS_coreSync(peer, cerr, sizeof(cerr));
+		int selected = NS_compatSync(peer, cerr, sizeof(cerr));
 		set_progress("Joining", "This can take up to a minute.");
-		if (staged > 0)
-			snprintf(core_note, sizeof(core_note), "  -  %d core(s) synced", staged);
-		else if (staged < 0)
-			snprintf(core_note, sizeof(core_note), "  -  cores not checked (%s)", cerr);
+		if (selected > 0)
+			snprintf(core_note, sizeof(core_note), "  -  %d compatibility fallback(s)", selected);
+		else if (selected < 0) {
+			/* Compatibility selection is part of arming, not an optional status
+			 * probe. Continuing after it fails can put the peers on different
+			 * cores, which is guaranteed to desynchronize shared-screen play. */
+			NS_endSession();
+			snprintf(status, sizeof(status), "Core check failed: %s", cerr);
+			screen = SCREEN_MENU;
+			return;
+		}
 		else
 			core_note[0] = '\0';
 	}
@@ -565,8 +594,7 @@ int main(int argc, char* argv[]) {
 			NS_endSession();
 			set_progress("Joining", "This can take up to a minute.");
 			NS_announceStop();
-			NS_coreServeStop();
-			NS_coreStagedClear();
+			NS_compatServeStop();
 			core_note[0] = '\0';
 			hosting_hotspot = 0;
 			/* Forced, not the 5s poll. The cached values are from before the
@@ -583,13 +611,18 @@ int main(int argc, char* argv[]) {
 
 		switch (screen) {
 		case SCREEN_MENU:
-			NS_coreServeTick();   /* still serving while armed, wherever we are */
+			NS_compatServeTick();   /* still serving while armed, wherever we are */
 			if (PAD_justPressed(BTN_UP))   { menu_sel = (menu_sel + MENU_COUNT - 1) % MENU_COUNT; dirty = 1; }
 			if (PAD_justPressed(BTN_DOWN)) { menu_sel = (menu_sel + 1) % MENU_COUNT; dirty = 1; }
 			if (PAD_justPressed(BTN_B))    quit = 1;
 			if (PAD_justPressed(BTN_A)) {
 				status[0] = '\0';
 				sub_sel = 0;
+				if (NS_isArmed() && (menu_sel == MENU_HOST || menu_sel == MENU_JOIN)) {
+					snprintf(status, sizeof(status), "End the current session with X first.");
+					dirty = 1;
+					break;
+				}
 				switch (menu_sel) {
 				case MENU_HOST:  screen = SCREEN_HOST_MENU; break;
 				case MENU_TOOLS: screen = SCREEN_TOOLS; break;
@@ -632,6 +665,7 @@ int main(int argc, char* argv[]) {
 						break;   // stay here so the reason is readable
 					}
 					hosting_hotspot = 1;
+					snprintf(local_ip, sizeof(local_ip), "%s", NS_HOTSPOT_HOST_IP);
 					NS_announceHotspot(hs_ssid, hs_psk);
 				} else {
 					// Leaving an AP up would share one radio and one channel
@@ -703,7 +737,8 @@ int main(int argc, char* argv[]) {
 			if (PAD_justPressed(BTN_A)) {
 				status[0] = '\0';
 				switch (settings_sel) {
-				case SET_SHARE:  c->share_cores   = !c->share_cores;   break;
+				case SET_SHARE:  c->share_cores = !c->share_cores; break;
+				case SET_COMPAT: c->compatibility_cores = !c->compatibility_cores; break;
 				case SET_SIMPLE: c->simple_client = !c->simple_client; break;
 				case SET_INSTANCED:
 					/* Cycles No -> Yes (all) -> pick, and the third state opens
@@ -755,7 +790,7 @@ int main(int argc, char* argv[]) {
 			NS_announceTick();
 			/* Non-blocking accept, so this costs nothing until a client
 			 * actually connects to compare builds. */
-			NS_coreServeTick();
+			NS_compatServeTick();
 
 			// The client list is read at render time, but this screen only
 			// redrew on a keypress - so a device that joined after the screen
@@ -782,6 +817,7 @@ int main(int argc, char* argv[]) {
 		case SCREEN_JOINING: {
 			int n = NS_discoverTick(peers, NS_MAX_PEERS);
 			if (n != peer_count) { peer_count = n; dirty = 1; }
+			dedupe_adhoc();
 			join_total = peer_count + adhoc_count;
 			if (peer_sel >= join_total) peer_sel = join_total ? join_total - 1 : 0;
 
@@ -795,6 +831,7 @@ int main(int argc, char* argv[]) {
 				snprintf(status, sizeof(status), "Scanning for ad hoc networks...");
 				render(s);
 				adhoc_count = NS_scanAdhoc(adhoc, NS_MAX_PEERS);
+				dedupe_adhoc();
 				join_total = peer_count + adhoc_count;
 				snprintf(status, sizeof(status), "%d ad hoc network(s) found.", adhoc_count);
 				dirty = 1;
@@ -837,7 +874,7 @@ int main(int argc, char* argv[]) {
 			 * host that had moved on - which is where arming leaves it, and
 			 * where it sits while choosing a game - silently stopped answering
 			 * core requests. Non-blocking and a no-op when not hosting. */
-			NS_coreServeTick();
+			NS_compatServeTick();
 			if (PAD_justPressed(BTN_B) || PAD_justPressed(BTN_A)) { screen = SCREEN_MENU; dirty = 1; }
 			break;
 		}

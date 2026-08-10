@@ -31,7 +31,8 @@ seams netplay needs:
 | `retro_set_environment` | answering `SET_NETPACKET_INTERFACE` ourselves — GB/GBA link on a stock frontend, no `ma_environment.c` patch (**done**) |
 | `retro_set_input_state` | `Netplay_getPlayerButtons` in `ma_input.c` |
 | `retro_run` | frame gating; returning without running the core is a legal frame skip that keeps the frontend responsive |
-| `retro_serialize` / `retro_unserialize` | rollback, plus detection of frontend-initiated loads (rewind, load state) that would silently desync |
+| `retro_serialize` / `retro_unserialize` | hide frontend save states while preserving protocol-owned initial sync and authoritative recovery |
+| `retro_get_memory_data` / `retro_get_memory_size` | hide SRAM/RTC from the shared-screen guest frontend while retaining protocol access to the wrapped core's raw buffers |
 | `retro_get_variable` | `minarch_get/setCoreOptionValue`, `forceCoreOptionUpdate`, `saveConfig` |
 | `retro_unload_game` / `retro_load_game` | `minarch_reloadGame` |
 
@@ -154,10 +155,25 @@ survive a reboot; run `sync` then `up` from a `boot.d` hook to persist.
   nothing outside the executable can call in. Session setup moves to the pak app,
   which already compiles its own `api.c`. In-game the shim can only draw into the
   core's framebuffer.
-- **Blocking FF/rewind/save states.** The shim cannot stop the frontend. It does
-  not need to for FF (frame gating neutralises it) and detects rewind/load-state
-  via unserialize provenance. Save state only calls `retro_serialize` and should
-  be harmless once network I/O is off the main loop.
+- **Frontend save states.** During an armed session the shim reports no state
+  capability, so save/load, autosave and auto-resume fail closed. Stock minarch
+  hardcodes its five menu rows and does not inspect that capability when drawing
+  them, so hiding the rows themselves requires a patched minarch binary.
+  Protocol-owned synchronization bypasses the exported wrappers and calls the
+  real core directly.
+
+Persistent game saves are separate from frontend save states. In shared-screen
+mode, the host frontend loads and writes SRAM/RTC normally. Authoritative
+transfers carry the host's raw save-memory and RTC buffers alongside serialized
+core state; the guest uses those buffers in memory, while the shim reports zero
+persistent-memory size to the guest frontend so it neither loads nor writes a
+local save. Disk filenames and rzip compression remain entirely minarch policy.
+The guest core's `GET_SAVE_DIRECTORY` is also redirected to a fresh process-local
+directory under `/tmp`, covering auxiliary files a core manages directly rather
+than exposing as libretro save memory.
+PCSX-ReARMed is forced to `memcard1=libretro` and `memcard2=none` for the session
+so its directly managed second card cannot bypass that policy. Single-player
+core settings are not changed.
 
 Unbinding the shortcuts via config is not a fix: `Config_readControls` reads
 `default_cfg` then `user_cfg`, so the user's bindings win. And forcing a config
@@ -189,7 +205,8 @@ paths were the stock ones:
 `library_name`, `valid_extensions` and `need_fullpath` all arrived verbatim. The
 only warnings in the log (`LEDS_applyRules called before PWR_init`) appear the
 same number of times in logs predating the shim, so they are existing NextUI
-startup noise. SRAM was written on exit.
+startup noise. Outside shared-screen guest mode, SRAM is still written normally
+on exit.
 
 Link play is verified host-side only: `shim/test/link.sh` runs two shim
 instances over loopback with a core that uses the netpacket interface, and
@@ -197,7 +214,9 @@ asserts the interface is accepted, both sides start with the right client ids,
 packets cross in both directions, and teardown reaches the core.
 
 Not yet exercised on device: link play between two units, and the tier 2 bind
-mount. Input-lockstep netplay is not implemented at all.
+mount. Shared-screen input lockstep, authoritative desync recovery, and both
+process-rejoin paths are covered by the host-side integration suite; the rejoin
+paths still need two-device fault testing.
 
 ## Link play
 
@@ -226,6 +245,7 @@ A session is a file:
 role=host|client
 port=55437
 peer=192.168.1.42    # clients only
+session_id=<generated hex> # namespaces host recovery data in /tmp
 ```
 
 `launcher/minarch.elf` finds it at `<pak>/state/session` and exports

@@ -117,7 +117,8 @@ typedef enum {
 } NS_InstMode;
 
 typedef struct {
-	bool        share_cores;    /* send our core to a peer whose build differs */
+	bool        share_cores;    /* frozen: retained so the setting can return later */
+	bool        compatibility_cores; /* fall back to the pak's matched core set */
 	bool        simple_client;  /* act as a thin client: host supplies everything */
 	NS_InstMode instanced;
 	bool        inst_core[NS_INST_CORES];
@@ -134,12 +135,11 @@ bool NS_coreInstalled(const char* core);
 /* --- core manifest ------------------------------------------------------
  *
  * What this device could bring to a session. Built at arm time so the peer's
- * builds are known before a game is picked, which is what lets a transfer
- * happen while the user is still browsing rather than in front of the launch.
+ * installed and packaged builds are known before a game is picked.
  *
  * Identity is the source revision (library_version), not the file CRC: two
- * platforms building the same commit produce different files that emulate
- * identically, so CRC-matching would transfer megabytes to no effect.
+ * platforms building the same commit produce different files that may emulate
+ * identically, so CRC alone is not a useful compatibility verdict.
  */
 #define NS_MAX_MANIFEST 12
 
@@ -151,6 +151,9 @@ typedef struct {
 	uint32_t size;
 	uint16_t machine;        /* ELF e_machine: 40 ARM, 183 AArch64 */
 	uint32_t glibc;          /* highest GLIBC_x.y required, major*1000+minor */
+	bool     installed;
+	char     compat_version[32]; /* pak fallback's source/build identity */
+	bool     compat_available;
 } NS_CoreInfo;
 
 /* Fills out with every netplay-capable core installed here. Costs one dlopen
@@ -161,31 +164,24 @@ int NS_coreManifest(NS_CoreInfo* out, int max);
 /* What this device can load, major*1000+minor. */
 uint32_t NS_runtimeGlibc(void);
 
-/* --- core exchange ------------------------------------------------------
+/* --- core compatibility -------------------------------------------------
  *
- * Moves the build negotiation off the game-launch path. The host serves; the
- * client connects once, after arming, and both learn what the other has. Any
- * core that needs replacing is fetched into cores/staged/, which the shim
- * checks before it opens anything - so by the time a game launches there is
- * nothing left to wait for.
- *
- * Doing this at arm time is the whole point: the transfer happens while the
- * user is still choosing a game, not in front of a black screen.
+ * The devices compare installed-core manifests at arm time. Matching installed
+ * builds remain first choice. When they differ and both devices have the same
+ * pak compatibility build, both session files select that local fallback.
+ * No executable code crosses the network.
  */
 #define NS_CORE_PORT 55439
 
 /* Host: accept and serve one exchange if a client is waiting. Non-blocking on
  * accept, so it can sit in the hosting screen's once-a-second tick. */
-void NS_coreServeStart(void);
-void NS_coreServeTick(void);
-void NS_coreServeStop(void);
+void NS_compatServeStart(void);
+void NS_compatServeTick(void);
+void NS_compatServeStop(void);
 
-/* Client: exchange manifests with the host and stage whatever is needed.
- * Blocking with progress. Returns the number of cores staged, -1 on failure. */
-int NS_coreSync(const char* host_ip, char* err, int errlen);
-
-/* Cores staged for the current session, cleared when it ends. */
-void NS_coreStagedClear(void);
+/* Client: compare manifests with the host. Returns the number of compatibility
+ * fallbacks selected on both devices, or -1 on failure. */
+int NS_compatSync(const char* host_ip, char* err, int errlen);
 
 /* --- discovery ---------------------------------------------------------- */
 

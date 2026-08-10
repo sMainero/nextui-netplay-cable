@@ -1,9 +1,7 @@
 #!/bin/sh
 #
 # Netplay.pak entry point. Runs the session-setup app.
-#
-# Deliberately does NOT run the old src/netplay.elf, which installed patched
-# system binaries - the thing this architecture replaces.
+
 
 DIR="$(dirname "$0")"
 cd "$DIR" || exit 1

@@ -12,7 +12,7 @@
 SUPPORTED_PLATFORMS = tg5040 tg5050 my282 my355 h700
 
 TARGET  = netplay_shim.so
-SOURCES = shim.c netlink.c overlay.c
+SOURCES = shim.c netlink.c overlay.c sha256.c
 INCDIR  = -Iinclude
 WARN    = -Wall -Wextra -Wno-unused-parameter
 
@@ -53,8 +53,10 @@ endif
 # No -flto anywhere: the shim is a thin forwarding layer and LTO buys nothing
 # while making symbol export behaviour harder to reason about.
 ARCH_tg5040 = -mcpu=cortex-a53
-ARCH_tg5050 = -mcpu=cortex-a53
+ARCH_tg5050 = -mcpu=cortex-a55
 ARCH_my282  = -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard
+ARCH_my355  = -mcpu=cortex-a55
+ARCH_h700   = -mcpu=cortex-a53
 
 CFLAGS  = $(ARCH_$(PLATFORM)) -O2 -fomit-frame-pointer -fPIC
 CFLAGS += $(INCDIR) $(WARN) -std=gnu99
@@ -80,6 +82,6 @@ native:
 		-shared -Wl,--no-undefined -fPIC $(INCDIR) $(WARN) -O2 -std=gnu99 -ldl -lpthread
 
 clean:
-	rm -f ../bin/tg5040/$(TARGET) ../bin/tg5050/$(TARGET) ../bin/native/$(TARGET)
+	rm -f $(foreach p,$(SUPPORTED_PLATFORMS),../bin/$(p)/$(TARGET)) ../bin/native/$(TARGET)
 
 .PHONY: all native clean

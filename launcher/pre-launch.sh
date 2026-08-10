@@ -18,8 +18,7 @@
 : "${SDCARD_PATH:=/mnt/SDCARD}"
 : "${PLATFORM:=tg5040}"
 : "${NETPLAY_PAK:=$SDCARD_PATH/Tools/$PLATFORM/Netplay.pak}"
-# Exported because the shim reads it to find cores/staged/ - a plain assignment
-# would be visible to this script and to nothing it runs.
+# Exported for the minarch shadow and any launcher helpers it invokes.
 export NETPLAY_PAK
 
 # Nothing below costs anything without a session, so a stock launch is

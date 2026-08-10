@@ -6,6 +6,10 @@ state/installed_version.txt
 state/netplay.state
 bin/native/
 bin/*/netplay_shim.so
-cores/
+cores/*
+!cores/patches/
+!cores/patches/*.patch
 wrapped/
 dist/
+logs/
+.cache/

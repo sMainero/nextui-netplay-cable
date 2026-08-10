@@ -390,10 +390,10 @@ survive the ssh session dropping (anything that touches `wlan0`), use
 
 ```
 Netplay          Host                        Tools              Settings
-  Host      ->     Create ad hoc network  ->   Settings    ->     Share compatible cores: Yes
-  Join             Host over WiFi             Run checks         Simple client: No
-  Tools                                       Restore WiFi       Instanced cores: No / Yes / >
-                                              Turn off
+  Host      ->     Create ad hoc network  ->   Settings    ->     Share cores: No (frozen)
+  Join             Host over WiFi             Run checks         Use compatibility cores: Yes
+  Tools                                       Restore WiFi       Simple client: No
+                                              Turn off           Instanced cores: No / Yes / >
 ```
 
 `X` ends a session from any screen; the hint only appears when one is armed.
