@@ -170,5 +170,19 @@ ip addr flush dev wlan0 2>/dev/null
 if [ -x /etc/wifi/wifi_init.sh ]; then
 	/etc/wifi/wifi_init.sh stop  >/dev/null 2>&1
 	/etc/wifi/wifi_init.sh start >/dev/null 2>&1
+elif [ -f "$RESTORE" ]; then
+	# A30 has no wifi_init.sh. Replay the command captured before joining,
+	# which is the same portable fallback used by the app and watchdog.
+	OLD_SUPPLICANT=$(head -1 "$RESTORE" 2>/dev/null)
+	if [ -n "$OLD_SUPPLICANT" ]; then
+		sh -c "$OLD_SUPPLICANT" >/dev/null 2>&1
+		w=1
+		while [ $w -le 10 ]; do
+			iw dev wlan0 link 2>/dev/null | grep -q "Connected to" && break
+			sleep 1
+			w=$((w + 1))
+		done
+		udhcpc -i wlan0 -n -q -t 3 -T 2 >/dev/null 2>&1
+	fi
 fi
 exit 1

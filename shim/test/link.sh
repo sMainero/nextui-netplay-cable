@@ -345,6 +345,43 @@ else
 fi
 
 echo
+echo "== shared-screen reset is host-authoritative"
+PORT16=$((PORT + 15))
+printf 'role=host\nport=%s\nmode=netplay\n'                    "$PORT16" > "$OUT/h16.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=netplay\n' "$PORT16" > "$OUT/c16.session"
+
+HARNESS_RESET_AT=260 HARNESS_BUTTONS=17 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
+	NETPLAY_SESSION="$OUT/h16.session" \
+	"$OUT/harness" "$SHIM" 1100 5 > "$OUT/h16.log" 2>&1 &
+H16=$!
+sleep 0.3
+HARNESS_RESET_AT=180 HARNESS_BUTTONS=34 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
+	NETPLAY_SESSION="$OUT/c16.session" \
+	"$OUT/harness" "$SHIM" 1100 5 > "$OUT/c16.log" 2>&1 &
+C16=$!
+wait $H16 2>/dev/null || true
+wait $C16 2>/dev/null || true
+
+expect "$OUT/c16.log" "guest reset rejected" "guest reset was rejected visibly"
+expect "$OUT/h16.log" "core:reset" "host alone reset its core"
+if grep -q "core:reset" "$OUT/c16.log"; then
+	echo "  MISS guest core was reset locally"
+	fail=1
+else
+	echo "  ok   guest core was not reset locally"
+fi
+expect "$OUT/h16.log" "authoritative reset .* sent" "host sent its post-reset state"
+expect "$OUT/c16.log" "authoritative reset .* adopted" "guest adopted the host reset"
+expect "$OUT/h16.log" "authoritative reset .* committed" "host committed reset after guest ACK"
+expect "$OUT/c16.log" "authoritative reset .* committed" "guest resumed only after reset commit"
+if grep -q "DESYNC" "$OUT/h16.log" "$OUT/c16.log"; then
+	echo "  MISS authoritative reset caused a later desync"
+	fail=1
+else
+	echo "  ok   reset timeline stayed synchronized"
+fi
+
+echo
 echo "== a restarted guest rejoins the live host"
 PORT12=$((PORT + 11))
 SID12=$(printf '%032x' "$PORT12")
@@ -539,6 +576,58 @@ w1_run=$(grep -c "core:run" "$OUT/w1.log" || true)
 [ "${w1_run:-0}" -eq 0 ] \
 	&& echo "  ok   core never ran without a peer" \
 	|| { echo "  MISS core ran $w1_run times unsynced"; fail=1; }
+
+echo
+echo "== an unavailable shared-screen peer can continue solo"
+PORT14=$((PORT + 13))
+printf 'role=host\nport=%s\nmode=netplay\n' "$PORT14" > "$OUT/solo.session"
+HARNESS_BUTTONS=256 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
+	NETPLAY_SESSION="$OUT/solo.session" NETPLAY_PEER_TIMEOUT_MS=100 \
+	"$OUT/harness" "$SHIM" 100 10 > "$OUT/solo.log" 2>&1 || true
+expect "$OUT/solo.log" "user continued this game solo" "A chose process-local solo play"
+solo_runs=$(grep -c "core:run" "$OUT/solo.log" || true)
+[ "$solo_runs" -gt 20 ] \
+	&& echo "  ok   local game resumed ($solo_runs frames)" \
+	|| { echo "  MISS local game only ran $solo_runs frames"; fail=1; }
+expect "$OUT/solo.log" "RESULT: ok" "session persistence restrictions remained active"
+
+echo
+echo "== a failed shared-screen session can explicitly retry"
+PORT17=$((PORT + 16))
+printf 'role=host\nport=%s\nmode=netplay\n' "$PORT17" > "$OUT/retry.session"
+# B is the direct Wait/retry action even though Continue solo is highlighted by
+# default. Keeping it held also verifies that edge detection prevents a retry
+# loop once the second wait times out.
+HARNESS_BUTTONS=1 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
+	NETPLAY_SESSION="$OUT/retry.session" NETPLAY_PEER_TIMEOUT_MS=100 \
+	"$OUT/harness" "$SHIM" 80 10 > "$OUT/retry.log" 2>&1 || true
+expect "$OUT/retry.log" "user chose to wait and retry" "B restarted peer discovery"
+retry_runs=$(grep -c "core:run" "$OUT/retry.log" || true)
+[ "$retry_runs" -eq 0 ] \
+	&& echo "  ok   retry did not advance the game without a peer" \
+	|| { echo "  MISS retry advanced $retry_runs game frames without a peer"; fail=1; }
+
+echo
+echo "== mismatched input delay fails before either core advances"
+PORT15=$((PORT + 14))
+printf 'role=host\nport=%s\nmode=netplay\ninput_delay=3\n' "$PORT15" > "$OUT/h15.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=netplay\ninput_delay=10\n' "$PORT15" > "$OUT/c15.session"
+NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h15.session" \
+	"$OUT/harness" "$SHIM" 120 5 > "$OUT/h15.log" 2>&1 &
+H15=$!
+sleep 0.2
+NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c15.session" \
+	"$OUT/harness" "$SHIM" 120 5 > "$OUT/c15.log" 2>&1 &
+C15=$!
+wait $H15 2>/dev/null || true
+wait $C15 2>/dev/null || true
+expect "$OUT/h15.log" "mode/input delay differs" "host rejected mismatched delay"
+expect "$OUT/c15.log" "mode/input delay differs" "client rejected mismatched delay"
+h15_runs=$(grep -c "core:run" "$OUT/h15.log" || true)
+c15_runs=$(grep -c "core:run" "$OUT/c15.log" || true)
+[ "$h15_runs" -eq 0 ] && [ "$c15_runs" -eq 0 ] \
+	&& echo "  ok   neither core advanced with incompatible timing" \
+	|| { echo "  MISS mismatched peers advanced (host=$h15_runs client=$c15_runs)"; fail=1; }
 
 echo
 echo "== mode comes from the core, not the session"

@@ -4,6 +4,7 @@
 
 NETPLAY_CORES="fbneo fceumm snes9x snes9x2005 mednafen_supafaust picodrive pcsx_rearmed gpsp gambatte"
 MOUNTS_FILE="${NETPLAY_MOUNTS_FILE:-/proc/mounts}"
+MOUNTINFO_FILE="${NETPLAY_MOUNTINFO_FILE:-/proc/self/mountinfo}"
 
 mount_core_is_supported() {
 	_wanted="$1"
@@ -31,16 +32,53 @@ mount_source() {
 	awk -v target="$_target" '$2 == target { print $1; exit }' "$MOUNTS_FILE" 2>/dev/null
 }
 
+mount_root() {
+	_target=$(mount_escape_path "$1")
+	awk -v target="$_target" '$5 == target { print $4; exit }' "$MOUNTINFO_FILE" 2>/dev/null
+}
+
+# Resolve a path to the root it has inside its backing filesystem. Bind mounts
+# on exFAT are reported by /proc/mounts as coming from /dev/mmcblk*, which loses
+# the source directory and makes exact ownership checks impossible. mountinfo
+# retains that directory in field 4. Find the longest containing mount point so
+# this also works when the SD card itself is mounted below another filesystem.
+mount_backing_root() {
+	_path=$(mount_escape_path "$1")
+	awk -v path="$_path" '
+		function under(p, m) {
+			return p == m || (substr(p, 1, length(m) + 1) == m "/")
+		}
+		under(path, $5) && length($5) > best {
+			best = length($5); root = $4; point = $5
+		}
+		END {
+			if (!best) exit 1
+			rel = substr(path, length(point) + 1)
+			if (root == "/") print rel == "" ? "/" : rel
+			else print root rel
+		}' "$MOUNTINFO_FILE" 2>/dev/null
+}
+
 mount_is_mounted() {
-	[ -n "$(mount_source "$1")" ]
+	if [ -r "$MOUNTINFO_FILE" ]; then
+		[ -n "$(mount_root "$1")" ]
+	else
+		[ -n "$(mount_source "$1")" ]
+	fi
 }
 
 # Ownership is an exact source/target pairing, not merely "something is mounted
 # here". This prevents Turn off from unmounting another tool's bind mount.
 mount_is_ours() {
 	_target="$1"
-	_expected=$(mount_escape_path "$MOUNT_STAGE/$(basename "$_target")")
-	[ "$(mount_source "$_target")" = "$_expected" ]
+	_expected="$MOUNT_STAGE/$(basename "$_target")"
+	if [ -r "$MOUNTINFO_FILE" ]; then
+		_expected_root=$(mount_backing_root "$_expected") || return 1
+		[ "$(mount_root "$_target")" = "$_expected_root" ]
+	else
+		_expected=$(mount_escape_path "$_expected")
+		[ "$(mount_source "$_target")" = "$_expected" ]
+	fi
 }
 
 mount_fingerprint() {

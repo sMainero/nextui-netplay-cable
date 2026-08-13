@@ -186,6 +186,27 @@ int main(int argc, char** argv) {
 	struct retro_game_info game;
 	memset(&game, 0, sizeof(game));
 	game.path = rompath;
+	void* rom_data = NULL;
+	if (get_info && !info.need_fullpath) {
+		FILE* rom = fopen(rompath, "rb");
+		if (!rom || fseek(rom, 0, SEEK_END) != 0) {
+			fprintf(stderr, "cannot read %s\n", rompath);
+			if (rom) fclose(rom);
+			return 1;
+		}
+		long length = ftell(rom);
+		if (length <= 0 || fseek(rom, 0, SEEK_SET) != 0 ||
+		    !(rom_data = malloc((size_t)length)) ||
+		    fread(rom_data, 1, (size_t)length, rom) != (size_t)length) {
+			fprintf(stderr, "cannot load %s into memory\n", rompath);
+			fclose(rom);
+			free(rom_data);
+			return 1;
+		}
+		fclose(rom);
+		game.data = rom_data;
+		game.size = (size_t)length;
+	}
 	if (!load_game(&game)) { fprintf(stderr, "retro_load_game failed for %s\n", rompath); return 1; }
 
 	size_t sz = ser_size();

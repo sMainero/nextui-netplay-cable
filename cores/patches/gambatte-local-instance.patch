@@ -1,0 +1,152 @@
+Allow a frontend to pair two Gambatte instances over loopback.
+
+The ordinary network slave must poll without blocking, but a local paired
+instance can briefly wait for its concurrently-running master. This rendezvous
+prevents the slave from finishing a frame just before the master posts its
+byte, which would otherwise leave the master blocked until the next frontend
+frame. "Local Server" and "Local Client" are intentionally internal option
+values; they need not appear in RetroArch's option list.
+
+--- a/libgambatte/libretro/libretro.cpp
++++ b/libgambatte/libretro/libretro.cpp
+@@ -1642,7 +1642,9 @@ class SNESInput : public gambatte::InputGetter
+ enum SerialMode {
+    SERIAL_NONE,
+    SERIAL_SERVER,
+-   SERIAL_CLIENT
++   SERIAL_CLIENT,
++   SERIAL_LOCAL_SERVER,
++   SERIAL_LOCAL_CLIENT
+ };
+ static NetSerial gb_net_serial;
+ static SerialMode gb_serialMode = SERIAL_NONE;
+@@ -1657,7 +1659,7 @@ void retro_get_system_info(struct retro_system_info *info)
+ #define GIT_VERSION ""
+ #endif
+ #ifdef HAVE_NETWORK
+-   info->library_version = "v0.5.0-netlink2" GIT_VERSION;
++   info->library_version = "v0.5.0-netlink3" GIT_VERSION;
+ #else
+    info->library_version = "v0.5.0" GIT_VERSION;
+ #endif
+@@ -2429,6 +2431,10 @@ static void check_variables(bool startup)
+          gb_serialMode = SERIAL_SERVER;
+       else if (!strcmp(var.value, "Network Client"))
+          gb_serialMode = SERIAL_CLIENT;
++      else if (!strcmp(var.value, "Local Server"))
++         gb_serialMode = SERIAL_LOCAL_SERVER;
++      else if (!strcmp(var.value, "Local Client"))
++         gb_serialMode = SERIAL_LOCAL_CLIENT;
+    }
+ 
+    var.key = "gambatte_gb_link_network_port";
+@@ -2478,11 +2484,19 @@ static void check_variables(bool startup)
+    switch(gb_serialMode)
+    {
+       case SERIAL_SERVER:
+-         gb_net_serial.start(true, gb_NetworkPort, gb_NetworkClientAddr);
++         gb_net_serial.start(true, gb_NetworkPort, gb_NetworkClientAddr, false);
+          gb.setSerialIO(&gb_net_serial);
+          break;
+       case SERIAL_CLIENT:
+-         gb_net_serial.start(false, gb_NetworkPort, gb_NetworkClientAddr);
++         gb_net_serial.start(false, gb_NetworkPort, gb_NetworkClientAddr, false);
++         gb.setSerialIO(&gb_net_serial);
++         break;
++      case SERIAL_LOCAL_SERVER:
++         gb_net_serial.start(true, gb_NetworkPort, gb_NetworkClientAddr, true);
++         gb.setSerialIO(&gb_net_serial);
++         break;
++      case SERIAL_LOCAL_CLIENT:
++         gb_net_serial.start(false, gb_NetworkPort, gb_NetworkClientAddr, true);
+          gb.setSerialIO(&gb_net_serial);
+          break;
+       default:
+--- a/libgambatte/libretro/net_serial.h
++++ b/libgambatte/libretro/net_serial.h
+@@ -14,7 +14,8 @@ class NetSerial : public gambatte::SerialIO
+ 		NetSerial();
+ 		~NetSerial();
+ 
+-		bool start(bool is_server, int port, const std::string& hostname);
++		bool start(bool is_server, int port, const std::string& hostname,
++		           bool local_link = false);
+ 		void stop();
+ 
+ 		virtual bool check(unsigned char out, unsigned char& in, bool& fastCgb);
+@@ -33,6 +34,7 @@ class NetSerial : public gambatte::SerialIO
+ 
+ 		bool is_stopped_;
+ 		bool is_server_;
++		bool local_link_;
+ 		int  port_;
+ 		std::string hostname_;
+ 
+--- a/libgambatte/libretro/net_serial.cpp
++++ b/libgambatte/libretro/net_serial.cpp
+@@ -12,6 +12,7 @@
+ #else
+ #include <sys/socket.h>
+ #include <sys/ioctl.h>
++#include <poll.h>
+ #include <sys/time.h>
+ #include <netinet/in.h>
+ #include <netinet/tcp.h>
+@@ -47,6 +48,7 @@ static unsigned long elapsed_us(const struct timeval& start)
+ NetSerial::NetSerial()
+ : is_stopped_(true)
+ , is_server_(false)
++, local_link_(false)
+ , port_(12345)
+ , hostname_()
+ , server_fd_(-1)
+@@ -66,20 +68,22 @@ NetSerial::~NetSerial()
+ 	stop();
+ }
+ 
+-bool NetSerial::start(bool is_server, int port, const std::string& hostname)
++bool NetSerial::start(bool is_server, int port, const std::string& hostname,
++		bool local_link)
+ {
+ 	/* Frontends report one global "variables updated" flag. Gambatte used to
+ 	 * tear down Game Link for every unrelated option change, including DMG
+ 	 * colorization. Preserve a healthy link unless its actual configuration
+ 	 * changed. */
+ 	if (!is_stopped_ && is_server_ == is_server && port_ == port &&
+-	    hostname_ == hostname)
++	    hostname_ == hostname && local_link_ == local_link)
+ 		return true;
+ 	stop();
+ 
+ 	gambatte_log(RETRO_LOG_INFO, "Starting GameLink network %s on %s:%d\n",
+ 			is_server ? "server" : "client", hostname.c_str(), port);
+ 	is_server_ = is_server;
++	local_link_ = local_link;
+ 	port_ = port;
+ 	hostname_ = hostname;
+ 	is_stopped_ = false;
+@@ -356,10 +360,21 @@ bool NetSerial::check(unsigned char out, unsigned char& in, bool& fastCgb)
+ 		return false;
+ 	}
+ 
+-	// No data available yet
+-	if (bytes_avail < 2) {
+-		return false;
++	// A local paired instance runs concurrently in this process. Give its
++	// serial master a brief rendezvous window before advancing the slave past
++	// this emulated cycle. The network path must remain non-blocking: waiting
++	// there is the latency problem instancing is intended to remove.
++	if (bytes_avail < 2 && local_link_) {
++#ifndef _WIN32
++		struct pollfd pfd;
++		pfd.fd = sockfd_;
++		pfd.events = POLLIN;
++		pfd.revents = 0;
++		if (poll(&pfd, 1, 2) > 0 && (pfd.revents & POLLIN))
++			ioctl(sockfd_, FIONREAD, &bytes_avail);
++#endif
+ 	}
++	if (bytes_avail < 2) return false;
+ 
+ 	if (!readPacket(buffer, sizeof(buffer)))
+    {

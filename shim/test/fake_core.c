@@ -10,6 +10,9 @@
 #include <unistd.h>
 
 #include "libretro.h"
+#ifdef FAKE_DUAL
+#include "gambatte_dual.h"
+#endif
 
 #define HIT(name) printf("core:%s\n", name)
 
@@ -24,6 +27,12 @@ static unsigned char state_blob[16];
 static unsigned char save_ram[16];
 static unsigned char rtc_ram[8];
 static unsigned core_runs;
+#ifdef FAKE_DUAL
+static unsigned dual_visible;
+static unsigned char dual_save_ram[2][16];
+static unsigned char dual_rtc_ram[2][8];
+static unsigned char dual_state[2][16];
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 // netpacket - what gpsp/gambatte use for link play
@@ -90,6 +99,17 @@ void retro_init(void) {
 	memset(rtc_ram, getenv("FAKE_RTC_BYTE") ? atoi(getenv("FAKE_RTC_BYTE")) : 0x52,
 	       sizeof(rtc_ram));
 	core_runs = 0;
+#ifdef FAKE_DUAL
+	memset(dual_state, 0xAB, sizeof(dual_state));
+	memset(dual_save_ram, 0, sizeof(dual_save_ram));
+	memset(dual_rtc_ram, 0, sizeof(dual_rtc_ram));
+	memset(dual_save_ram[dual_visible],
+	       getenv("FAKE_SRAM_BYTE") ? atoi(getenv("FAKE_SRAM_BYTE")) : 0x51,
+	       sizeof(dual_save_ram[dual_visible]));
+	memset(dual_rtc_ram[dual_visible],
+	       getenv("FAKE_RTC_BYTE") ? atoi(getenv("FAKE_RTC_BYTE")) : 0x52,
+	       sizeof(dual_rtc_ram[dual_visible]));
+#endif
 	// Report what the frontend (or the shim) gives us for a core option, the way
 	// gpSP reads gpsp_serial to decide its link mode.
 	struct retro_variable var = { "gpsp_serial", NULL };
@@ -141,7 +161,10 @@ void retro_get_system_av_info(struct retro_system_av_info* info) {
 }
 
 void retro_set_controller_port_device(unsigned port, unsigned device) { HIT("set_controller_port_device"); }
-void retro_reset(void) { HIT("reset"); }
+void retro_reset(void) {
+	HIT("reset");
+	memset(state_blob, 0xC3, sizeof(state_blob));
+}
 
 void retro_run(void) {
 	HIT("run");
@@ -226,7 +249,10 @@ bool retro_unserialize(const void* data, size_t size) {
 	HIT("unserialize");
 	if (size < sizeof(state_blob)) return false;
 	memcpy(state_blob, data, sizeof(state_blob));
-	return state_blob[0] == 0xAB;
+	/* Both the initialized and post-reset machine states are states produced by
+	 * this core. Rejecting the latter made the host-authoritative reset test
+	 * model a core that could not load its own serialization. */
+	return state_blob[0] == 0xAB || state_blob[0] == 0xC3;
 }
 
 void retro_cheat_reset(void) { HIT("cheat_reset"); }
@@ -239,6 +265,10 @@ void retro_unload_game(void) { HIT("unload_game"); }
 unsigned retro_get_region(void) { HIT("get_region"); return RETRO_REGION_NTSC; }
 void* retro_get_memory_data(unsigned id) {
 	HIT("get_memory_data");
+#ifdef FAKE_DUAL
+	if (id == RETRO_MEMORY_SAVE_RAM) return dual_save_ram[dual_visible];
+	if (id == RETRO_MEMORY_RTC) return dual_rtc_ram[dual_visible];
+#endif
 	if (id == RETRO_MEMORY_SAVE_RAM) return save_ram;
 	if (id == RETRO_MEMORY_RTC) return rtc_ram;
 	return NULL;
@@ -249,3 +279,47 @@ size_t retro_get_memory_size(unsigned id) {
 	if (id == RETRO_MEMORY_RTC) return sizeof(rtc_ram);
 	return 0;
 }
+
+#ifdef FAKE_DUAL
+unsigned retro_dual_get_abi_version(void) { return GAMBATTE_DUAL_ABI_VERSION; }
+uint64_t retro_dual_get_capabilities(void) {
+	return GAMBATTE_DUAL_CAP_TWO_CONTENTS | GAMBATTE_DUAL_CAP_CONSOLE_MEMORY |
+	       GAMBATTE_DUAL_CAP_VISIBLE_CONSOLE | GAMBATTE_DUAL_CAP_PAIRED_CHECKPOINT |
+	       GAMBATTE_DUAL_CAP_TARGETED_RESET;
+}
+bool retro_dual_set_visible_console(unsigned console) {
+	if (console > GAMBATTE_DUAL_CONSOLE_B) return false;
+	dual_visible = console;
+	return true;
+}
+unsigned retro_dual_get_visible_console(void) { return dual_visible; }
+void* retro_dual_get_memory_data(unsigned console, unsigned id) {
+	if (console > GAMBATTE_DUAL_CONSOLE_B) return NULL;
+	if (id == RETRO_MEMORY_SAVE_RAM) return dual_save_ram[console];
+	if (id == RETRO_MEMORY_RTC) return dual_rtc_ram[console];
+	return NULL;
+}
+size_t retro_dual_get_memory_size(unsigned console, unsigned id) {
+	if (console > GAMBATTE_DUAL_CONSOLE_B) return 0;
+	if (id == RETRO_MEMORY_SAVE_RAM) return sizeof(dual_save_ram[console]);
+	if (id == RETRO_MEMORY_RTC) return sizeof(dual_rtc_ram[console]);
+	return 0;
+}
+bool retro_dual_reset_console(unsigned console) {
+	if (console > GAMBATTE_DUAL_CONSOLE_B) return false;
+	memset(dual_state[console], 0xC3, sizeof(dual_state[console]));
+	return true;
+}
+bool retro_dual_is_checkpoint_safe(void) { return true; }
+size_t retro_dual_serialize_size(void) { return sizeof(dual_state); }
+bool retro_dual_serialize(void* data, size_t size) {
+	if (size != sizeof(dual_state)) return false;
+	memcpy(data, dual_state, size);
+	return true;
+}
+bool retro_dual_unserialize(const void* data, size_t size) {
+	if (size != sizeof(dual_state)) return false;
+	memcpy(dual_state, data, size);
+	return true;
+}
+#endif

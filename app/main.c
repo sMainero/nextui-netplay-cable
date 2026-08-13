@@ -63,7 +63,9 @@ static NS_Peer* join_at(int i) { return i < peer_count ? &peers[i] : &adhoc[i - 
 
 /* A hotspot can be visible both through its last broadcast announcement and
  * through the WiFi scan. They are two sightings of one host, not two choices.
- * Prefer the announcement: it carries platform metadata and credentials. */
+ * Prefer the announcement: it carries platform metadata and credentials. Mark
+ * that row as scanned, though, so the UI presents the SSID the user just found
+ * instead of making the ad-hoc result appear to have vanished into an IP. */
 static void dedupe_adhoc(void) {
 	int kept = 0;
 	for (int i = 0; i < adhoc_count; i++) {
@@ -71,6 +73,7 @@ static void dedupe_adhoc(void) {
 		for (int j = 0; j < peer_count; j++) {
 			if (peers[j].hotspot && peers[j].ssid[0] &&
 			    !strcmp(peers[j].ssid, adhoc[i].ssid)) {
+				peers[j].scanned = true;
 				duplicate = true;
 				break;
 			}
@@ -146,7 +149,7 @@ static int draw_row(SDL_Surface* screen_s, const char* text, int y, bool selecte
 enum { MENU_HOST, MENU_JOIN, MENU_TOOLS, MENU_COUNT };
 enum { HOST_ADHOC, HOST_WIFI, HOST_COUNT };
 enum { TOOL_SETTINGS, TOOL_CHECKS, TOOL_FIXWIFI, TOOL_OFF, TOOL_COUNT };
-enum { SET_SHARE, SET_COMPAT, SET_SIMPLE, SET_INSTANCED, SET_COUNT };
+enum { SET_SHARE, SET_COMPAT, SET_FORCE_COMPAT, SET_VERBOSE_LOGS, SET_SIMPLE, SET_INSTANCED, SET_COUNT };
 
 static const char* menu_label(int item) {
 	switch (item) {
@@ -197,17 +200,23 @@ static void setting_row(char* out, int len, int item) {
 	case SET_COMPAT:
 		snprintf(out, len, "Use compatibility cores:  %s", c->compatibility_cores ? "Yes" : "No");
 		break;
+	case SET_FORCE_COMPAT:
+		snprintf(out, len, "Force compatibility cores:  %s", c->force_compatibility ? "Yes" : "No");
+		break;
+	case SET_VERBOSE_LOGS:
+		snprintf(out, len, "Verbose debugging logs:  %s", c->verbose_logs ? "Yes" : "No");
+		break;
 	case SET_SIMPLE:
-		snprintf(out, len, "Simple client:  %s", c->simple_client ? "Yes" : "No");
+		snprintf(out, len, "Simple client (planned):  %s", c->simple_client ? "Yes" : "No");
 		break;
 	case SET_INSTANCED:
 		switch (c->instanced) {
-		case NS_INST_OFF:      snprintf(out, len, "Instanced cores:  No"); break;
-		case NS_INST_ALL:      snprintf(out, len, "Instanced cores:  Yes (all)"); break;
+		case NS_INST_OFF:      snprintf(out, len, "Instanced link:  No"); break;
+		case NS_INST_ALL:      snprintf(out, len, "Instanced link:  Yes (supported)"); break;
 		case NS_INST_SELECTED: {
 			int n = 0;
 			for (int i = 0; i < NS_INST_CORES; i++) if (c->inst_core[i]) n++;
-			snprintf(out, len, "Instanced cores:  %d selected  >", n);
+			snprintf(out, len, "Instanced link:  %d selected  >", n);
 			break;
 		}
 		}
@@ -351,10 +360,12 @@ static void render(SDL_Surface* s) {
 			hint = "Frozen for now; no core files are transferred."; break;
 		case SET_COMPAT:
 			hint = "Use pak cores only when installed builds differ."; break;
+		case SET_FORCE_COMPAT:
+			hint = "Testing: use pak cores even when builds match."; break;
 		case SET_SIMPLE:
-			hint = "Host supplies the game; this device just joins."; break;
+			hint = "Planned: accept invitations for matching local games."; break;
 		case SET_INSTANCED:
-			hint = "Run both consoles here; network only the inputs."; break;
+			hint = "Gambatte: local link; WiFi carries delayed inputs."; break;
 		}
 		y = draw_line(s, hint, y, COLOR_GRAY, true);
 		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
@@ -368,9 +379,10 @@ static void render(SDL_Surface* s) {
 		for (int i = 0; i < NS_INST_CORES; i++) {
 			char row[128];
 			bool have = NS_coreInstalled(NS_INST_CORE[i]);
-			snprintf(row, sizeof(row), "[%s] %s%s",
+			snprintf(row, sizeof(row), "[%s] %s%s%s",
 			         c->inst_core[i] ? "x" : " ", NS_INST_CORE[i],
-			         have ? "" : "  (not installed)");
+			         have ? "" : "  (not installed)",
+			         i == 0 ? "" : "  (planned)");
 			y = draw_row(s, row, y, i == inst_sel);
 		}
 		y += SCALE1(6);
@@ -474,6 +486,20 @@ static void render(SDL_Surface* s) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+static void abort_arm_attempt(bool may_have_activated) {
+	/* One rollback path owns everything an arm attempt can start. NS_disarm is
+	 * deliberately reserved for attempts that may have created a session or
+	 * partial bindings; a failed preflight must not remove bindings retained
+	 * from an earlier, deliberately ended session. */
+	NS_announceStop();
+	NS_compatServeStop();
+	if (may_have_activated)
+		NS_disarm();
+	else
+		NS_hotspotStop();
+	hosting_hotspot = 0;
+}
+
 static void do_arm(NS_Role role, const char* peer) {
 	char err[96] = "";
 
@@ -491,15 +517,14 @@ static void do_arm(NS_Role role, const char* peer) {
 	 * core manifest exchange below, so the old crude platform check is gone. */
 	check_count = NS_runChecks(checks, 8, &check_worst);
 	if (check_worst == NS_CHECK_FAIL) {
-		NS_announceStop();
-		NS_hotspotStop();
-		hosting_hotspot = 0;
+		abort_arm_attempt(false);
 		snprintf(status, sizeof(status), "Checks failed - not arming");
 		screen = SCREEN_CHECKS;
 		return;
 	}
 
 	if (!NS_arm(role, peer, err, sizeof(err))) {
+		abort_arm_attempt(true);
 		snprintf(status, sizeof(status), "%s", err[0] ? err : "could not arm");
 		screen = SCREEN_MENU;
 		return;
@@ -513,8 +538,16 @@ static void do_arm(NS_Role role, const char* peer) {
 	 * than in front of a launch. The host serves from its hosting tick; the
 	 * client drives the exchange here. */
 	if (role == NS_ROLE_HOST) {
-		NS_compatServeStart();
-	} else if (NS_settings()->compatibility_cores) {
+		if (!NS_compatServeStart()) {
+			abort_arm_attempt(true);
+			snprintf(status, sizeof(status), "Could not listen for core negotiation.");
+			screen = SCREEN_MENU;
+			return;
+		}
+	} else {
+		/* Always compare manifests. With compatibility disabled the exchange
+		 * still records differing installed builds so both launchers can warn;
+		 * the setting only controls whether a packaged fallback may be chosen. */
 		set_progress("Checking cores", "Comparing builds with the host.");
 		draw_progress("Comparing builds", 1, 1);
 		char cerr[128] = "";
@@ -526,7 +559,7 @@ static void do_arm(NS_Role role, const char* peer) {
 			/* Compatibility selection is part of arming, not an optional status
 			 * probe. Continuing after it fails can put the peers on different
 			 * cores, which is guaranteed to desynchronize shared-screen play. */
-			NS_endSession();
+			abort_arm_attempt(true);
 			snprintf(status, sizeof(status), "Core check failed: %s", cerr);
 			screen = SCREEN_MENU;
 			return;
@@ -590,11 +623,9 @@ int main(int argc, char* argv[]) {
 			// NS_endSession stops the AP and restores wifi itself; calling
 			// NS_hotspotStop again here ran the teardown twice and logged a
 			// spurious "nothing recorded to restore wifi with".
-			set_progress("Ending session", "Putting WiFi back.");
+			set_progress("Restoring original WiFi", "Leaving the ad hoc network.");
 			NS_endSession();
 			set_progress("Joining", "This can take up to a minute.");
-			NS_announceStop();
-			NS_compatServeStop();
 			core_note[0] = '\0';
 			hosting_hotspot = 0;
 			/* Forced, not the 5s poll. The cached values are from before the
@@ -604,13 +635,17 @@ int main(int argc, char* argv[]) {
 			wifi_poll(true);
 			snprintf(status, sizeof(status), wifi_up
 			         ? "Session ended. Bindings kept."
-			         : "Session ended. WiFi still reconnecting...");
+			         : "Session ended. Original WiFi recovery continues...");
 			screen = SCREEN_MENU;
 			dirty = 1;
 		}
 
 		switch (screen) {
 		case SCREEN_MENU:
+			/* B from Hosting is navigation, not a lifecycle event. Keep the
+			 * host visible while this process remains in its menu. A future
+			 * broker will extend the same ownership beyond this app process. */
+			NS_announceTick();
 			NS_compatServeTick();   /* still serving while armed, wherever we are */
 			if (PAD_justPressed(BTN_UP))   { menu_sel = (menu_sel + MENU_COUNT - 1) % MENU_COUNT; dirty = 1; }
 			if (PAD_justPressed(BTN_DOWN)) { menu_sel = (menu_sel + 1) % MENU_COUNT; dirty = 1; }
@@ -738,7 +773,15 @@ int main(int argc, char* argv[]) {
 				status[0] = '\0';
 				switch (settings_sel) {
 				case SET_SHARE:  c->share_cores = !c->share_cores; break;
-				case SET_COMPAT: c->compatibility_cores = !c->compatibility_cores; break;
+				case SET_COMPAT:
+					c->compatibility_cores = !c->compatibility_cores;
+					if (!c->compatibility_cores) c->force_compatibility = false;
+					break;
+				case SET_FORCE_COMPAT:
+					c->force_compatibility = !c->force_compatibility;
+					if (c->force_compatibility) c->compatibility_cores = true;
+					break;
+				case SET_VERBOSE_LOGS: c->verbose_logs = !c->verbose_logs; break;
 				case SET_SIMPLE: c->simple_client = !c->simple_client; break;
 				case SET_INSTANCED:
 					/* Cycles No -> Yes (all) -> pick, and the third state opens
@@ -763,7 +806,10 @@ int main(int argc, char* argv[]) {
 			if (PAD_justPressed(BTN_DOWN)) { inst_sel = (inst_sel + 1) % NS_INST_CORES; dirty = 1; }
 			if (PAD_justPressed(BTN_B))    { screen = SCREEN_SETTINGS; dirty = 1; }
 			if (PAD_justPressed(BTN_A)) {
-				if (NS_coreInstalled(NS_INST_CORE[inst_sel])) {
+				if (inst_sel != 0) {
+					snprintf(status, sizeof(status), "%s instancing is not implemented yet.",
+					         NS_INST_CORE[inst_sel]);
+				} else if (NS_coreInstalled(NS_INST_CORE[inst_sel])) {
 					c->inst_core[inst_sel] = !c->inst_core[inst_sel];
 					NS_settingsSave();
 				} else {
@@ -807,7 +853,6 @@ int main(int argc, char* argv[]) {
 			// keypress to start it - and the global X handler would shadow one
 			// here anyway, since this screen is only reached once armed.
 			if (PAD_justPressed(BTN_B)) {
-				NS_announceStop();
 				screen = SCREEN_MENU;
 				dirty = 1;
 			}
@@ -831,9 +876,10 @@ int main(int argc, char* argv[]) {
 				snprintf(status, sizeof(status), "Scanning for ad hoc networks...");
 				render(s);
 				adhoc_count = NS_scanAdhoc(adhoc, NS_MAX_PEERS);
+				int scanned_count = adhoc_count;
 				dedupe_adhoc();
 				join_total = peer_count + adhoc_count;
-				snprintf(status, sizeof(status), "%d ad hoc network(s) found.", adhoc_count);
+				snprintf(status, sizeof(status), "%d ad hoc network(s) found.", scanned_count);
 				dirty = 1;
 			}
 
@@ -886,6 +932,7 @@ int main(int argc, char* argv[]) {
 	}
 
 	NS_announceStop();
+	NS_compatServeStop();
 	NS_discoverStop();
 
 	QuitSettings();

@@ -31,6 +31,8 @@ chmod 755 "$NP/launcher"/*
 cat > "$SYSTEM_PATH/bin/minarch.elf" <<'EOF'
 #!/bin/sh
 [ "$NETPLAY_COMPAT_CORE" = "1" ] && echo "compat=1"
+[ "$NETPLAY_DUAL_CORE" = "1" ] && echo "dual=1"
+[ -n "$NETPLAY_CORE_NOTICE" ] && echo "notice=$NETPLAY_CORE_NOTICE"
 echo "minarch core=$1 rom=$2 real=$NETPLAY_REAL_CORE session=$NETPLAY_SESSION"
 EOF
 chmod 755 "$SYSTEM_PATH/bin/minarch.elf"
@@ -160,8 +162,47 @@ echo "$OUT" | grep -q "real=$NP/cores/override/$PLATFORM/gpsp_libretro.so" \
 	&& ok "packaged gpSP used for link implementation" || bad "packaged gpSP ignored: $OUT"
 echo "$OUT" | grep -q "compat=1" \
 	&& ok "packaged-core launch is marked" || bad "compatibility environment missing: $OUT"
+echo "$OUT" | grep -q "notice=compatibility" \
+	&& ok "packaged-core startup notice selected" || bad "compatibility notice missing: $OUT"
 echo "$OUT" | grep -q "core=$NP/cores/gpsp_libretro.so" \
 	&& ok "shim still staged under the real core name" || bad "shim name wrong: $OUT"
+
+# Instanced Gambatte is a separate implementation artifact. It must be used
+# only for an explicitly enabled link session and remain staged under the
+# ordinary gambatte basename so MinArch keeps the user's save/config paths.
+echo "pretend network-enabled Gambatte" > "$NP/cores/override/$PLATFORM/gambatte_libretro.so"
+echo "pretend paired Gambatte" > "$NP/cores/override/$PLATFORM/gambatte_dual_libretro.so"
+# NS_writeSession does not know which game will launch next, so it intentionally
+# omits mode=. Gambatte's identity establishes link mode after the core opens;
+# the launcher must be able to select the paired implementation before then.
+printf 'role=host\nport=55437\ninstanced_gambatte=1\n' > "$ROOT/dual.session"
+OUT=$(NETPLAY_SESSION="$ROOT/dual.session" "$ROOT/Emus/$PLATFORM/GB.pak/launch.sh" /roms/game.gb 2>&1)
+echo "$OUT" | grep -q "real=$NP/cores/override/$PLATFORM/gambatte_dual_libretro.so" \
+	&& echo "$OUT" | grep -q "dual=1" \
+	&& ok "instanced GB link selected the paired Gambatte core" \
+	|| bad "paired Gambatte selection failed: $OUT"
+printf 'role=host\nport=55437\nmode=link\ninstanced_gambatte=0\n' > "$ROOT/serial.session"
+OUT=$(NETPLAY_SESSION="$ROOT/serial.session" "$ROOT/Emus/$PLATFORM/GB.pak/launch.sh" /roms/game.gb 2>&1)
+echo "$OUT" | grep -q "real=$NP/cores/override/$PLATFORM/gambatte_libretro.so" \
+	&& ! echo "$OUT" | grep -q "dual=1" \
+	&& ok "ordinary GB link retained the network-serial Gambatte core" \
+	|| bad "network-serial Gambatte fallback failed: $OUT"
+
+echo
+echo "== verbose per-game process logs"
+printf 'role=host\nport=55437\nsession_id=0123456789abcdef0123456789abcdef\nverbose_logs=1\n' > "$ROOT/verbose.session"
+NETPLAY_SESSION="$ROOT/verbose.session" "$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba >/dev/null 2>&1
+NETPLAY_SESSION="$ROOT/verbose.session" "$ROOT/Emus/$PLATFORM/GBA.pak/launch.sh" /roms/game.gba >/dev/null 2>&1
+VERBOSE_COUNT=$(find "$USERDATA_PATH/logs/netplay-games/game.gba/0123456789abcdef0123456789abcdef" \
+	-type f -name '*-host-*.log' 2>/dev/null | wc -l)
+VERBOSE_LOG=$(find "$USERDATA_PATH/logs/netplay-games/game.gba/0123456789abcdef0123456789abcdef" \
+	-type f -name '*-host-*.log' 2>/dev/null | head -n 1)
+[ "$VERBOSE_COUNT" -eq 2 ] && ok "each launch received its own game/session log" \
+	|| bad "verbose launch log missing"
+grep -q '^rom=/roms/game.gba$' "$VERBOSE_LOG" 2>/dev/null \
+	&& grep -q '^=== process exited status=0 ===$' "$VERBOSE_LOG" 2>/dev/null \
+	&& ok "verbose log retained metadata and process outcome" \
+	|| bad "verbose launch log incomplete"
 
 # Other cores stay on the installed build until the setup negotiation selects
 # the matching compatibility build on both devices.
@@ -174,6 +215,26 @@ OUT=$(NETPLAY_SESSION="$ROOT/compat.session" "$NP/launcher/minarch.elf" \
 	"$SYSTEM_PATH/cores/fceumm_libretro.so" /roms/game.nes 2>&1)
 echo "$OUT" | grep -q "real=$NP/cores/compatibility/aarch64/fceumm_libretro.so" \
 	&& ok "selected compatibility core used" || bad "compatibility fallback ignored: $OUT"
+echo "$OUT" | grep -q "notice=compatibility" \
+	&& ok "fallback startup notice selected" || bad "fallback notice missing: $OUT"
+
+# The A30 SFC pak requests Snes9x 2005, while the cross-platform compatibility
+# artifact uses the canonical snes9x basename regardless of its implementation.
+echo "pretend canonical snes9x compatibility core" > "$NP/cores/compatibility/aarch64/snes9x_libretro.so"
+printf 'role=client\nport=55437\ncompat_core.snes9x2005=1\n' > "$ROOT/snes.session"
+OUT=$(NETPLAY_SESSION="$ROOT/snes.session" "$NP/launcher/minarch.elf" \
+	"$SYSTEM_PATH/cores/snes9x2005_libretro.so" /roms/game.sfc 2>&1)
+echo "$OUT" | grep -q "real=$NP/cores/compatibility/aarch64/snes9x_libretro.so" \
+	&& ok "Snes9x 2005 pak routed to canonical compatibility core" \
+	|| bad "Snes9x 2005 compatibility alias failed: $OUT"
+
+printf 'role=host\nport=55437\ncore_mismatch.fceumm=1\n' > "$ROOT/mismatch.session"
+OUT=$(NETPLAY_SESSION="$ROOT/mismatch.session" "$NP/launcher/minarch.elf" \
+	"$SYSTEM_PATH/cores/fceumm_libretro.so" /roms/game.nes 2>&1)
+echo "$OUT" | grep -q "real=$SYSTEM_PATH/cores/fceumm_libretro.so" \
+	&& echo "$OUT" | grep -q "notice=mismatch" \
+	&& ok "differing installed cores launch with a warning" \
+	|| bad "installed-core mismatch warning missing: $OUT"
 rm -rf "$NP/cores/compatibility"
 OUT=$(NETPLAY_SESSION="$ROOT/compat.session" "$NP/launcher/minarch.elf" \
 	"$SYSTEM_PATH/cores/fceumm_libretro.so" /roms/game.nes 2>&1)
@@ -266,6 +327,20 @@ echo "$OUT" | grep -q "core=$NP/cores/picodrive_libretro.so" \
 echo "$OUT" | grep -q "real=$SYSTEM_PATH/cores/picodrive_libretro.so" \
 	&& ok "real core passed to the shim" || bad "wrong real core: $OUT"
 
+# The setup app runs its mandatory minarch-path check before arming a new
+# session. When persistent wrappers are already mounted, it must validate the
+# preserved original rather than conclude that every emulator pak vanished.
+CHECKED=$(for p in "$SYSTEM_PATH/paks/Emus"/*.pak; do
+	f="$p/launch.sh"
+	if grep -q "Installed by Netplay.pak" "$f" 2>/dev/null && [ -f "$p/launch.sh.old" ]; then
+		f="$p/launch.sh.old"
+	fi
+	grep -q 'minarch.elf' "$f" 2>/dev/null && echo "$f"
+done)
+echo "$CHECKED" | grep -q '/MD.pak/launch.sh.old$' \
+	&& ok "preflight sees original launcher through mounted wrapper" \
+	|| bad "preflight missed mounted original launcher"
+
 echo
 echo "== bind-mount: staleness is detected"
 "$NP/launcher/bind-mount.sh" status 2>&1 | grep -q "stale" && bad "clean staging reported stale" || ok "fresh staging not stale"
@@ -277,21 +352,26 @@ chmod 755 "$SYSTEM_PATH/paks/Emus/GBA.pak/launch.sh"
 
 echo
 echo "== bind-mount: mount ownership"
-# Teardown must distinguish our exact stage source from a foreign bind mount.
+# Teardown must distinguish our exact stage root from a foreign bind mount.
+# This fixture has the same shape as the Brick: /proc/mounts would name the
+# exFAT block device for both, while mountinfo retains each bind root in field 4.
 OWN_TARGET="$SYSTEM_PATH/paks/Emus/GB.pak"
 OWN_SOURCE="$NP/mounts/GB.pak"
 FOREIGN_TARGET="$SYSTEM_PATH/paks/Emus/GBA.pak"
-MOUNTS_FIXTURE="$ROOT/proc-mounts"
-printf '%s %s none rw 0 0\n' "$OWN_SOURCE" "$OWN_TARGET" > "$MOUNTS_FIXTURE"
-printf '%s %s none rw 0 0\n' "$ROOT/other/GBA.pak" "$FOREIGN_TARGET" >> "$MOUNTS_FIXTURE"
-NETPLAY_MOUNTS_FILE="$MOUNTS_FIXTURE"
-export NETPLAY_MOUNTS_FILE
+MOUNTINFO_FIXTURE="$ROOT/proc-mountinfo"
+printf '30 1 179:33 / %s rw - exfat /dev/mmcblk1p1 rw\n' "$ROOT" > "$MOUNTINFO_FIXTURE"
+printf '31 30 179:33 %s %s rw - exfat /dev/mmcblk1p1 rw\n' \
+	"${OWN_SOURCE#$ROOT}" "$OWN_TARGET" >> "$MOUNTINFO_FIXTURE"
+printf '32 30 179:33 /other/GBA.pak %s rw - exfat /dev/mmcblk1p1 rw\n' \
+	"$FOREIGN_TARGET" >> "$MOUNTINFO_FIXTURE"
+NETPLAY_MOUNTINFO_FILE="$MOUNTINFO_FIXTURE"
+export NETPLAY_MOUNTINFO_FILE
 MOUNT_STAGE="$NP/mounts"
 MARKER="Installed by Netplay.pak"
 . "$NP/launcher/mount-common.sh"
 mount_is_ours "$OWN_TARGET" && ok "recognises Netplay-owned mount" || bad "owned mount not recognised"
 mount_is_ours "$FOREIGN_TARGET" && bad "foreign mount claimed as ours" || ok "foreign mount left unowned"
-unset NETPLAY_MOUNTS_FILE
+unset NETPLAY_MOUNTINFO_FILE
 
 echo
 echo "== bind-mount: boot hook"

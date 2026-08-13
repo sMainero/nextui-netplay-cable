@@ -119,7 +119,9 @@ typedef enum {
 typedef struct {
 	bool        share_cores;    /* frozen: retained so the setting can return later */
 	bool        compatibility_cores; /* fall back to the pak's matched core set */
-	bool        simple_client;  /* act as a thin client: host supplies everything */
+	bool        force_compatibility; /* testing: choose packaged builds even if installed match */
+	bool        verbose_logs; /* retain a complete immutable log for each game launch */
+	bool        simple_client;  /* planned: accept an invitation for a matching local game */
 	NS_InstMode instanced;
 	bool        inst_core[NS_INST_CORES];
 } NS_Settings;
@@ -175,7 +177,7 @@ uint32_t NS_runtimeGlibc(void);
 
 /* Host: accept and serve one exchange if a client is waiting. Non-blocking on
  * accept, so it can sit in the hosting screen's once-a-second tick. */
-void NS_compatServeStart(void);
+bool NS_compatServeStart(void);
 void NS_compatServeTick(void);
 void NS_compatServeStop(void);
 

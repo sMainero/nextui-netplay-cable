@@ -1,4 +1,4 @@
-.PHONY: dist dist-base dist-compatibility dist-full shim cores core-sources compatibility compatibility-sources compatibility-armv7 compatibility-aarch64 check-compatibility check-netplay-cores cores-gambatte cores-gpsp app test clean help
+.PHONY: dist dist-base dist-compatibility dist-full shim cores core-sources compatibility compatibility-sources compatibility-armv7 compatibility-aarch64 check-compatibility check-netplay-cores cores-gambatte cores-gambatte-dual cores-gpsp gblc-pak app test test-gambatte-dual clean help
 
 PAK        := Netplay.pak
 BASE_ARCHIVE   := dist/Netplay.pak.zip
@@ -17,6 +17,8 @@ BUILDER    ?= $(abspath $(CURDIR)/../../build-platforms)
 help:
 	@echo "make shim    cross-build the shim for $(PLATFORMS) (needs docker)"
 	@echo "make cores   build the patched gambatte + gpsp cores (needs docker)"
+	@echo "make cores-gambatte-dual  build the experimental in-process dual Gambatte core"
+	@echo "make gblc-pak  build a standalone my282 GBLC emulator test pak"
 	@echo "make compatibility  build seven pinned cores for ARMv7 + AArch64"
 	@echo "make core-sources  fetch pinned core sources and apply tracked patches"
 	@echo "make app     build the session-setup app (needs docker + NEXTUI)"
@@ -45,14 +47,15 @@ shim:
 # Both are the same upstream sources NextUI uses; only the build differs.
 CORE_SRC_ROOT ?= .cache/cores
 GAMBATTE_SRC := $(CORE_SRC_ROOT)/gambatte
+GAMBATTE_DUAL_SRC := $(CORE_SRC_ROOT)/gambatte-dual
 GPSP_SRC     := $(CORE_SRC_ROOT)/gpsp
-GAMBATTE_REPO := https://github.com/libretro/gambatte-libretro.git
-GAMBATTE_REV  := 9b3b5e3cc18ec92f460d37dd551eaf90c55bfcea
+GAMBATTE_REPO := https://github.com/bmpriest/gambatte-libretro.git
+GAMBATTE_REV  := 70f86206f3a903f91892fb873220253a1b718d26
 GPSP_REPO     := https://github.com/libretro/gpsp.git
 GPSP_REV      := 69e86ebe89f14c3f5f75b809c12c0a953b3d6ce4
-GAMBATTE_PATCHES := cores/patches/gambatte-platforms.patch cores/patches/gambatte-serial-timeout.patch
 GPSP_PATCHES := cores/patches/gpsp-platforms.patch cores/patches/gpsp-001-rfu-disconnect.patch cores/patches/gpsp-002-rfu-queue-size.patch cores/patches/gpsp-003-netplay-version.patch
-GAMBATTE_STAMP := $(GAMBATTE_SRC)/.netplay-patched-$(GAMBATTE_REV)
+GAMBATTE_STAMP := $(GAMBATTE_SRC)/.netplay-fork-$(GAMBATTE_REV)
+GAMBATTE_DUAL_STAMP := $(GAMBATTE_DUAL_SRC)/.netplay-fork-$(GAMBATTE_REV)
 GPSP_STAMP := $(GPSP_SRC)/.netplay-patched-$(GPSP_REV)
 
 FCEUMM_SRC := $(CORE_SRC_ROOT)/fceumm
@@ -103,13 +106,16 @@ $(PCSX_SRC)/.compat-pinned: cores/patches/pcsx-rearmed-old-arm-hwcap.patch
 	@patch -d "$(PCSX_SRC)" -p1 < cores/patches/pcsx-rearmed-old-arm-hwcap.patch
 	@touch "$@"
 
-$(GAMBATTE_STAMP): $(GAMBATTE_PATCHES)
+$(GAMBATTE_STAMP):
 	@rm -rf "$(GAMBATTE_SRC)"
 	@mkdir -p "$(CORE_SRC_ROOT)"
 	@git clone -q "$(GAMBATTE_REPO)" "$(GAMBATTE_SRC)"
 	@git -C "$(GAMBATTE_SRC)" checkout -q "$(GAMBATTE_REV)"
-	@patch -d "$(GAMBATTE_SRC)" -p1 < cores/patches/gambatte-platforms.patch
-	@patch -d "$(GAMBATTE_SRC)" -p1 < cores/patches/gambatte-serial-timeout.patch
+	@touch "$@"
+
+$(GAMBATTE_DUAL_STAMP): $(GAMBATTE_STAMP)
+	@rm -rf "$(GAMBATTE_DUAL_SRC)"
+	@cp -a "$(GAMBATTE_SRC)" "$(GAMBATTE_DUAL_SRC)"
 	@touch "$@"
 
 $(GPSP_STAMP): $(GPSP_PATCHES)
@@ -135,13 +141,13 @@ define core_build
 			mkdir -p dist/cores/$$p; \
 			bp=$$p; case $$p in my355) bp=tg5050 ;; h700) bp=tg5040 ;; esac; \
 			$(MAKE) -s -C "$(BUILDER)" build PLATFORM=$$p PROJECT="$$PWD" \
-				CMD='sh -c "make -C $(2) $(3) platform='$$bp' clean >/dev/null 2>&1; \
-				make -C $(2) $(3) platform='$$bp' -j4 && \
-				cp $(2)/$(1)_libretro.so dist/cores/'$$p'/"' || exit 1; \
+				CMD="make -C $(2) $(3) platform=$$bp clean >/dev/null 2>&1 && \
+				make -C $(2) $(3) platform=$$bp -j4 && \
+				cp $(2)/$(1)_libretro.so dist/cores/$$p/" || exit 1; \
 		done
 endef
 
-cores: core-sources cores-gambatte cores-gpsp
+cores: core-sources cores-gambatte cores-gambatte-dual cores-gpsp
 
 cores-gambatte:
 	@test -d "$(GAMBATTE_SRC)" || { echo "missing $(GAMBATTE_SRC)"; exit 1; }
@@ -151,7 +157,55 @@ cores-gambatte:
 			"$$(strings -n 6 dist/cores/$$p/gambatte_libretro.so | grep -m1 '^v0\.5\.0')" \
 			"$$(strings -n 6 dist/cores/$$p/gambatte_libretro.so | grep -c gambatte_gb_link_mode)"; \
 	done
+	@mkdir -p dist/compatibility/armv7 dist/compatibility/aarch64
+	@cp dist/cores/my282/gambatte_libretro.so dist/compatibility/armv7/
+	@cp dist/cores/tg5040/gambatte_libretro.so dist/compatibility/aarch64/
 	@echo "   (link=0 means HAVE_NETWORK did not take - stock NextUI gambatte reads 0)"
+
+# The dual build is a Netplay implementation core, not a compatibility core.
+# It is selected only for same-ROM instanced Gambatte sessions; ordinary link
+# play continues to use the network-capable single-console build above.
+cores-gambatte-dual: $(GAMBATTE_DUAL_STAMP)
+	@for p in $(PLATFORMS); do \
+		echo "== gambatte-dual $$p"; \
+		mkdir -p dist/cores-experimental/$$p; \
+		bp=$$p; case $$p in my355) bp=tg5050 ;; h700) bp=tg5040 ;; esac; \
+		$(MAKE) -s -C "$(BUILDER)" build PLATFORM=$$p PROJECT="$$PWD" \
+			CMD="make -C $(GAMBATTE_DUAL_SRC) -f Makefile.libretro HAVE_NETWORK=1 NETPLAY_DUAL_INSTANCE=1 platform=$$bp clean >/dev/null 2>&1 && \
+				make -C $(GAMBATTE_DUAL_SRC) -f Makefile.libretro HAVE_NETWORK=1 NETPLAY_DUAL_INSTANCE=1 platform=$$bp -j4 && \
+				cp $(GAMBATTE_DUAL_SRC)/gambatte_libretro.so dist/cores-experimental/$$p/gambatte_dual_libretro.so" || exit 1; \
+	done
+	@for p in $(PLATFORMS); do \
+		printf "   %-7s %s\n" "$$p" \
+			"$$(strings -n 6 dist/cores-experimental/$$p/gambatte_dual_libretro.so | grep -m1 '^v0\.5\.0-netdual')"; \
+	done
+
+test-gambatte-dual: $(GAMBATTE_DUAL_STAMP)
+	@test -n "$(ROM_A)" -a -n "$(ROM_B)" || { \
+		echo "usage: make test-gambatte-dual ROM_A=/path/a.gb ROM_B=/path/b.gb"; exit 2; }
+	@$(MAKE) -s -C "$(GAMBATTE_DUAL_SRC)" test-dual-contract ROM_A="$(abspath $(ROM_A))" ROM_B="$(abspath $(ROM_B))"
+
+# Standalone A30 feasibility package. The archive expands directly into the SD
+# card root and is deliberately separate from every Netplay release artifact.
+GBLC_STAGE := dist/gblc-my282
+GBLC_ARCHIVE := dist/GBLC-my282.pak.zip
+
+gblc-pak: $(GAMBATTE_DUAL_STAMP)
+	@$(MAKE) -s -C "$(BUILDER)" build PLATFORM=my282 PROJECT="$$PWD" \
+		CMD="make -C $(GAMBATTE_DUAL_SRC) -f Makefile.libretro HAVE_NETWORK=1 NETPLAY_DUAL_INSTANCE=1 platform=my282 clean >/dev/null 2>&1 && \
+			make -C $(GAMBATTE_DUAL_SRC) -f Makefile.libretro HAVE_NETWORK=1 NETPLAY_DUAL_INSTANCE=1 platform=my282 -j4"
+	@rm -rf "$(GBLC_STAGE)"
+	@mkdir -p "$(GBLC_STAGE)/Emus/my282/GBLC.pak" \
+		"$(GBLC_STAGE)/Roms/Game Boy Link Cable (GBLC)"
+	@cp testing/GBLC.pak/launch.sh testing/GBLC.pak/default.cfg \
+		testing/GBLC.pak/README.txt "$(GBLC_STAGE)/Emus/my282/GBLC.pak/"
+	@cp "$(GAMBATTE_DUAL_SRC)/gambatte_libretro.so" \
+		"$(GBLC_STAGE)/Emus/my282/GBLC.pak/gambatte_dual_libretro.so"
+	@cp testing/roms/README.txt "$(GBLC_STAGE)/Roms/Game Boy Link Cable (GBLC)/"
+	@chmod +x "$(GBLC_STAGE)/Emus/my282/GBLC.pak/launch.sh"
+	@rm -f "$(GBLC_ARCHIVE)"
+	@cd "$(GBLC_STAGE)" && zip -qr "$(abspath $(GBLC_ARCHIVE))" Emus Roms
+	@echo "built $(GBLC_ARCHIVE)"
 
 cores-gpsp:
 	@test -d "$(GPSP_SRC)" || { echo "missing $(GPSP_SRC)"; exit 1; }
@@ -196,6 +250,7 @@ app:
 test:
 	@./shim/test/run.sh
 	@./shim/test/link.sh
+	@./shim/test/dual.sh
 	@./launcher/test.sh
 
 ###########################################################
@@ -239,6 +294,8 @@ dist-base: $(BASE_DIST_CHECKS)
 		mkdir -p "$(BASE_STAGE)/$(PAK)/cores/override/$$p"; \
 		cp dist/cores/$$p/gambatte_libretro.so dist/cores/$$p/gpsp_libretro.so \
 		   "$(BASE_STAGE)/$(PAK)/cores/override/$$p/"; \
+		cp dist/cores-experimental/$$p/gambatte_dual_libretro.so \
+		   "$(BASE_STAGE)/$(PAK)/cores/override/$$p/"; \
 	done
 	@for p in $(PLATFORMS); do \
 		mkdir -p "$(BASE_STAGE)/$(PAK)/bin/$$p"; \
@@ -270,7 +327,10 @@ check-netplay-cores:
 	@for p in $(PLATFORMS); do for c in gambatte gpsp; do \
 		test -f dist/cores/$$p/$${c}_libretro.so || { \
 			echo "missing netplay core $$p/$$c - run 'make cores' first"; exit 1; }; \
-	done; done
+	done; \
+	test -f dist/cores-experimental/$$p/gambatte_dual_libretro.so || { \
+		echo "missing netplay core $$p/gambatte_dual - run 'make cores' first"; exit 1; }; \
+	done
 
 check-shim-%:
 	@test -f bin/$*/netplay_shim.so || { \

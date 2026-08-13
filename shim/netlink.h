@@ -104,9 +104,12 @@ bool NetLink_isPeerPaused(void);
 
 /* Inputs are addressed by frame number, so a late packet is still usable and a
  * duplicate is harmless. */
-void NetLink_sendInput(uint32_t frame, uint32_t buttons);
+bool NetLink_sendInput(uint32_t frame, uint32_t buttons);
 bool NetLink_getRemoteInput(uint32_t frame, uint32_t* buttons);
+/* A new connection needs the full reset. Moving to a committed authoritative
+ * timeline must retain ACK/COMMIT controls which may already be in flight. */
 void NetLink_resetSync(void);
+void NetLink_resetTimeline(void);
 
 /* Both sides must start from bit-identical state, so the host ships one.
  * Chunked: a save state is far larger than a packet. */
@@ -115,11 +118,13 @@ bool NetLink_takeState(void** data, size_t* len);  /* caller frees */
 
 /* Periodic agreement check. Without it a divergence is silent and the two
  * games quietly tell different stories. */
-void NetLink_sendHash(uint32_t frame, uint32_t hash);
+bool NetLink_sendHash(uint32_t frame, uint32_t hash);
 bool NetLink_takeHash(uint32_t* frame, uint32_t* hash);
 
 typedef struct {
 	uint8_t  rom_sha256[32];
+	uint32_t mode;          /* 1 = shared-screen; link identity follows separately */
+	uint32_t input_delay;   /* timeline priming must agree exactly */
 	uint32_t core_identity;
 	uint32_t state_size;
 	uint32_t sram_size;
@@ -141,8 +146,12 @@ bool NetLink_takeCheckpointAck(uint32_t* frame, uint32_t* hash, bool* matched);
  * delayed control packet from an abandoned attempt harmless. */
 bool NetLink_requestResync(uint32_t frame);
 bool NetLink_takeResyncRequest(uint32_t* frame);
-bool NetLink_beginResync(uint32_t epoch, uint32_t resume_frame);
-bool NetLink_takeResyncBegin(uint32_t* epoch, uint32_t* resume_frame);
+typedef enum {
+	NETLINK_RECOVERY_SYNC = 0,
+	NETLINK_RECOVERY_RESET = 1,
+} NetLinkRecoveryKind;
+bool NetLink_beginResync(uint32_t epoch, uint32_t resume_frame, NetLinkRecoveryKind kind);
+bool NetLink_takeResyncBegin(uint32_t* epoch, uint32_t* resume_frame, NetLinkRecoveryKind* kind);
 bool NetLink_ackResync(uint32_t epoch, bool loaded);
 bool NetLink_takeResyncAck(uint32_t* epoch, bool* loaded);
 bool NetLink_commitResync(uint32_t epoch);

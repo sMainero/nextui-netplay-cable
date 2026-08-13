@@ -35,6 +35,7 @@ fi
 
 RESTORE="$NP/state/wifi_restore"
 LOCK="/tmp/netplay_watchdog.pid"
+RESTORE_LOCK="/tmp/netplay_wifi_restore.lock"
 HOST=10.0.0.1
 PREFIX=nextui
 
@@ -77,11 +78,31 @@ on_adhoc() {
 }
 
 restore_wifi() {
+	# The setup app has a foreground restore path using the same radio and daemon
+	# commands. Only one may own that transaction: otherwise each can kill the
+	# supplicant the other just started. A live owner will finish (or retain the
+	# breadcrumb), so the watchdog can retry on its next failure window.
+	if ! mkdir "$RESTORE_LOCK" 2>/dev/null; then
+		_owner=$(cat "$RESTORE_LOCK/pid" 2>/dev/null)
+		if [ -n "$_owner" ] && [ -d "/proc/$_owner" ]; then
+			log "wifi restoration already owned by pid $_owner"
+			return 1
+		fi
+		rm -f "$RESTORE_LOCK/pid"
+		rmdir "$RESTORE_LOCK" 2>/dev/null
+		mkdir "$RESTORE_LOCK" 2>/dev/null || return 1
+	fi
+	echo $$ > "$RESTORE_LOCK/pid"
+
 	# Same command the app captured before it moved the client stack. Replaying
 	# it verbatim is the only portable route back: /etc/wifi/wifi_init.sh exists
 	# on some platforms and not others.
 	_cmd=$(head -1 "$RESTORE" 2>/dev/null)
-	[ -n "$_cmd" ] || { log "nothing recorded to restore with"; return 1; }
+	if [ -z "$_cmd" ]; then
+		log "nothing recorded to restore with"
+		rm -f "$RESTORE_LOCK/pid"; rmdir "$RESTORE_LOCK" 2>/dev/null
+		return 1
+	fi
 
 	killall -q wpa_supplicant 2>/dev/null
 	ip addr flush dev wlan0 2>/dev/null
@@ -97,7 +118,12 @@ restore_wifi() {
 	udhcpc -i wlan0 -n -q -t 8 >/dev/null 2>&1
 
 	_ip=$(ip -4 addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
-	[ -n "$_ip" ] && log "recovered, back on wifi as $_ip" || log "restore attempt did not get an address"
+	if [ -z "$_ip" ]; then
+		log "restore attempt did not get an address - keeping recovery record"
+		rm -f "$RESTORE_LOCK/pid"; rmdir "$RESTORE_LOCK" 2>/dev/null
+		return 1
+	fi
+	log "recovered, back on wifi as $_ip"
 	rm -f "$RESTORE"
 
 	# The ad hoc network is gone - stop the launch stub chasing it.
@@ -113,6 +139,7 @@ restore_wifi() {
 			mv "$_sess.tmp" "$_sess" &&
 			log "cleared adhoc_ssid from the session - that network is gone"
 	fi
+	rm -f "$RESTORE_LOCK/pid"; rmdir "$RESTORE_LOCK" 2>/dev/null
 }
 
 log "watching (host $HOST, every ${INTERVAL}s, act after $FAILS_NEEDED failures)"
@@ -154,8 +181,12 @@ while [ $checks -lt $MAX_CHECKS ]; do
 	log "$reason ($fails/$FAILS_NEEDED)"
 	if [ $fails -ge $FAILS_NEEDED ]; then
 		log "giving up ($reason) - restoring wifi"
-		restore_wifi
-		exit 0
+		if restore_wifi; then
+			exit 0
+		fi
+		# A failed attempt is not terminal. Retain the breadcrumb and give the
+		# platform time to settle before collecting another failure window.
+		fails=0
 	fi
 done
 

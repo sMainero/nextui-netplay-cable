@@ -259,6 +259,8 @@ const char* const NS_INST_CORE[NS_INST_CORES] = { "gambatte", "gpsp", "mgba" };
 static NS_Settings ns_set = {
 	.share_cores   = false,
 	.compatibility_cores = true,
+	.force_compatibility = false,
+	.verbose_logs = true,
 	.simple_client = false,
 	.instanced     = NS_INST_OFF,
 	.inst_core     = { false, false, false },
@@ -276,6 +278,15 @@ static const char* compatibility_arch(void) {
 NS_Settings* NS_settings(void) {
 	if (!ns_set_loaded) NS_settingsLoad();
 	return &ns_set;
+}
+
+static bool instanced_core_enabled(const char* core) {
+	NS_Settings* settings = NS_settings();
+	if (settings->instanced == NS_INST_OFF) return false;
+	if (settings->instanced == NS_INST_ALL) return true;
+	for (int i = 0; i < NS_INST_CORES; i++)
+		if (!strcmp(core, NS_INST_CORE[i])) return settings->inst_core[i];
+	return false;
 }
 
 void NS_settingsLoad(void) {
@@ -298,6 +309,8 @@ void NS_settingsLoad(void) {
 
 		if      (!strcmp(k, "share_cores"))   ns_set.share_cores = v != 0;
 		else if (!strcmp(k, "compatibility_cores")) ns_set.compatibility_cores = v != 0;
+		else if (!strcmp(k, "force_compatibility")) ns_set.force_compatibility = v != 0;
+		else if (!strcmp(k, "verbose_logs")) ns_set.verbose_logs = v != 0;
 		else if (!strcmp(k, "simple_client")) ns_set.simple_client = v != 0;
 		else if (!strcmp(k, "instanced"))
 			ns_set.instanced = (v < 0 || v > NS_INST_SELECTED) ? NS_INST_OFF : (NS_InstMode)v;
@@ -310,6 +323,10 @@ void NS_settingsLoad(void) {
 		}
 	}
 	fclose(f);
+	/* The testing override is a stronger form of using packaged cores. Keep old
+	 * or hand-edited settings internally coherent rather than showing an
+	 * impossible Force=Yes / Use=No combination. */
+	if (ns_set.force_compatibility) ns_set.compatibility_cores = true;
 }
 
 void NS_settingsSave(void) {
@@ -324,6 +341,8 @@ void NS_settingsSave(void) {
 	if (!f) { ns_log("cannot write settings\n"); return; }
 	fprintf(f, "share_cores=%d\n",   ns_set.share_cores ? 1 : 0);
 	fprintf(f, "compatibility_cores=%d\n", ns_set.compatibility_cores ? 1 : 0);
+	fprintf(f, "force_compatibility=%d\n", ns_set.force_compatibility ? 1 : 0);
+	fprintf(f, "verbose_logs=%d\n", ns_set.verbose_logs ? 1 : 0);
 	fprintf(f, "simple_client=%d\n", ns_set.simple_client ? 1 : 0);
 	fprintf(f, "instanced=%d\n",     (int)ns_set.instanced);
 	for (int i = 0; i < NS_INST_CORES; i++)
@@ -359,7 +378,7 @@ bool NS_coreInstalled(const char* core) {
  * scripts; a core absent here is simply never offered for sharing. */
 static const char* MANIFEST_CORES[] = {
 	"fceumm", "picodrive", "snes9x", "snes9x2005", "gambatte", "gpsp",
-	"mgba", "mednafen_supafaust", "fbneo", "pcsx_rearmed",
+	"mgba", "mednafen_supafaust", "pcsx_rearmed",
 };
 
 uint32_t NS_runtimeGlibc(void) {
@@ -474,6 +493,11 @@ static bool installed_core_path(const char* core, char* out, int len) {
 }
 
 static bool compatibility_core_path(const char* core, char* out, int len) {
+	/* A30's stock SFC pak invokes snes9x2005_libretro.so. The shared fallback
+	 * uses one canonical filename regardless of which installed Snes9x variant
+	 * led to negotiation; both architecture copies contain the same pinned
+	 * portable, lower-overhead Supafaust implementation. */
+	if (!strcmp(core, "snes9x2005")) core = "snes9x";
 	snprintf(out, len, "%s/cores/compatibility/%s/%s_libretro.so",
 	         ns_pak, compatibility_arch(), core);
 	return file_exists(out);
@@ -515,7 +539,7 @@ int NS_coreManifest(NS_CoreInfo* out, int max) {
 // core compatibility negotiation
 //////////////////////////////////////////////////////////////////////////////
 
-#define CORE_MAGIC 0x4E504332u   /* 'NPC2': metadata-only compatibility protocol */
+#define CORE_MAGIC 0x4E504333u   /* 'NPC3': metadata-only compatibility protocol */
 #define CORE_IO_MS   30000
 
 typedef struct __attribute__((packed)) {
@@ -557,8 +581,9 @@ static bool io_all(int fd, void* buf, size_t len, bool writing) {
 }
 
 static bool send_manifest(int fd, NS_CoreInfo* m, int n) {
-	uint32_t hdr[3] = { htonl(CORE_MAGIC), htonl((uint32_t)n),
-	                    htonl(NS_settings()->compatibility_cores ? 1u : 0u) };
+	uint32_t hdr[4] = { htonl(CORE_MAGIC), htonl((uint32_t)n),
+	                    htonl(NS_settings()->compatibility_cores ? 1u : 0u),
+	                    htonl(NS_settings()->force_compatibility ? 1u : 0u) };
 	if (!io_all(fd, hdr, sizeof(hdr), true)) return false;
 	for (int i = 0; i < n; i++) {
 		CoreWire w;
@@ -577,12 +602,14 @@ static bool send_manifest(int fd, NS_CoreInfo* m, int n) {
 	return true;
 }
 
-static int recv_manifest(int fd, NS_CoreInfo* out, int max, bool* peer_compat_enabled) {
-	uint32_t hdr[3];
+static int recv_manifest(int fd, NS_CoreInfo* out, int max,
+                         bool* peer_compat_enabled, bool* peer_force_compatibility) {
+	uint32_t hdr[4];
 	if (!io_all(fd, hdr, sizeof(hdr), false)) return -1;
 	if (ntohl(hdr[0]) != CORE_MAGIC) return -1;
 	int n = (int)ntohl(hdr[1]);
 	*peer_compat_enabled = ntohl(hdr[2]) != 0;
+	*peer_force_compatibility = ntohl(hdr[3]) != 0;
 	if (n < 0 || n > NS_MAX_MANIFEST) return -1;
 
 	int kept = 0;
@@ -635,7 +662,9 @@ static bool compatibility_builds_match(const NS_CoreInfo* a, const NS_CoreInfo* 
 /* Rewrite only the generated compatibility selections, preserving role,
  * transport and hand-edited options. Both copies must agree because the
  * launcher reads state/session while session.conf is the durable template. */
-static bool write_compat_file(const char* path, const char selected[][32], int count) {
+static bool write_compat_file(const char* path,
+                              const char selected[][32], int count,
+                              const char mismatched[][32], int mismatch_count) {
 	char tmp[560];
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	FILE* in = fopen(path, "r");
@@ -645,8 +674,11 @@ static bool write_compat_file(const char* path, const char selected[][32], int c
 
 	char line[512];
 	while (fgets(line, sizeof(line), in))
-		if (strncmp(line, "compat_core.", 12)) fputs(line, out);
+		if (strncmp(line, "compat_core.", 12) &&
+		    strncmp(line, "core_mismatch.", 14)) fputs(line, out);
 	for (int i = 0; i < count; i++) fprintf(out, "compat_core.%s=1\n", selected[i]);
+	for (int i = 0; i < mismatch_count; i++)
+		fprintf(out, "core_mismatch.%s=1\n", mismatched[i]);
 
 	fclose(in);
 	if (fclose(out) != 0 || rename(tmp, path) != 0) {
@@ -657,14 +689,28 @@ static bool write_compat_file(const char* path, const char selected[][32], int c
 }
 
 static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, int tn,
-								bool peer_enabled) {
+								bool peer_enabled, bool peer_force) {
 	char selected[NS_MAX_MANIFEST][32];
+	char mismatched[NS_MAX_MANIFEST][32];
 	int count = 0;
+	int mismatch_count = 0;
 	bool enabled = NS_settings()->compatibility_cores && peer_enabled;
+	bool forced = enabled && (NS_settings()->force_compatibility || peer_force);
 
 	for (size_t i = 0; i < sizeof(MANIFEST_CORES) / sizeof(MANIFEST_CORES[0]); i++) {
 		NS_CoreInfo* a = find_core(mine, mn, MANIFEST_CORES[i]);
 		NS_CoreInfo* b = find_core(theirs, tn, MANIFEST_CORES[i]);
+		if (forced && (a || b)) {
+			if (compatibility_builds_match(a, b)) {
+				snprintf(selected[count++], sizeof(selected[0]), "%s", MANIFEST_CORES[i]);
+				ns_log("%s: testing override selected the packaged compatibility core\n",
+				       MANIFEST_CORES[i]);
+			} else {
+				ns_log("%s: testing override requested but no common packaged core exists\n",
+				       MANIFEST_CORES[i]);
+			}
+			continue;
+		}
 		if (installed_builds_match(MANIFEST_CORES[i], a, b)) {
 			ns_log("%s: installed builds match; keeping them\n", MANIFEST_CORES[i]);
 			continue;
@@ -674,23 +720,24 @@ static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, 
 			ns_log("%s: installed builds differ; both will use compatibility cores\n",
 			       MANIFEST_CORES[i]);
 		} else if (a && b && (a->installed || b->installed)) {
+			snprintf(mismatched[mismatch_count++], sizeof(mismatched[0]), "%s",
+			         MANIFEST_CORES[i]);
 			ns_log("%s: installed builds differ and no common compatibility core is enabled\n",
 			       MANIFEST_CORES[i]);
 		}
 	}
-
 	char path[512];
 	snprintf(path, sizeof(path), "%s/session.conf", ns_pak);
-	if (!write_compat_file(path, selected, count)) {
+	if (!write_compat_file(path, selected, count, mismatched, mismatch_count)) {
 		ns_log("cannot update compatibility selections in session.conf\n");
 		return -1;
 	}
 	snprintf(path, sizeof(path), "%s/state/session", ns_pak);
-	if (!write_compat_file(path, selected, count)) {
+	if (!write_compat_file(path, selected, count, mismatched, mismatch_count)) {
 		ns_log("cannot update compatibility selections in active session\n");
 		/* Do not leave a durable selection that disagrees with the active file. */
 		snprintf(path, sizeof(path), "%s/session.conf", ns_pak);
-		write_compat_file(path, selected, 0);
+		write_compat_file(path, selected, 0, mismatched, 0);
 		return -1;
 	}
 	return count;
@@ -699,11 +746,14 @@ static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, 
 //////////////////////////////////////////////////////////////////////////////
 // host side
 
-void NS_compatServeStart(void) {
-	if (core_listen_fd >= 0) return;
+bool NS_compatServeStart(void) {
+	if (core_listen_fd >= 0) return true;
 
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0) return;
+	if (fd < 0) {
+		ns_log("core compatibility negotiation: socket failed: %s\n", strerror(errno));
+		return false;
+	}
 	int on = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
 	int fl = fcntl(fd, F_GETFL, 0);
@@ -715,11 +765,13 @@ void NS_compatServeStart(void) {
 	a.sin_addr.s_addr = INADDR_ANY;
 	a.sin_port = htons(NS_CORE_PORT);
 	if (bind(fd, (struct sockaddr*)&a, sizeof(a)) != 0 || listen(fd, 2) != 0) {
+		ns_log("core compatibility negotiation: listen failed: %s\n", strerror(errno));
 		close(fd);
-		return;
+		return false;
 	}
 	core_listen_fd = fd;
 	ns_log("core compatibility negotiation listening on %d\n", NS_CORE_PORT);
+	return true;
 }
 
 void NS_compatServeStop(void) {
@@ -737,14 +789,17 @@ void NS_compatServeTick(void) {
 
 	NS_CoreInfo theirs[NS_MAX_MANIFEST];
 	bool peer_compat_enabled = false;
-	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST, &peer_compat_enabled);
+	bool peer_force_compatibility = false;
+	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST,
+	                       &peer_compat_enabled, &peer_force_compatibility);
 	if (tn < 0 ||
 	    !send_manifest(fd, mine, n)) {
 		ns_log("core compatibility negotiation: manifest failed\n");
 		close(fd);
 		return;
 	}
-	int selected = select_compatibility(mine, n, theirs, tn, peer_compat_enabled);
+	int selected = select_compatibility(mine, n, theirs, tn,
+	                                    peer_compat_enabled, peer_force_compatibility);
 	if (selected < 0)
 		ns_log("core compatibility negotiation: could not activate selections\n");
 	else
@@ -844,20 +899,25 @@ int NS_compatSync(const char* host_ip, char* err, int errlen) {
 
 	NS_CoreInfo theirs[NS_MAX_MANIFEST];
 	bool peer_compat_enabled = false;
+	bool peer_force_compatibility = false;
 	if (!send_manifest(fd, mine, n)) {
 		close(fd);
 		snprintf(err, errlen, "manifest exchange failed");
 		return -1;
 	}
-	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST, &peer_compat_enabled);
+	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST,
+	                       &peer_compat_enabled, &peer_force_compatibility);
 	if (tn < 0) {
 		close(fd);
 		snprintf(err, errlen, "manifest exchange failed");
 		return -1;
 	}
 
-	int selected = select_compatibility(mine, n, theirs, tn, peer_compat_enabled);
-	if (selected < 0)
+	int selected = select_compatibility(mine, n, theirs, tn,
+	                                    peer_compat_enabled, peer_force_compatibility);
+	if (selected == -2)
+		snprintf(err, errlen, "forced compatibility core unavailable");
+	else if (selected < 0)
 		snprintf(err, errlen, "cannot activate core selection");
 
 	/* Frozen peer-to-peer executable transfer. Compatibility negotiation above
@@ -974,9 +1034,14 @@ int NS_runChecks(NS_Check* out, int max, NS_CheckResult* worst) {
 	int checked = 0, unqualified = 0;
 	snprintf(path, sizeof(path), "%s/.system/%s/paks/Emus", ns_sd, ns_platform);
 	{
-		char cmd[600];
+		char cmd[1200];
 		snprintf(cmd, sizeof(cmd),
-		         "grep -l 'minarch.elf' %s/*.pak/launch.sh 2>/dev/null", path);
+		         "for p in '%s'/*.pak; do "
+		         "f=\"$p/launch.sh\"; "
+		         "if grep -q 'Installed by Netplay.pak' \"$f\" 2>/dev/null && "
+		         "[ -f \"$p/launch.sh.old\" ]; then f=\"$p/launch.sh.old\"; fi; "
+		         "grep -q 'minarch.elf' \"$f\" 2>/dev/null && echo \"$f\"; "
+		         "done", path);
 		FILE* f = popen(cmd, "r");
 		if (f) {
 			while (fgets(line, sizeof(line), f)) {
@@ -1101,6 +1166,12 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	/* Kept in the session format while peer executable sharing is frozen. */
 	fprintf(f, "share_cores=%d\n", NS_settings()->share_cores ? 1 : 0);
 	fprintf(f, "compatibility_cores=%d\n", NS_settings()->compatibility_cores ? 1 : 0);
+	fprintf(f, "force_compatibility=%d\n", NS_settings()->force_compatibility ? 1 : 0);
+	fprintf(f, "verbose_logs=%d\n", NS_settings()->verbose_logs ? 1 : 0);
+	/* Gambatte is the first implemented instanced core. The other choices stay
+	 * persisted so their UI/API do not need another format change when their
+	 * local-link hosts are ready. Unknown session keys are deliberately safe. */
+	fprintf(f, "instanced_gambatte=%d\n", instanced_core_enabled("gambatte") ? 1 : 0);
 
 	/* Record the ad hoc network so the launch stub can put us back on it. The
 	 * join done here does not survive the app exiting - the platform brings its
@@ -1157,6 +1228,15 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	         ns_sd, ns_platform, ns_sd, ns_platform, ns_sd, ns_platform, ns_pak);
 	if (system(cmd) != 0) {
 		ns_log("bind mounts unavailable - falling back to launch stubs\n");
+		/* `up` may have covered some paks before another target failed. Never
+		 * combine that partial mount set with SD launch stubs: undo the entire
+		 * owned mount transaction before trying the fallback route. */
+		snprintf(cmd, sizeof(cmd),
+		         "SDCARD_PATH='%s' PLATFORM='%s' SYSTEM_PATH='%s/.system/%s' "
+		         "USERDATA_PATH='%s/.userdata/%s' "
+		         "sh '%s/launcher/bind-mount.sh' down >/dev/null 2>&1",
+		         ns_sd, ns_platform, ns_sd, ns_platform, ns_sd, ns_platform, ns_pak);
+		system(cmd);
 		snprintf(cmd, sizeof(cmd),
 		         "SDCARD_PATH='%s' PLATFORM='%s' SYSTEM_PATH='%s/.system/%s' "
 		         "sh '%s/launcher/install-stubs.sh' install >/dev/null 2>&1",
@@ -1176,6 +1256,8 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 
 void NS_disarm(void) {
 	char cmd[1200];
+	NS_announceStop();
+	NS_compatServeStop();
 	/* Takes both routes down - mounts, the boot hook, and any legacy stubs -
 	 * so "off" means off regardless of how this device was covered. */
 	snprintf(cmd, sizeof(cmd),
@@ -1201,6 +1283,8 @@ void NS_disarm(void) {
  * instead of a full reinstall across every Emus pak. */
 void NS_endSession(void) {
 	char cmd[1200];
+	NS_announceStop();
+	NS_compatServeStop();
 	snprintf(cmd, sizeof(cmd), "rm -f '%s/state/session'", ns_pak);
 	system(cmd);
 
@@ -1608,12 +1692,66 @@ static bool load_saved_supplicant(void) {
  * first request can go out during the 4-way handshake and simply be dropped. */
 #define RESTORE_DHCP_RETRY_S 8
 
+/* A30 occasionally accepts the captured command but loses the first daemon
+ * during the radio transition. One clean retry inside the existing deadline
+ * is much faster than handing the same command to the watchdog half a minute
+ * later (the failure observed in the field). */
+#define RESTORE_SUPPLICANT_RETRY_S 10
+#define WIFI_RESTORE_LOCK "/tmp/netplay_wifi_restore.lock"
+
 static bool wifi_link_up(void) {
 	return system("iw dev wlan0 link 2>/dev/null | grep -q 'Connected to'") == 0;
 }
 
 static bool wifi_has_ip(void) {
 	return system("ip -4 addr show wlan0 2>/dev/null | grep -q 'inet '") == 0;
+}
+
+static bool supplicant_running(void) {
+	return system("pidof wpa_supplicant >/dev/null 2>&1") == 0;
+}
+
+static bool wifi_restore_lock_acquire(void) {
+	if (mkdir(WIFI_RESTORE_LOCK, 0700) == 0) {
+		char path[128];
+		snprintf(path, sizeof(path), "%s/pid", WIFI_RESTORE_LOCK);
+		FILE* f = fopen(path, "w");
+		if (f) { fprintf(f, "%d\n", getpid()); fclose(f); }
+		return true;
+	}
+
+	/* Do not kill or wait behind the watchdog: the retained recovery record
+	 * means this caller can safely stand down while the current owner finishes.
+	 * Recover only an unmistakably stale directory left by a crashed owner. */
+	char path[128];
+	snprintf(path, sizeof(path), "%s/pid", WIFI_RESTORE_LOCK);
+	FILE* f = fopen(path, "r");
+	int pid = 0;
+	bool live = f && fscanf(f, "%d", &pid) == 1 && pid > 0;
+	if (f) fclose(f);
+	if (live) {
+		char proc[64];
+		snprintf(proc, sizeof(proc), "/proc/%d", pid);
+		live = file_exists(proc);
+	}
+	if (live) {
+		ns_log("wifi restoration already owned by pid %d\n", pid);
+		return false;
+	}
+	unlink(path);
+	if (rmdir(WIFI_RESTORE_LOCK) != 0 || mkdir(WIFI_RESTORE_LOCK, 0700) != 0)
+		return false;
+	snprintf(path, sizeof(path), "%s/pid", WIFI_RESTORE_LOCK);
+	f = fopen(path, "w");
+	if (f) { fprintf(f, "%d\n", getpid()); fclose(f); }
+	return true;
+}
+
+static void wifi_restore_lock_release(void) {
+	char path[128];
+	snprintf(path, sizeof(path), "%s/pid", WIFI_RESTORE_LOCK);
+	unlink(path);
+	rmdir(WIFI_RESTORE_LOCK);
 }
 
 /* Put back whatever was running before, preferring the platform's own script
@@ -1623,25 +1761,34 @@ static bool wifi_has_ip(void) {
  * at all and reported success unconditionally, so the UI could claim it was
  * connected while the radio was still associating. */
 static bool wifi_client_stack_up(void) {
+	if (!wifi_restore_lock_acquire()) return false;
+
 	system("killall -q wpa_supplicant 2>/dev/null");
+	system("killall -q udhcpc 2>/dev/null");
+	/* Do not race a daemon which has accepted SIGTERM but has not released its
+	 * control socket yet. The A30 log showed precisely that first-start loss. */
+	for (int i = 0; i < 10 && supplicant_running(); i++) usleep(100000);
+	system("ip addr flush dev wlan0 2>/dev/null");
+	system("ip route flush dev wlan0 2>/dev/null");
 	system("ip link set wlan0 up 2>/dev/null");
 
+	bool can_retry_saved = false;
+	char cmd[600] = "";
 	if (file_exists("/etc/wifi/wifi_init.sh")) {
 		system("/etc/wifi/wifi_init.sh stop  >/dev/null 2>&1");
 		system("/etc/wifi/wifi_init.sh start >/dev/null 2>&1");
-		ns_log("restored wifi via wifi_init.sh\n");
-		return wifi_has_ip();
-	}
-
-	if (!load_saved_supplicant()) {
+		ns_log("started wifi restoration via wifi_init.sh\n");
+	} else if (!load_saved_supplicant()) {
 		ns_log("WARNING: nothing recorded to restore wifi with\n");
+		wifi_restore_lock_release();
 		return false;
+	} else {
+		/* The captured line already carries -B; it daemonises itself. */
+		snprintf(cmd, sizeof(cmd), "%s >/dev/null 2>&1", saved_supplicant);
+		system(cmd);
+		can_retry_saved = true;
+		ns_log("started saved supplicant command\n");
 	}
-
-	char cmd[600];
-	/* The captured line already carries -B; it daemonises itself. */
-	snprintf(cmd, sizeof(cmd), "%s >/dev/null 2>&1", saved_supplicant);
-	system(cmd);
 
 	/* One loop to the deadline. What we are waiting for is an address; whether
 	 * the time goes on associating or on DHCP is not something to budget for
@@ -1656,12 +1803,23 @@ static bool wifi_client_stack_up(void) {
 
 	for (int i = 0; i < RESTORE_TOTAL_S && !got_ip; i++) {
 		if (ns_progress)
-			ns_progress(assoc ? "Getting an address" : "Reconnecting", i + 1, RESTORE_TOTAL_S);
+			ns_progress(assoc ? "Getting original WiFi address"
+			                  : "Reconnecting to original WiFi",
+			            i + 1, RESTORE_TOTAL_S);
 		sleep(1);
 
 		if (!assoc) {
 			assoc = wifi_link_up();
-			if (!assoc) continue;
+			if (!assoc) {
+				if (can_retry_saved && i + 1 == RESTORE_SUPPLICANT_RETRY_S) {
+					ns_log("still unassociated after %ds - restarting saved supplicant\n",
+					       i + 1);
+					system("killall -q wpa_supplicant 2>/dev/null");
+					for (int n = 0; n < 10 && supplicant_running(); n++) usleep(100000);
+					system(cmd);
+				}
+				continue;
+			}
 			ns_log("re-associated after %ds\n", i + 1);
 		}
 
@@ -1678,6 +1836,7 @@ static bool wifi_client_stack_up(void) {
 
 	if (got_ip) {
 		ns_log("restored wifi via saved supplicant command\n");
+		wifi_restore_lock_release();
 		return true;
 	}
 
@@ -1688,6 +1847,7 @@ static bool wifi_client_stack_up(void) {
 	 * the watchdog and the next app launch both still know to finish this. */
 	ns_log("wifi not back after %ds (associated=%d) - leaving dhcp running\n",
 	       RESTORE_TOTAL_S, assoc);
+	wifi_restore_lock_release();
 	return false;
 }
 
@@ -1720,7 +1880,7 @@ bool NS_wifiRecoverIfStranded(void) {
 
 	char cmd[256];
 	snprintf(cmd, sizeof(cmd),
-	         "iw dev wlan0 link 2>/dev/null | grep -q 'SSID: %s'", NS_ADHOC_SSID);
+	         "iw dev wlan0 link 2>/dev/null | grep -q 'SSID: %s-'", NS_ADHOC_PREFIX);
 	bool on_adhoc = system(cmd) == 0;
 
 	/* Healthy on some other network: nothing to do, and the record is stale.

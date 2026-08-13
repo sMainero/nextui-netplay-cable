@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 #define NETLINK_MAGIC    0x4E504C4BU /* 'NPLK' */
-#define NETLINK_PROTOCOL 7
+#define NETLINK_PROTOCOL 9
 
 #define QUEUE_SIZE    512
 /* Inputs are indexed by frame; the ring only has to outlast the input delay
@@ -51,10 +51,10 @@ enum {
 	CMD_STATE  = 0x06, /* {total, offset, bytes} */
 	CMD_HASH   = 0x07, /* {frame, hash} */
 	CMD_RESYNC_REQUEST = 0x08, /* {mismatched frame} */
-	CMD_RESYNC_BEGIN   = 0x09, /* {epoch, resume_frame}; CMD_STATE follows */
+	CMD_RESYNC_BEGIN   = 0x09, /* {epoch, resume_frame, kind}; CMD_STATE follows */
 	CMD_RESYNC_ACK     = 0x0A, /* {epoch, loaded} */
 	CMD_RESYNC_COMMIT  = 0x0B, /* {epoch} */
-	CMD_SESSION_IDENTITY = 0x0C, /* {rom sha256, core id, state size} */
+	CMD_SESSION_IDENTITY = 0x0C, /* {rom sha256, mode, delay, core/state/save identity} */
 	CMD_CHECKPOINT_ACK = 0x0D, /* {frame, hash, matched} */
 };
 
@@ -118,6 +118,7 @@ static struct {
 	bool     resync_request_ready;
 	uint32_t resync_begin_epoch;
 	uint32_t resync_begin_frame;
+	NetLinkRecoveryKind resync_begin_kind;
 	bool     resync_begin_ready;
 	uint32_t resync_ack_epoch;
 	bool     resync_ack_loaded;
@@ -699,10 +700,13 @@ static void* worker(void* arg) {
 			pthread_mutex_unlock(&nl.lock);
 		}
 
-		if (hdr.cmd == CMD_RESYNC_BEGIN && size == 8) {
+		if (hdr.cmd == CMD_RESYNC_BEGIN && size == 12) {
 			pthread_mutex_lock(&nl.lock);
 			nl.resync_begin_epoch = ntohl(*(uint32_t*)buf);
 			nl.resync_begin_frame = ntohl(*(uint32_t*)(buf + 4));
+			uint32_t kind = ntohl(*(uint32_t*)(buf + 8));
+			nl.resync_begin_kind = kind == NETLINK_RECOVERY_RESET
+			                     ? NETLINK_RECOVERY_RESET : NETLINK_RECOVERY_SYNC;
 			nl.resync_begin_ready = true;
 			/* BEGIN owns the state stream which follows it. */
 			free(nl.state_buf);
@@ -727,13 +731,15 @@ static void* worker(void* arg) {
 			pthread_mutex_unlock(&nl.lock);
 		}
 
-		if (hdr.cmd == CMD_SESSION_IDENTITY && size == 48) {
+		if (hdr.cmd == CMD_SESSION_IDENTITY && size == 56) {
 			pthread_mutex_lock(&nl.lock);
 			memcpy(nl.peer_session_identity.rom_sha256, buf, 32);
-			nl.peer_session_identity.core_identity = ntohl(*(uint32_t*)(buf + 32));
-			nl.peer_session_identity.state_size = ntohl(*(uint32_t*)(buf + 36));
-			nl.peer_session_identity.sram_size = ntohl(*(uint32_t*)(buf + 40));
-			nl.peer_session_identity.rtc_size = ntohl(*(uint32_t*)(buf + 44));
+			nl.peer_session_identity.mode = ntohl(*(uint32_t*)(buf + 32));
+			nl.peer_session_identity.input_delay = ntohl(*(uint32_t*)(buf + 36));
+			nl.peer_session_identity.core_identity = ntohl(*(uint32_t*)(buf + 40));
+			nl.peer_session_identity.state_size = ntohl(*(uint32_t*)(buf + 44));
+			nl.peer_session_identity.sram_size = ntohl(*(uint32_t*)(buf + 48));
+			nl.peer_session_identity.rtc_size = ntohl(*(uint32_t*)(buf + 52));
 			nl.peer_session_identity_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
@@ -801,13 +807,11 @@ void NetLink_setCoreRunning(bool running) {
 bool NetLink_isPeerPaused(void) {
 	pthread_mutex_lock(&nl.lock);
 	bool p = nl.peer_paused;
-	if (p && ms_since(&nl.peer_paused_at) > MAX_PAUSE_MS) {
-		nl.peer_paused = false;
-		p = false;
-		pthread_mutex_unlock(&nl.lock);
-		nl_log("peer paused for over %ds - resuming without it\n", MAX_PAUSE_MS / 1000);
-		return false;
-	}
+	/* A live peer may legitimately remain in its menu indefinitely. The worker
+	 * keeps exchanging heartbeats while both frontends are paused, and
+	 * drop_connection() clears this flag if the process/device actually dies.
+	 * A time-based forced resume ran a link core alone after 30 seconds, broke
+	 * Gambatte's separate serial socket, and made two-menu resume unrecoverable. */
 	pthread_mutex_unlock(&nl.lock);
 	return p;
 }
@@ -846,25 +850,45 @@ uint32_t NetLink_connectionGeneration(void) {
 // shared-screen netplay
 //////////////////////////////////////////////////////////////////////////////
 
+static void reset_timeline_locked(void) {
+	memset(nl.inputs, 0, sizeof(nl.inputs));
+	nl.peer_hash_head = nl.peer_hash_count = 0;
+	nl.checkpoint_ack_ready = false;
+}
+
+void NetLink_resetTimeline(void) {
+	pthread_mutex_lock(&nl.lock);
+	reset_timeline_locked();
+	pthread_mutex_unlock(&nl.lock);
+}
+
 void NetLink_resetSync(void) {
 	pthread_mutex_lock(&nl.lock);
-	memset(nl.inputs, 0, sizeof(nl.inputs));
+	reset_timeline_locked();
 	free(nl.state_buf);
 	nl.state_buf = NULL;
 	nl.state_len = nl.state_have = 0;
 	nl.state_ready = false;
-	nl.peer_hash_head = nl.peer_hash_count = 0;
-	nl.checkpoint_ack_ready = false;
 	nl.resync_request_ready = nl.resync_begin_ready = false;
 	nl.resync_ack_ready = nl.resync_commit_ready = false;
 	pthread_mutex_unlock(&nl.lock);
 }
 
-void NetLink_sendInput(uint32_t frame, uint32_t buttons) {
-	uint32_t payload[2] = { htonl(frame), htonl(buttons) };
+/* Every framed send has the same failure semantics. A partial control/state
+ * transaction cannot be repaired on the same byte stream; close it and let the
+ * next connection generation start from a clean identity/state handshake. */
+static bool send_command(uint8_t cmd, const void* data, size_t len) {
 	pthread_mutex_lock(&nl.lock);
-	if (nl.connected) send_framed(CMD_INPUT, payload, sizeof(payload), NetLink_localClientId());
+	bool connected = nl.connected;
+	bool ok = connected && send_framed(cmd, data, len, NetLink_localClientId());
 	pthread_mutex_unlock(&nl.lock);
+	if (!ok && connected) drop_connection("protocol send failed");
+	return ok;
+}
+
+bool NetLink_sendInput(uint32_t frame, uint32_t buttons) {
+	uint32_t payload[2] = { htonl(frame), htonl(buttons) };
+	return send_command(CMD_INPUT, payload, sizeof(payload));
 }
 
 bool NetLink_getRemoteInput(uint32_t frame, uint32_t* buttons) {
@@ -887,9 +911,7 @@ bool NetLink_sendState(const void* data, size_t len) {
 		memcpy(pkt, hdr, 8);
 		memcpy(pkt + 8, p + off, n);
 
-		pthread_mutex_lock(&nl.lock);
-		bool ok = nl.connected && send_framed(CMD_STATE, pkt, n + 8, NetLink_localClientId());
-		pthread_mutex_unlock(&nl.lock);
+		bool ok = send_command(CMD_STATE, pkt, n + 8);
 		if (!ok) return false;
 	}
 	return true;
@@ -956,24 +978,21 @@ bool NetLink_takeState(void** data, size_t* len) {
 	return true;
 }
 
-void NetLink_sendHash(uint32_t frame, uint32_t hash) {
+bool NetLink_sendHash(uint32_t frame, uint32_t hash) {
 	uint32_t payload[2] = { htonl(frame), htonl(hash) };
-	pthread_mutex_lock(&nl.lock);
-	if (nl.connected) send_framed(CMD_HASH, payload, sizeof(payload), NetLink_localClientId());
-	pthread_mutex_unlock(&nl.lock);
+	return send_command(CMD_HASH, payload, sizeof(payload));
 }
 
 bool NetLink_sendSessionIdentity(const NetLinkSessionIdentity* identity) {
-	uint8_t wire[48];
+	uint8_t wire[56];
 	memcpy(wire, identity->rom_sha256, 32);
-	uint32_t v = htonl(identity->core_identity); memcpy(wire + 32, &v, 4);
-	v = htonl(identity->state_size); memcpy(wire + 36, &v, 4);
-	v = htonl(identity->sram_size); memcpy(wire + 40, &v, 4);
-	v = htonl(identity->rtc_size); memcpy(wire + 44, &v, 4);
-	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.connected && send_framed(CMD_SESSION_IDENTITY, wire, sizeof(wire), NetLink_localClientId());
-	pthread_mutex_unlock(&nl.lock);
-	return ok;
+	uint32_t v = htonl(identity->mode); memcpy(wire + 32, &v, 4);
+	v = htonl(identity->input_delay); memcpy(wire + 36, &v, 4);
+	v = htonl(identity->core_identity); memcpy(wire + 40, &v, 4);
+	v = htonl(identity->state_size); memcpy(wire + 44, &v, 4);
+	v = htonl(identity->sram_size); memcpy(wire + 48, &v, 4);
+	v = htonl(identity->rtc_size); memcpy(wire + 52, &v, 4);
+	return send_command(CMD_SESSION_IDENTITY, wire, sizeof(wire));
 }
 
 bool NetLink_takeSessionIdentity(NetLinkSessionIdentity* identity) {
@@ -986,10 +1005,7 @@ bool NetLink_takeSessionIdentity(NetLinkSessionIdentity* identity) {
 
 bool NetLink_ackCheckpoint(uint32_t frame, uint32_t hash, bool matched) {
 	uint32_t wire[3] = { htonl(frame), htonl(hash), htonl(matched ? 1u : 0u) };
-	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.connected && send_framed(CMD_CHECKPOINT_ACK, wire, sizeof(wire), NetLink_localClientId());
-	pthread_mutex_unlock(&nl.lock);
-	return ok;
+	return send_command(CMD_CHECKPOINT_ACK, wire, sizeof(wire));
 }
 
 bool NetLink_takeCheckpointAck(uint32_t* frame, uint32_t* hash, bool* matched) {
@@ -1020,29 +1036,20 @@ bool NetLink_takeHash(uint32_t* frame, uint32_t* hash) {
 
 static bool send_u32_control(uint8_t cmd, uint32_t value) {
 	uint32_t wire = htonl(value);
-	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.connected && send_framed(cmd, &wire, sizeof(wire), NetLink_localClientId());
-	pthread_mutex_unlock(&nl.lock);
-	return ok;
+	return send_command(cmd, &wire, sizeof(wire));
 }
 
 bool NetLink_requestResync(uint32_t frame) { return send_u32_control(CMD_RESYNC_REQUEST, frame); }
 bool NetLink_commitResync(uint32_t epoch)  { return send_u32_control(CMD_RESYNC_COMMIT, epoch); }
 
-bool NetLink_beginResync(uint32_t epoch, uint32_t resume_frame) {
-	uint32_t wire[2] = { htonl(epoch), htonl(resume_frame) };
-	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.connected && send_framed(CMD_RESYNC_BEGIN, wire, sizeof(wire), NetLink_localClientId());
-	pthread_mutex_unlock(&nl.lock);
-	return ok;
+bool NetLink_beginResync(uint32_t epoch, uint32_t resume_frame, NetLinkRecoveryKind kind) {
+	uint32_t wire[3] = { htonl(epoch), htonl(resume_frame), htonl((uint32_t)kind) };
+	return send_command(CMD_RESYNC_BEGIN, wire, sizeof(wire));
 }
 
 bool NetLink_ackResync(uint32_t epoch, bool loaded) {
 	uint32_t wire[2] = { htonl(epoch), htonl(loaded ? 1u : 0u) };
-	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.connected && send_framed(CMD_RESYNC_ACK, wire, sizeof(wire), NetLink_localClientId());
-	pthread_mutex_unlock(&nl.lock);
-	return ok;
+	return send_command(CMD_RESYNC_ACK, wire, sizeof(wire));
 }
 
 bool NetLink_takeResyncRequest(uint32_t* frame) {
@@ -1053,12 +1060,13 @@ bool NetLink_takeResyncRequest(uint32_t* frame) {
 	return ok;
 }
 
-bool NetLink_takeResyncBegin(uint32_t* epoch, uint32_t* resume_frame) {
+bool NetLink_takeResyncBegin(uint32_t* epoch, uint32_t* resume_frame, NetLinkRecoveryKind* kind) {
 	pthread_mutex_lock(&nl.lock);
 	bool ok = nl.resync_begin_ready;
 	if (ok) {
 		*epoch = nl.resync_begin_epoch;
 		*resume_frame = nl.resync_begin_frame;
+		*kind = nl.resync_begin_kind;
 		nl.resync_begin_ready = false;
 	}
 	pthread_mutex_unlock(&nl.lock);
@@ -1095,12 +1103,7 @@ bool NetLink_send(int flags, const void* buf, size_t len, uint16_t client_id) {
 		return false;
 	}
 
-	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.connected && send_framed(CMD_DATA, buf, len, NetLink_localClientId());
-	pthread_mutex_unlock(&nl.lock);
-
-	if (!ok && nl.connected) drop_connection("data send failed");
-	return ok;
+	return send_command(CMD_DATA, buf, len);
 }
 
 bool NetLink_popPacket(void* out, size_t out_cap, size_t* out_len) {

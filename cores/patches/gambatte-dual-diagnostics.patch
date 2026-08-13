@@ -1,0 +1,288 @@
+Add low-overhead frame and in-memory serial diagnostics to the dual prototype.
+
+The standalone GBLC test pak mirrors port-zero input when requested so one
+handheld can drive both local consoles far enough to exercise Game Link.
+
+--- a/libgambatte/libretro/libretro.cpp
++++ b/libgambatte/libretro/libretro.cpp
+@@ -14,6 +14,7 @@
+ #ifdef NETPLAY_DUAL_INSTANCE
+ #include "local_serial.h"
+ #include <pthread.h>
++#include <sys/time.h>
+ #endif
+ 
+ #if defined(__DJGPP__) && defined(__STRICT_ANSI__)
+@@ -118,6 +119,73 @@
+ static NetplayLocalSerialBus local_serial_bus;
+ static NetplayLocalSerialEndpoint local_serial_a(local_serial_bus, 0);
+ static NetplayLocalSerialEndpoint local_serial_b(local_serial_bus, 1);
++static int dual_mirror_input = 0;
++
++struct DualDiagnostics {
++   uint64_t frames;
++   uint64_t primary_us;
++   uint64_t secondary_us;
++   uint64_t pair_us;
++   uint32_t primary_max_us;
++   uint32_t secondary_max_us;
++   uint32_t pair_max_us;
++   uint32_t thread_failures;
++};
++static DualDiagnostics dual_diag;
++
++static uint64_t dual_now_us(void)
++{
++   struct timeval tv;
++   gettimeofday(&tv, NULL);
++   return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
++}
++
++static uint32_t dual_u32_us(uint64_t value)
++{
++   return value > UINT32_MAX ? UINT32_MAX : (uint32_t)value;
++}
++
++static void dual_record_frame(uint64_t primary_us, uint64_t secondary_us,
++      uint64_t pair_us)
++{
++   dual_diag.frames++;
++   dual_diag.primary_us += primary_us;
++   dual_diag.secondary_us += secondary_us;
++   dual_diag.pair_us += pair_us;
++   if (primary_us > dual_diag.primary_max_us)
++      dual_diag.primary_max_us = dual_u32_us(primary_us);
++   if (secondary_us > dual_diag.secondary_max_us)
++      dual_diag.secondary_max_us = dual_u32_us(secondary_us);
++   if (pair_us > dual_diag.pair_max_us)
++      dual_diag.pair_max_us = dual_u32_us(pair_us);
++
++   if (dual_diag.frames != 60 && dual_diag.frames % 300 != 0)
++      return;
++
++   NetplayLocalSerialStats serial;
++   local_serial_bus.snapshot(serial);
++   const uint64_t n = dual_diag.frames;
++   const uint64_t serial_avg = serial.exchanges
++      ? serial.total_wait_us / serial.exchanges : 0;
++   const uint64_t pair_avg = dual_diag.pair_us / n;
++   const double capacity = pair_avg ? 1000000.0 / pair_avg : 0.0;
++   gambatte_log(RETRO_LOG_INFO,
++      "GBLC perf frames=%llu primary=%lluus/%uus secondary=%lluus/%uus "
++      "pair=%lluus/%uus capacity=%.1ffps threads_failed=%u\n",
++      (unsigned long long)n,
++      (unsigned long long)(dual_diag.primary_us / n), dual_diag.primary_max_us,
++      (unsigned long long)(dual_diag.secondary_us / n), dual_diag.secondary_max_us,
++      (unsigned long long)pair_avg, dual_diag.pair_max_us, capacity,
++      dual_diag.thread_failures);
++   gambatte_log(RETRO_LOG_INFO,
++      "GBLC serial exchanges=%llu wait_avg=%lluus wait_max=%uus "
++      "send_timeouts=%llu simultaneous_clocks=%llu idle_polls=%llu\n",
++      (unsigned long long)serial.exchanges,
++      (unsigned long long)serial_avg, serial.longest_wait_us,
++      (unsigned long long)serial.send_timeouts,
++      (unsigned long long)serial.simultaneous_sends,
++      (unsigned long long)serial.poll_timeouts);
++}
+ #endif
+ #define NUM_GAMEBOYS 2
+ #else
+@@ -1963,22 +2030,34 @@
+ 
+ size_t retro_serialize_size(void)
+ {
++#ifdef NETPLAY_DUAL_INSTANCE
++   /* A one-console state cannot safely restore a linked pair. */
++   return 0;
++#else
+    if (serialize_size == 0)
+       serialize_size = gb.stateSize();
+    return serialize_size;
++#endif
+ }
+ 
+ bool retro_serialize(void *data, size_t size)
+ {
++#ifdef NETPLAY_DUAL_INSTANCE
++   return false;
++#else
+    if (size != retro_serialize_size())
+       return false;
+ 
+    gb.saveState(data);
+    return true;
++#endif
+ }
+ 
+ bool retro_unserialize(const void *data, size_t size)
+ {
++#ifdef NETPLAY_DUAL_INSTANCE
++   return false;
++#else
+    if (size != retro_serialize_size())
+       return false;
+ 
+@@ -2015,6 +2094,7 @@
+    reset_frame_blending_buffers();
+ 
+    return true;
++#endif
+ }
+ 
+ /* Cheats are tracked per-index so we can honor the `enabled` flag
+@@ -2747,6 +2839,24 @@
+       { 0 },
+    };
+ 
++#ifdef NETPLAY_DUAL_INSTANCE
++   struct retro_input_descriptor dual_desc[] = {
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,   "D-Pad Left" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,     "D-Pad Up" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,   "D-Pad Down" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT,  "D-Pad Right" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,      "B" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,      "A" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,      "Turbo B" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,      "Turbo A" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT, "Select" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START,  "Start" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2,     "Console A Only" },
++      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2,     "Console B Only" },
++      { 0 },
++   };
++   environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, dual_desc);
++#else
+    if (libretro_supports_ff_override)
+    {
+       if (libretro_supports_set_variable)
+@@ -2760,6 +2872,7 @@
+       else
+          environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
+    }
++#endif
+ 
+ #if defined(VIDEO_RGB565) || defined(VIDEO_ABGR1555)
+    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
+@@ -2892,6 +2972,11 @@
+    local_serial_bus.reset();
+    gb.setSerialIO(&local_serial_a);
+    gb2.setSerialIO(&local_serial_b);
++   memset(&dual_diag, 0, sizeof(dual_diag));
++   const char* mirror = getenv("GBLC_MIRROR_INPUT");
++   dual_mirror_input = mirror && mirror[0] && strcmp(mirror, "0") != 0;
++   gambatte_log(RETRO_LOG_INFO, "GBLC dual-instance diagnostics enabled; input=%s\n",
++      dual_mirror_input ? "mirrored (hold L2=A only, R2=B only)" : "ports 0/1");
+ #endif
+    audio_resampler_init(true);
+ 
+@@ -3016,15 +3101,29 @@
+       int16_t i16[2 * SOUND_BUFF_SIZE];
+    } sound;
+    unsigned samples;
++   uint64_t elapsed_us;
+ };
+ 
+ static void* run_secondary_frame(void* opaque)
+ {
+    DualRunContext* context = static_cast<DualRunContext*>(opaque);
++   const uint64_t started = dual_now_us();
++   local_serial_bus.setActive(1, true);
+    context->samples = SOUND_SAMPLES_PER_RUN;
+    while (gb2.runFor(video_buf + GB_SCREEN_WIDTH, VIDEO_PITCH,
+           context->sound.u32, SOUND_BUFF_SIZE, context->samples) == -1)
+       context->samples = SOUND_SAMPLES_PER_RUN;
++   local_serial_bus.setActive(1, false);
++   while (local_serial_bus.peerActive(1)) {
++      if (local_serial_bus.waitForService(1, 250)) {
++         local_serial_bus.setActive(1, true);
++         unsigned service_samples = 32;
++         gb2.runFor(video_buf + GB_SCREEN_WIDTH, VIDEO_PITCH,
++               context->sound.u32, SOUND_BUFF_SIZE, service_samples);
++         local_serial_bus.setActive(1, false);
++      }
++   }
++   context->elapsed_us = dual_now_us() - started;
+    return NULL;
+ }
+ #endif
+@@ -3052,14 +3140,32 @@
+       int16_t i16[2 * SOUND_BUFF_SIZE];
+    } static sound_buf;
+ #ifdef NETPLAY_DUAL_INSTANCE
+-   libretro_input_state2 = read_basic_input(1);
++   if (dual_mirror_input)
++   {
++      const unsigned mirrored = libretro_input_state;
++      const bool primary_only = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0,
++            RETRO_DEVICE_ID_JOYPAD_L2) != 0;
++      const bool secondary_only = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0,
++            RETRO_DEVICE_ID_JOYPAD_R2) != 0;
++      libretro_input_state = secondary_only && !primary_only ? 0 : mirrored;
++      libretro_input_state2 = primary_only && !secondary_only ? 0 : mirrored;
++   }
++   else
++      libretro_input_state2 = read_basic_input(1);
+    static DualRunContext secondary;
+    pthread_t secondary_thread;
++   const uint64_t pair_started = dual_now_us();
+    bool secondary_started = pthread_create(&secondary_thread, NULL,
+          run_secondary_frame, &secondary) == 0;
++   if (!secondary_started)
++      dual_diag.thread_failures++;
+ #endif
+    unsigned samples = SOUND_SAMPLES_PER_RUN;
+ 
++#ifdef NETPLAY_DUAL_INSTANCE
++   const uint64_t primary_started = dual_now_us();
++   local_serial_bus.setActive(0, true);
++#endif
+    while (gb.runFor(video_buf, VIDEO_PITCH, sound_buf.u32, SOUND_BUFF_SIZE, samples) == -1)
+    {
+       if (use_cc_resampler)
+@@ -3076,12 +3171,28 @@
+       libretro_samples_count += samples;
+       samples = SOUND_SAMPLES_PER_RUN;
+    }
++#ifdef NETPLAY_DUAL_INSTANCE
++   local_serial_bus.setActive(0, false);
++   while (local_serial_bus.peerActive(0)) {
++      if (local_serial_bus.waitForService(0, 250)) {
++         local_serial_bus.setActive(0, true);
++         static gambatte::uint_least32_t service_sound[SOUND_BUFF_SIZE];
++         unsigned service_samples = 32;
++         gb.runFor(video_buf, VIDEO_PITCH, service_sound,
++               SOUND_BUFF_SIZE, service_samples);
++         local_serial_bus.setActive(0, false);
++      }
++   }
++   const uint64_t primary_elapsed = dual_now_us() - primary_started;
++#endif
+ #ifdef DUAL_MODE
+ #ifdef NETPLAY_DUAL_INSTANCE
+    if (secondary_started)
+       pthread_join(secondary_thread, NULL);
+    else
+       run_secondary_frame(&secondary);
++   dual_record_frame(primary_elapsed, secondary.elapsed_us,
++      dual_now_us() - pair_started);
+ #else
+    while (gb2.runFor(video_buf + GB_SCREEN_WIDTH, VIDEO_PITCH, sound_buf.u32, samples) == -1) {}
+ #endif
+@@ -3112,8 +3228,16 @@
+    libretro_frames_count++;
+ 
+    bool updated = false;
+-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
++   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
++   {
+       check_variables(false);
++#ifdef NETPLAY_DUAL_INSTANCE
++      /* The ordinary link-mode option handler installs NetSerial or NULL.
++       * Runtime option refreshes must not detach the wrapper's private bus. */
++      gb.setSerialIO(&local_serial_a);
++      gb2.setSerialIO(&local_serial_b);
++#endif
++   }
+ }
+ 
+ unsigned retro_api_version() { return RETRO_API_VERSION; }

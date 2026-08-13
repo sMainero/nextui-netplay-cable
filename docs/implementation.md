@@ -47,6 +47,24 @@ regression confirmed to fail against the bug it covers. The loopback suite also
 forces a desync, restarts each role independently, verifies host checkpoint
 restore, and rejects different ROM content before state loading.
 
+### Diagnostic game logs
+
+`Verbose debugging logs` is enabled by default. While a session is armed, each
+emulator process mirrors its complete stdout/stderr to:
+
+```
+$USERDATA_PATH/logs/netplay-games/<game>/<session-id>/<timestamp>-<role>-<pid>.log
+```
+
+The usual NextUI per-system log is still written normally. The archive is
+separate because NextUI truncates that log on the next launch, which otherwise
+erases a crash when the player attempts to rejoin. Rejoins in the same session
+share the game/session directory but receive a new file; output from different
+processes is never appended into one ambiguous stream. Each file records the
+ROM, requested and selected core paths, role, process id, and normal exit
+status. A missing exit trailer indicates that the process or its wrapper was
+terminated without completing its normal shutdown path.
+
 ### Also working on hardware
 
 - **Ad hoc networking**, end to end and in play. The Brick hosts on `wlan1`
@@ -62,8 +80,9 @@ restore, and rejects different ROM content before state loading.
   stack and clears the dead session pointer.
 - **Wi-Fi power save** is disabled while a session is armed and restored on
   disarm.
-- **SFC across all five platforms.** my282 now builds the same Snes9x 1.63 the
-  arm64 platforms ship, and the two produce bit-identical state.
+- **SFC across all five platforms.** Compatibility fallback now loads pinned
+  Supafaust on both architecture families. Its encoded state, round trip, and
+  frame hashes matched between A30 and Brick in a Kirby Super Star probe.
 - **Bind mounts instead of writing into `Emus/`.** Covered systems are wrapped
   by mounting a staged copy over the pak in place, so the user's `Emus` tree
   gains nothing. Verified on both devices: 7 paks mounted, the tree left empty,
@@ -101,6 +120,14 @@ Because mounts do not survive a reboot, this registers a hook in
 `$USERDATA_PATH/auto.sh` - present on both measured devices and already the
 convention other paks use. The `boot.d` directory that `run_hooks.sh` reads
 would be tidier, but it exists on tg5040 and not on my282.
+
+Mount ownership is resolved from `/proc/self/mountinfo`, not `/proc/mounts`.
+On the Brick's exFAT SD card, `/proc/mounts` reports every bind source as the
+backing block device (`/dev/mmcblk1p1`) and discards the staged source path.
+`mountinfo` retains that path as the mount root, allowing `down` to unmount
+only an exact Netplay stage/target pairing. Preflight likewise detects a
+mounted Netplay wrapper and validates its preserved `launch.sh.old`; otherwise
+an already-active wrapper would make the app report that no emulator paks exist.
 
 `install-stubs.sh` remains for devices where mounting is unavailable, and so an
 install predating the mounts can still be uninstalled. `bind-mount.sh up`
@@ -193,7 +220,7 @@ patches are context-sensitive.
 | **picodrive** | Solved, and now confirmed across architectures: `2.01-strict-portable` (armhf) and `2.01-b0be121` (arm64) both produce `59f99520`. `NO_ARM_ASM=1` alone is necessary and sufficient. The only core pinned identically on all five platforms. |
 | **gambatte** | Same commit both sides (`9b3b5e3`, both ours). No asm cores. Untested. |
 | **pcsx_rearmed** | Deterministic **only with `pcsx_rearmed_drc_thread=disabled`** - see below; the shim now forces it. Cross-architecture remains untested, and the arch-specific subsystems are still there: `assem_arm.c` vs `assem_arm64.c` (MIPS recompiler) and 33 NEON files in `gpu_neon`. Same-architecture play is plausible; my282-to-arm64 is not established. |
-| **snes9x** | **Resolved.** my282 now builds Snes9x 1.63 pinned to the same revision as the arm64 platforms, and the result is bit-identical: both report `2fde8454` at 600 frames with a 823407-byte state. Measured at 2.1x realtime on the A30 - viable, with far less headroom than the snes9x2005 it replaces (7.7x). See the build notes in `workspace/my282/cores/makefile`. |
+| **SNES** | **Resolved through compatibility fallback.** Full Snes9x 1.63 remained deterministic but only sustained 46–50 fps in live A30/Brick lockstep. Snes9x 2005 was rejected because it serializes raw native structs, making its state architecture-dependent. Pinned Supafaust uses an encoded 277,033-byte state; A30 and Brick produced identical hashes (`f0e38316` after 120 frames and `bf872104` after a further 30-frame serialize probe), exact round trips, and about 81 headless fps on A30 for Kirby Super Star. |
 
 ### How many builds are actually in the wild
 
@@ -639,9 +666,21 @@ Capacity is not a constraint either:
 | mGBA, A30 | 141 fps (234%) | 142 + 138 fps |
 | gpSP, A30 (reference) | 483 fps (805%) | — |
 
-Remaining unknowns: how the two instances exchange serial data (loopback sockets
-work but cannot be snapshotted; an in-process bridge needs a gambatte patch), and
-determinism, which is the same constraint as everywhere else.
+The first Gambatte implementation uses two physical `.so` copies and runs their
+`retro_run` calls concurrently. The core patch adds internal `Local Server` and
+`Local Client` modes: serial stays on a loopback TCP connection, with a brief
+slave rendezvous to keep both cores on the same emulated transfer. The network
+transport carries only delayed, frame-indexed inputs.
+
+Startup is symmetric: each device sends the visible core's serialized state
+plus SRAM/RTC, then loads the peer's bundle into its hidden core. A ready barrier
+prevents either input timeline from beginning before both hidden consoles have
+adopted their state. Video/audio from the hidden core is discarded; its save
+directory is process-local and never persists.
+
+Current limits: identical ROM and core identity only; no different-cartridge
+pairing, process rejoin, or dual-instance reset policy yet. Device testing is
+still required to establish the real latency win and local serial reliability.
 
 ## Durability: when does a frozen pak stop working?
 

@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <gnu/libc-version.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -39,12 +40,15 @@
 #include <time.h>
 
 #include "libretro.h"
+#include "gambatte_dual.h"
 #include "netlink.h"
 #include "overlay.h"
 #include "sha256.h"
 
 #define SHIM_ENV_REAL_CORE "NETPLAY_REAL_CORE"
 #define SHIM_ENV_SESSION   "NETPLAY_SESSION"
+#define SHIM_ENV_NOTICE    "NETPLAY_CORE_NOTICE"
+#define STARTUP_NOTICE_MS  2000
 
 /* Bound on packets handed to the core per frame. Without a cap, a peer that
  * has raced ahead can starve the frame. */
@@ -74,6 +78,9 @@
  * packet cannot be mistaken for input on the recovered timeline. */
 #define RECOVERY_TIMEOUT_MS 10000
 #define RECOVERY_FRAME_JUMP 512
+#define PEER_WAIT_TIMEOUT_MS 30000
+#define MAX_DESYNC_RECOVERIES 3
+#define DESYNC_WINDOW_MS 60000
 
 //////////////////////////////////////////////////////////////////////////////
 // logging - minarch redirects the emulator's stderr to $LOGS_PATH/<TAG>.txt
@@ -124,7 +131,7 @@ static void shim_log(const char* fmt, ...) {
 // the wrapped core
 //////////////////////////////////////////////////////////////////////////////
 
-static struct {
+typedef struct {
 	void* handle;
 
 	void     (*init)(void);
@@ -152,7 +159,70 @@ static struct {
 	unsigned (*get_region)(void);
 	void*    (*get_memory_data)(unsigned);
 	size_t   (*get_memory_size)(unsigned);
-} core;
+
+	/* Optional bmpriest/gambatte-libretro dual-instance ABI. */
+	unsigned (*dual_get_abi_version)(void);
+	uint64_t (*dual_get_capabilities)(void);
+	bool     (*dual_set_visible_console)(unsigned);
+	unsigned (*dual_get_visible_console)(void);
+	void*    (*dual_get_memory_data)(unsigned, unsigned);
+	size_t   (*dual_get_memory_size)(unsigned, unsigned);
+	bool     (*dual_reset_console)(unsigned);
+	bool     (*dual_is_checkpoint_safe)(void);
+	size_t   (*dual_serialize_size)(void);
+	bool     (*dual_serialize)(void*, size_t);
+	bool     (*dual_unserialize)(const void*, size_t);
+} Core;
+
+static Core core;
+
+/* Gambatte instanced link: the visible core is paired with a second copy in
+ * this process. They exchange serial bytes over loopback; only delayed,
+ * frame-indexed controller inputs cross Wi-Fi. */
+static Core shadow_core;
+static int dual_link_mode;
+static int dual_core_mode;
+static unsigned dual_local_console;
+static unsigned dual_peer_console;
+static int dual_bootstrapped;
+static int dual_identity_sent;
+static int dual_identity_checked;
+static int dual_state_sent;
+static int dual_state_loaded;
+static int dual_checkpoint_sent;
+static int dual_checkpoint_loaded;
+static int dual_ready_sent;
+static int dual_failed;
+static char dual_error[128];
+static uint32_t dual_frame;
+static uint32_t dual_generation;
+#define DUAL_READY_EPOCH 0x4455414Cu /* DUAL */
+static uint32_t dual_primary_buttons;
+static uint32_t dual_shadow_buttons;
+#define DUAL_INPUT_RESET 0x80000000u
+static int dual_reset_pending;
+static char shadow_core_path[256];
+/* The hidden core has to run concurrently with the visible core because either
+ * side of Gambatte's local serial link may block waiting for the other. Keep
+ * one worker alive for the game: creating and joining a pthread for every
+ * emulated frame was measurable as a larger cost than Gambatte itself on the
+ * A30. */
+static pthread_t shadow_worker_thread;
+static pthread_mutex_t shadow_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t shadow_worker_request = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t shadow_worker_complete = PTHREAD_COND_INITIALIZER;
+static int shadow_worker_started;
+static int shadow_worker_pending;
+static int shadow_worker_done;
+static int shadow_worker_stop;
+static uint32_t shadow_last_run_us;
+static uint64_t dual_visible_run_us;
+static uint64_t dual_shadow_run_us;
+static uint64_t dual_pair_run_us;
+static uint32_t dual_visible_run_max_us;
+static uint32_t dual_shadow_run_max_us;
+static uint32_t dual_pair_run_max_us;
+static void stop_shadow_worker(void);
 
 // Callbacks the frontend handed us. We pass our own wrappers to the real core
 // and forward through these, so we can intercept in either direction.
@@ -188,12 +258,30 @@ static uint32_t recovery_epoch;
 static uint32_t recovery_resume_frame;
 static unsigned recovery_count;
 static int recovery_failed;
+static char recovery_error[96];
 static struct timeval recovery_started;
 static uint32_t connection_generation;
 static int connection_identity_sent;
 static int connection_identity_checked;
 static int connection_sync_pending;
 static int netplay_ever_synced;
+static int solo_mode;
+static struct timeval peer_missing_since;
+static struct timeval input_stall_since;
+static struct timeval desync_window_started;
+static unsigned desync_recoveries;
+static uint32_t failure_buttons_previous;
+typedef enum {
+	FAILURE_WAIT = 0,
+	FAILURE_SOLO,
+	FAILURE_EXIT,
+	FAILURE_CHOICE_COUNT,
+} FailureChoice;
+static FailureChoice failure_choice = FAILURE_SOLO;
+static int exit_requested;
+static int host_reset_pending;
+static int recovery_promote_checkpoint;
+static NetLinkRecoveryKind recovery_kind = NETLINK_RECOVERY_SYNC;
 
 static uint8_t rom_sha256[32];
 static int rom_hash_ready;
@@ -204,6 +292,15 @@ static void* checkpoint_candidate;
 static size_t checkpoint_candidate_len;
 static uint32_t checkpoint_candidate_frame;
 static uint32_t checkpoint_candidate_hash;
+
+#define HASH_HISTORY 8
+typedef struct {
+	uint32_t frame;
+	uint32_t hash;
+	int valid;
+} StateHash;
+static StateHash own_hashes[HASH_HISTORY];
+static StateHash pending_peer_hashes[HASH_HISTORY];
 
 // Pacing stats. Without these a "laggy" session is unattributable: from the
 // outside a core that cannot hit 60fps and a peer whose inputs arrive late look
@@ -223,6 +320,16 @@ static int session_active = 0;
  * directory in /tmp so those files can function during play but never touch
  * the user's persistent save tree. */
 static char guest_save_dir[256];
+static char shadow_save_dir[256];
+static char startup_notice[96];
+static struct timeval startup_notice_started;
+static unsigned startup_notice_frame;
+
+static void show_runtime_notice(const char* message) {
+	snprintf(startup_notice, sizeof(startup_notice), "%s", message ? message : "");
+	startup_notice_started.tv_sec = startup_notice_started.tv_usec = 0;
+	startup_notice_frame = 0;
+}
 
 // Core options forced by the session, as `option.<key>=<value>` lines. gpSP's
 // link emulation is per-game (gpsp_serial: mul_poke, mul_aw1, mul_aw2, rfu) and
@@ -260,6 +367,7 @@ static unsigned av_base_width, av_base_height;
 static struct retro_netpacket_callback core_netpacket;
 static int  have_netpacket = 0;   // core registered an interface
 static int  netpacket_started = 0; // we have called its start()
+static int contains_ci(const char* hay, const char* needle);
 
 // The session file is read twice on purpose: netlink takes the transport keys,
 // this takes the option overrides. Keeping them separate beats threading core
@@ -267,6 +375,10 @@ static int  netpacket_started = 0; // we have called its start()
 static void load_option_overrides(const char* session_path) {
 	FILE* f = fopen(session_path, "r");
 	if (!f) return;
+	struct retro_system_info info;
+	memset(&info, 0, sizeof(info));
+	core.get_system_info(&info);
+	bool gambatte = info.library_name && contains_ci(info.library_name, "gambatte");
 
 	char line[256];
 	while (fgets(line, sizeof(line), f) && option_override_count < MAX_OPTION_OVERRIDES) {
@@ -280,6 +392,10 @@ static void load_option_overrides(const char* session_path) {
 
 		const char* k = line + 7;
 		const char* v = eq + 1;
+		/* The app arms one generic session before a game is selected. Preserve its
+		 * Gambatte fields for GB, but do not apply or log them for every unrelated
+		 * shared-screen core launched under that session. */
+		if (!strncmp(k, "gambatte_", 9) && !gambatte) continue;
 		if (strlen(k) >= sizeof(option_override[0].key) ||
 		    strlen(v) >= sizeof(option_override[0].value)) {
 			shim_log("ignoring over-long option override '%s'\n", k);
@@ -384,6 +500,42 @@ static int core_wants_link(void) {
 	return 0;
 }
 
+static int core_is_gambatte(void) {
+	struct retro_system_info info;
+	memset(&info, 0, sizeof(info));
+	core.get_system_info(&info);
+	return info.library_name && contains_ci(info.library_name, "gambatte");
+}
+
+static int session_instanced_gambatte(const char* path) {
+	FILE* f = fopen(path, "r");
+	if (!f) return 0;
+	char line[256];
+	int enabled = 0;
+	while (fgets(line, sizeof(line), f)) {
+		int value;
+		if (sscanf(line, "instanced_gambatte=%d", &value) == 1)
+			enabled = value != 0;
+	}
+	fclose(f);
+	return enabled;
+}
+
+static bool core_has_dual_contract(void) {
+	const uint64_t required = GAMBATTE_DUAL_CAP_TWO_CONTENTS |
+	                          GAMBATTE_DUAL_CAP_CONSOLE_MEMORY |
+	                          GAMBATTE_DUAL_CAP_VISIBLE_CONSOLE |
+	                          GAMBATTE_DUAL_CAP_PAIRED_CHECKPOINT;
+	if (!core.dual_get_abi_version || !core.dual_get_capabilities ||
+	    !core.dual_set_visible_console || !core.dual_get_memory_data ||
+	    !core.dual_get_memory_size || !core.dual_is_checkpoint_safe ||
+	    !core.dual_serialize_size || !core.dual_serialize ||
+	    !core.dual_unserialize)
+		return false;
+	return core.dual_get_abi_version() == GAMBATTE_DUAL_ABI_VERSION &&
+	       (core.dual_get_capabilities() & required) == required;
+}
+
 // Core options that a session cannot work without, applied unless the session
 // file already sets them.
 //
@@ -482,11 +634,52 @@ static const char* find_option_override(const char* key) {
 // loading
 //////////////////////////////////////////////////////////////////////////////
 
-#define RESOLVE(field, name)                                            \
+static const char* resolve_core(Core* target) {
+	const char* missing = NULL;
+#define RESOLVE_TO(field, name)                                        \
 	do {                                                                \
-		core.field = dlsym(core.handle, name);                          \
-		if (!core.field) missing = missing ? missing : name;            \
+		target->field = dlsym(target->handle, name);                     \
+		if (!target->field) missing = missing ? missing : name;         \
 	} while (0)
+	RESOLVE_TO(init,                       "retro_init");
+	RESOLVE_TO(deinit,                     "retro_deinit");
+	RESOLVE_TO(api_version,                "retro_api_version");
+	RESOLVE_TO(get_system_info,            "retro_get_system_info");
+	RESOLVE_TO(get_system_av_info,         "retro_get_system_av_info");
+	RESOLVE_TO(set_environment,            "retro_set_environment");
+	RESOLVE_TO(set_video_refresh,          "retro_set_video_refresh");
+	RESOLVE_TO(set_audio_sample,           "retro_set_audio_sample");
+	RESOLVE_TO(set_audio_sample_batch,     "retro_set_audio_sample_batch");
+	RESOLVE_TO(set_input_poll,             "retro_set_input_poll");
+	RESOLVE_TO(set_input_state,            "retro_set_input_state");
+	RESOLVE_TO(set_controller_port_device, "retro_set_controller_port_device");
+	RESOLVE_TO(reset,                      "retro_reset");
+	RESOLVE_TO(run,                        "retro_run");
+	RESOLVE_TO(serialize_size,             "retro_serialize_size");
+	RESOLVE_TO(serialize,                  "retro_serialize");
+	RESOLVE_TO(unserialize,                "retro_unserialize");
+	RESOLVE_TO(cheat_reset,                "retro_cheat_reset");
+	RESOLVE_TO(cheat_set,                  "retro_cheat_set");
+	RESOLVE_TO(load_game,                  "retro_load_game");
+	RESOLVE_TO(unload_game,                "retro_unload_game");
+	RESOLVE_TO(get_region,                 "retro_get_region");
+	RESOLVE_TO(get_memory_data,            "retro_get_memory_data");
+	RESOLVE_TO(get_memory_size,            "retro_get_memory_size");
+	target->load_game_special = dlsym(target->handle, "retro_load_game_special");
+	target->dual_get_abi_version = dlsym(target->handle, "retro_dual_get_abi_version");
+	target->dual_get_capabilities = dlsym(target->handle, "retro_dual_get_capabilities");
+	target->dual_set_visible_console = dlsym(target->handle, "retro_dual_set_visible_console");
+	target->dual_get_visible_console = dlsym(target->handle, "retro_dual_get_visible_console");
+	target->dual_get_memory_data = dlsym(target->handle, "retro_dual_get_memory_data");
+	target->dual_get_memory_size = dlsym(target->handle, "retro_dual_get_memory_size");
+	target->dual_reset_console = dlsym(target->handle, "retro_dual_reset_console");
+	target->dual_is_checkpoint_safe = dlsym(target->handle, "retro_dual_is_checkpoint_safe");
+	target->dual_serialize_size = dlsym(target->handle, "retro_dual_serialize_size");
+	target->dual_serialize = dlsym(target->handle, "retro_dual_serialize");
+	target->dual_unserialize = dlsym(target->handle, "retro_dual_unserialize");
+#undef RESOLVE_TO
+	return missing;
+}
 
 // Resolved lazily: minarch calls retro_get_system_info before it calls any of
 // the retro_set_* registration functions, so there is no single safe place to
@@ -825,6 +1018,16 @@ static void ensure_loaded(void) {
 	const char* session = getenv(SHIM_ENV_SESSION);
 	session_active = (session && session[0] && NetLink_configure(session));
 	if (session_active) NetLink_start();
+	const char* notice = getenv(SHIM_ENV_NOTICE);
+	if (session_active && notice) {
+		if (!strcmp(notice, "compatibility"))
+			snprintf(startup_notice, sizeof(startup_notice),
+			         "Starting with compatibility core...");
+		else if (!strcmp(notice, "mismatch"))
+			snprintf(startup_notice, sizeof(startup_notice),
+			         "Core builds differ. Desyncs may occur...");
+		if (startup_notice[0]) shim_log("startup notice: %s\n", startup_notice);
+	}
 
 	// RTLD_LOCAL keeps the real core's retro_* symbols out of the global
 	// namespace, where they would collide with the ones we export.
@@ -834,34 +1037,7 @@ static void ensure_loaded(void) {
 		exit(EXIT_FAILURE);
 	}
 
-	const char* missing = NULL;
-	RESOLVE(init,                       "retro_init");
-	RESOLVE(deinit,                     "retro_deinit");
-	RESOLVE(api_version,                "retro_api_version");
-	RESOLVE(get_system_info,            "retro_get_system_info");
-	RESOLVE(get_system_av_info,         "retro_get_system_av_info");
-	RESOLVE(set_environment,            "retro_set_environment");
-	RESOLVE(set_video_refresh,          "retro_set_video_refresh");
-	RESOLVE(set_audio_sample,           "retro_set_audio_sample");
-	RESOLVE(set_audio_sample_batch,     "retro_set_audio_sample_batch");
-	RESOLVE(set_input_poll,             "retro_set_input_poll");
-	RESOLVE(set_input_state,            "retro_set_input_state");
-	RESOLVE(set_controller_port_device, "retro_set_controller_port_device");
-	RESOLVE(reset,                      "retro_reset");
-	RESOLVE(run,                        "retro_run");
-	RESOLVE(serialize_size,             "retro_serialize_size");
-	RESOLVE(serialize,                  "retro_serialize");
-	RESOLVE(unserialize,                "retro_unserialize");
-	RESOLVE(cheat_reset,                "retro_cheat_reset");
-	RESOLVE(cheat_set,                  "retro_cheat_set");
-	RESOLVE(load_game,                  "retro_load_game");
-	RESOLVE(unload_game,                "retro_unload_game");
-	RESOLVE(get_region,                 "retro_get_region");
-	RESOLVE(get_memory_data,            "retro_get_memory_data");
-	RESOLVE(get_memory_size,            "retro_get_memory_size");
-
-	// Optional - not every core implements it, and minarch tolerates its absence.
-	core.load_game_special = dlsym(core.handle, "retro_load_game_special");
+	const char* missing = resolve_core(&core);
 
 	if (missing) {
 		shim_log("FATAL: %s is missing %s\n", path, missing);
@@ -887,6 +1063,25 @@ static void ensure_loaded(void) {
 		         override >= 0 ? "from session" : "from core");
 
 		input_delay = session_input_delay(session);
+		bool dual_requested = !netplay_mode && core_is_gambatte() &&
+		                      session_instanced_gambatte(session);
+		dual_core_mode = dual_requested && core_has_dual_contract();
+		dual_link_mode = dual_core_mode;
+		if (dual_core_mode) {
+			dual_local_console = NetLink_getRole() == NETLINK_ROLE_HOST
+			                   ? GAMBATTE_DUAL_CONSOLE_A : GAMBATTE_DUAL_CONSOLE_B;
+			dual_peer_console = dual_local_console == GAMBATTE_DUAL_CONSOLE_A
+			                  ? GAMBATTE_DUAL_CONSOLE_B : GAMBATTE_DUAL_CONSOLE_A;
+			if (!core.dual_set_visible_console(dual_local_console)) {
+				dual_core_mode = dual_link_mode = 0;
+				shim_log("dual contract rejected visible-console selection; using network serial\n");
+			} else {
+				shim_log("Gambatte dual ABI v%u enabled (console %c visible); Wi-Fi carries inputs only\n",
+				         core.dual_get_abi_version(), dual_local_console ? 'B' : 'A');
+			}
+		} else if (dual_requested) {
+			shim_log("paired Gambatte core/ABI unavailable; using network serial fallback\n");
+		}
 
 		// After the mode is known: only shared screen compares state, and only
 		// then does a nondeterministic core matter.
@@ -903,6 +1098,16 @@ static void ensure_loaded(void) {
 				shim_log("guest core-managed saves redirected to %s\n", guest_save_dir);
 			}
 		}
+		if (dual_link_mode && !dual_core_mode) {
+			snprintf(shadow_save_dir, sizeof(shadow_save_dir),
+			         "/tmp/netplay-shadow-%s%ld",
+			         session_id[0] ? session_id : "process-", (long)getpid());
+			if (mkdir(shadow_save_dir, 0700) != 0 && errno != EEXIST) {
+				shim_log("WARNING: cannot create hidden-core save directory %s: %s\n",
+				         shadow_save_dir, strerror(errno));
+				shadow_save_dir[0] = '\0';
+			}
+		}
 	}
 
 	shim_log("wrapping %s (session=%s)\n", path, session_active ? "armed" : "none");
@@ -910,8 +1115,6 @@ static void ensure_loaded(void) {
 	// The transport starts before the core is opened so link-capable cores see a
 	// ready netpacket interface during their own initialization.
 }
-
-#undef RESOLVE
 
 //////////////////////////////////////////////////////////////////////////////
 // callback wrappers
@@ -931,6 +1134,8 @@ static void shim_netpacket_send(int flags, const void* buf, size_t len, uint16_t
 // here - packets are already queued and will be delivered by deliver_packets().
 static void shim_netpacket_poll_receive(void) {
 }
+
+static const char* dual_link_option(const char* key, bool shadow);
 
 static bool shim_environment(unsigned cmd, void* data) {
 	if (cmd == RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE) {
@@ -974,6 +1179,10 @@ static bool shim_environment(unsigned cmd, void* data) {
 
 	if (cmd == RETRO_ENVIRONMENT_GET_VARIABLE && session_active && data) {
 		struct retro_variable* var = data;
+		if (dual_link_mode && var->key) {
+			const char* local = dual_link_option(var->key, false);
+			if (local) { var->value = local; return true; }
+		}
 		const char* forced = var->key ? find_option_override(var->key) : NULL;
 		if (forced) {
 			var->value = forced;
@@ -999,6 +1208,117 @@ static bool shim_environment(unsigned cmd, void* data) {
 	return fe_environment ? fe_environment(cmd, data) : false;
 }
 
+static const char* dual_link_option(const char* key, bool shadow) {
+	static const char* digits = "127000000001";
+	static const char digit_values[10][2] = {
+		"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
+	};
+	bool primary_server = NetLink_getRole() == NETLINK_ROLE_HOST;
+	bool server = shadow ? !primary_server : primary_server;
+	if (!strcmp(key, "gambatte_gb_link_mode"))
+		return server ? "Local Server" : "Local Client";
+	if (!strcmp(key, "gambatte_gb_link_network_port")) return "56401";
+	const char* prefix = "gambatte_gb_link_network_server_ip_";
+	if (!strncmp(key, prefix, strlen(prefix))) {
+		int n = atoi(key + strlen(prefix));
+		if (n >= 1 && n <= 12) return digit_values[digits[n - 1] - '0'];
+	}
+	return NULL;
+}
+
+static bool shadow_environment(unsigned cmd, void* data) {
+	/* MinArch's environment callback is not documented as thread-safe. The
+	 * hidden core runs concurrently only after startup, so do not let its
+	 * per-frame option poll enter the frontend beside the visible core. Session
+	 * options are immutable for this process. */
+	if (cmd == RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE && data) {
+		*(bool*)data = false;
+		return true;
+	}
+	if (cmd == RETRO_ENVIRONMENT_GET_VARIABLE && data) {
+		struct retro_variable* var = data;
+		const char* local = var->key ? dual_link_option(var->key, true) : NULL;
+		if (local) { var->value = local; return true; }
+		const char* forced = var->key ? find_option_override(var->key) : NULL;
+		if (forced) { var->value = forced; return true; }
+	}
+	/* The hidden console must never open core-managed files in the visible
+	 * console's save directory. Its serialized state is supplied by the peer. */
+	if ((cmd == RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY ||
+	     cmd == RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY) && data && shadow_save_dir[0]) {
+		*(const char**)data = shadow_save_dir;
+		return true;
+	}
+	if (cmd == RETRO_ENVIRONMENT_SET_PIXEL_FORMAT) return true;
+	return fe_environment ? fe_environment(cmd, data) : false;
+}
+
+static void shadow_video_refresh(const void* data, unsigned w, unsigned h, size_t pitch) {
+	(void)data; (void)w; (void)h; (void)pitch;
+}
+static void shadow_audio_sample(int16_t left, int16_t right) { (void)left; (void)right; }
+static size_t shadow_audio_batch(const int16_t* data, size_t frames) { (void)data; return frames; }
+static void shadow_input_poll(void) {}
+static int16_t shadow_input_state(unsigned port, unsigned device, unsigned index, unsigned id) {
+	if (port || device != RETRO_DEVICE_JOYPAD || index) return 0;
+	if (id == RETRO_DEVICE_ID_JOYPAD_MASK) return (int16_t)dual_shadow_buttons;
+	return (dual_shadow_buttons >> id) & 1;
+}
+
+static bool copy_core_file(const char* from, const char* to) {
+	FILE* in = fopen(from, "rb");
+	if (!in) return false;
+	FILE* out = fopen(to, "wb");
+	if (!out) { fclose(in); return false; }
+	char buf[32768];
+	size_t n;
+	bool ok = true;
+	while ((n = fread(buf, 1, sizeof(buf), in)) != 0)
+		if (fwrite(buf, 1, n, out) != n) { ok = false; break; }
+	if (ferror(in)) ok = false;
+	if (fclose(out) != 0) ok = false;
+	fclose(in);
+	if (!ok) remove(to);
+	return ok;
+}
+
+static bool prepare_shadow_core(void) {
+	if (!dual_link_mode || shadow_core.handle) return shadow_core.handle != NULL;
+	const char* source = getenv(SHIM_ENV_REAL_CORE);
+	if (!source || !source[0]) return false;
+	snprintf(shadow_core_path, sizeof(shadow_core_path),
+	         "/tmp/netplay-gambatte-shadow-%ld.so", (long)getpid());
+	if (!copy_core_file(source, shadow_core_path)) {
+		snprintf(dual_error, sizeof(dual_error), "Could not stage second Gambatte instance.");
+		return false;
+	}
+	shadow_core.handle = dlopen(shadow_core_path, RTLD_NOW | RTLD_LOCAL);
+	if (!shadow_core.handle) {
+		shim_log("second Gambatte dlopen failed: %s\n", dlerror());
+		snprintf(dual_error, sizeof(dual_error), "Could not load second Gambatte instance.");
+		remove(shadow_core_path);
+		return false;
+	}
+	const char* missing = resolve_core(&shadow_core);
+	if (missing) {
+		shim_log("second Gambatte is missing %s\n", missing);
+		snprintf(dual_error, sizeof(dual_error), "Second Gambatte build is incomplete.");
+		dlclose(shadow_core.handle);
+		memset(&shadow_core, 0, sizeof(shadow_core));
+		remove(shadow_core_path);
+		return false;
+	}
+	shadow_core.set_environment(shadow_environment);
+	shadow_core.set_video_refresh(shadow_video_refresh);
+	shadow_core.set_audio_sample(shadow_audio_sample);
+	shadow_core.set_audio_sample_batch(shadow_audio_batch);
+	shadow_core.set_input_poll(shadow_input_poll);
+	shadow_core.set_input_state(shadow_input_state);
+	shadow_core.init();
+	shim_log("second Gambatte instance loaded from %s\n", shadow_core_path);
+	return true;
+}
+
 // Bring both sides to a bit-identical starting point. The host ships its state;
 // the client adopts it. Without this the two simulations differ from frame one
 // and every synced input afterwards is meaningless.
@@ -1016,7 +1336,7 @@ static uint32_t core_identity(void) {
 
 	/* Serialize size differs between builds far more often than the version
 	 * string does, so fold it in. */
-	size_t sz = core.serialize_size();
+	size_t sz = dual_core_mode ? core.dual_serialize_size() : core.serialize_size();
 	h ^= (uint32_t)sz;
 	h *= 16777619u;
 
@@ -1045,12 +1365,73 @@ typedef struct __attribute__((packed)) {
 
 static uint32_t hash_bytes(const void* data, size_t len);
 
-static bool persistent_memory_sizes(uint32_t* sram_size, uint32_t* rtc_size) {
-	size_t sram = core.get_memory_size(RETRO_MEMORY_SAVE_RAM);
-	size_t rtc = core.get_memory_size(RETRO_MEMORY_RTC);
+static bool core_memory_sizes(Core* target, uint32_t* sram_size, uint32_t* rtc_size) {
+	size_t sram = target->get_memory_size(RETRO_MEMORY_SAVE_RAM);
+	size_t rtc = target->get_memory_size(RETRO_MEMORY_RTC);
 	if (sram > UINT32_MAX || rtc > UINT32_MAX) return false;
 	*sram_size = (uint32_t)sram;
 	*rtc_size = (uint32_t)rtc;
+	return true;
+}
+
+static bool persistent_memory_sizes(uint32_t* sram_size, uint32_t* rtc_size) {
+	return core_memory_sizes(&core, sram_size, rtc_size);
+}
+
+#define DUAL_MEMORY_MAGIC 0x47424d45u /* GBME */
+typedef struct __attribute__((packed)) {
+	uint32_t magic;
+	uint32_t sram_size;
+	uint32_t rtc_size;
+} DualMemoryHeader;
+
+static bool dual_memory_sizes(unsigned console, uint32_t* sram_size, uint32_t* rtc_size) {
+	size_t sram = core.dual_get_memory_size(console, RETRO_MEMORY_SAVE_RAM);
+	size_t rtc = core.dual_get_memory_size(console, RETRO_MEMORY_RTC);
+	if (sram > UINT32_MAX || rtc > UINT32_MAX) return false;
+	*sram_size = (uint32_t)sram;
+	*rtc_size = (uint32_t)rtc;
+	return true;
+}
+
+static bool capture_dual_memory(unsigned console, void** out, size_t* out_len) {
+	uint32_t sram_size = 0, rtc_size = 0;
+	if (!dual_memory_sizes(console, &sram_size, &rtc_size)) return false;
+	size_t total = sizeof(DualMemoryHeader) + (size_t)sram_size + rtc_size;
+	if (total > NETLINK_MAX_STATE) return false;
+	void* sram = sram_size ? core.dual_get_memory_data(console, RETRO_MEMORY_SAVE_RAM) : NULL;
+	void* rtc = rtc_size ? core.dual_get_memory_data(console, RETRO_MEMORY_RTC) : NULL;
+	if ((sram_size && !sram) || (rtc_size && !rtc)) return false;
+	uint8_t* data = malloc(total);
+	if (!data) return false;
+	DualMemoryHeader h = { htonl(DUAL_MEMORY_MAGIC), htonl(sram_size), htonl(rtc_size) };
+	memcpy(data, &h, sizeof(h));
+	if (sram_size) memcpy(data + sizeof(h), sram, sram_size);
+	if (rtc_size) memcpy(data + sizeof(h) + sram_size, rtc, rtc_size);
+	*out = data;
+	*out_len = total;
+	return true;
+}
+
+static bool apply_dual_memory(unsigned console, const void* input, size_t len) {
+	if (!input || len < sizeof(DualMemoryHeader)) return false;
+	DualMemoryHeader wire;
+	memcpy(&wire, input, sizeof(wire));
+	uint32_t magic = ntohl(wire.magic);
+	uint32_t sram_size = ntohl(wire.sram_size);
+	uint32_t rtc_size = ntohl(wire.rtc_size);
+	uint32_t local_sram = 0, local_rtc = 0;
+	if (magic != DUAL_MEMORY_MAGIC ||
+	    len != sizeof(wire) + (size_t)sram_size + rtc_size ||
+	    !dual_memory_sizes(console, &local_sram, &local_rtc) ||
+	    sram_size != local_sram || rtc_size != local_rtc)
+		return false;
+	void* sram = sram_size ? core.dual_get_memory_data(console, RETRO_MEMORY_SAVE_RAM) : NULL;
+	void* rtc = rtc_size ? core.dual_get_memory_data(console, RETRO_MEMORY_RTC) : NULL;
+	if ((sram_size && !sram) || (rtc_size && !rtc)) return false;
+	const uint8_t* data = input;
+	if (sram_size) memcpy(sram, data + sizeof(wire), sram_size);
+	if (rtc_size) memcpy(rtc, data + sizeof(wire) + sram_size, rtc_size);
 	return true;
 }
 
@@ -1078,17 +1459,17 @@ static bool parse_authoritative_state(const void* data, size_t len,
 /* Package the core state together with the raw persistent-memory regions. The
  * files that minarch used to populate those regions (.sav, .srm, compressed or
  * otherwise) never enter the protocol. */
-static bool capture_authoritative_state(void** out, size_t* out_len, uint32_t* out_hash) {
-	size_t state_size = core.serialize_size();
+static bool capture_core_state(Core* target, void** out, size_t* out_len, uint32_t* out_hash) {
+	size_t state_size = target->serialize_size();
 	uint32_t sram_size, rtc_size;
 	if (!state_size || state_size > UINT32_MAX ||
-	    !persistent_memory_sizes(&sram_size, &rtc_size)) return false;
+	    !core_memory_sizes(target, &sram_size, &rtc_size)) return false;
 	uint64_t payload64 = (uint64_t)state_size + sram_size + rtc_size;
 	if (payload64 > NETLINK_MAX_STATE - sizeof(AuthoritativeHeader)) return false;
 	size_t payload = (size_t)payload64;
 
-	void* sram = sram_size ? core.get_memory_data(RETRO_MEMORY_SAVE_RAM) : NULL;
-	void* rtc = rtc_size ? core.get_memory_data(RETRO_MEMORY_RTC) : NULL;
+	void* sram = sram_size ? target->get_memory_data(RETRO_MEMORY_SAVE_RAM) : NULL;
+	void* rtc = rtc_size ? target->get_memory_data(RETRO_MEMORY_RTC) : NULL;
 	if ((sram_size && !sram) || (rtc_size && !rtc)) return false;
 
 	size_t total = sizeof(AuthoritativeHeader) + payload;
@@ -1104,7 +1485,7 @@ static bool capture_authoritative_state(void** out, size_t* out_len, uint32_t* o
 	memcpy(buf, &wire, sizeof(wire));
 	uint8_t* state = buf + sizeof(wire);
 	memset(state, 0, state_size);
-	if (!core.serialize(state, state_size)) { free(buf); return false; }
+	if (!target->serialize(state, state_size)) { free(buf); return false; }
 	if (sram_size) memcpy(state + state_size, sram, sram_size);
 	if (rtc_size) memcpy(state + state_size + sram_size, rtc, rtc_size);
 
@@ -1114,23 +1495,31 @@ static bool capture_authoritative_state(void** out, size_t* out_len, uint32_t* o
 	return true;
 }
 
-static bool apply_authoritative_state(const void* data, size_t len) {
+static bool capture_authoritative_state(void** out, size_t* out_len, uint32_t* out_hash) {
+	return capture_core_state(&core, out, out_len, out_hash);
+}
+
+static bool apply_core_state(Core* target, const void* data, size_t len) {
 	AuthoritativeHeader h;
 	uint32_t local_sram, local_rtc;
 	if (!parse_authoritative_state(data, len, &h) ||
-	    h.state_size != core.serialize_size() ||
-	    !persistent_memory_sizes(&local_sram, &local_rtc) ||
+	    h.state_size != target->serialize_size() ||
+	    !core_memory_sizes(target, &local_sram, &local_rtc) ||
 	    h.sram_size != local_sram || h.rtc_size != local_rtc)
 		return false;
 
 	const uint8_t* state = (const uint8_t*)data + sizeof(AuthoritativeHeader);
-	if (!core.unserialize(state, h.state_size)) return false;
-	void* sram = h.sram_size ? core.get_memory_data(RETRO_MEMORY_SAVE_RAM) : NULL;
-	void* rtc = h.rtc_size ? core.get_memory_data(RETRO_MEMORY_RTC) : NULL;
+	if (!target->unserialize(state, h.state_size)) return false;
+	void* sram = h.sram_size ? target->get_memory_data(RETRO_MEMORY_SAVE_RAM) : NULL;
+	void* rtc = h.rtc_size ? target->get_memory_data(RETRO_MEMORY_RTC) : NULL;
 	if ((h.sram_size && !sram) || (h.rtc_size && !rtc)) return false;
 	if (h.sram_size) memcpy(sram, state + h.state_size, h.sram_size);
 	if (h.rtc_size) memcpy(rtc, state + h.state_size + h.sram_size, h.rtc_size);
 	return true;
+}
+
+static bool apply_authoritative_state(const void* data, size_t len) {
+	return apply_core_state(&core, data, len);
 }
 
 #define CHECKPOINT_MAGIC 0x4E50434Bu /* NPCK */
@@ -1229,6 +1618,11 @@ static bool identity_matches(const NetLinkSessionIdentity* peer) {
 		shim_log("refusing peer: ROM content hashes differ\n");
 		return false;
 	}
+	if (peer->mode != 1 || peer->input_delay != (uint32_t)input_delay) {
+		shim_log("refusing peer: mode/input delay differs (peer %u/%u, ours 1/%d)\n",
+		         peer->mode, peer->input_delay, input_delay);
+		return false;
+	}
 	if (peer->core_identity != mine || peer->state_size != state_size ||
 	    peer->sram_size != sram_size || peer->rtc_size != rtc_size) {
 		shim_log("refusing peer: core/state/persistent-memory identity differs "
@@ -1238,6 +1632,14 @@ static bool identity_matches(const NetLinkSessionIdentity* peer) {
 		return false;
 	}
 	return true;
+}
+
+static void recovery_fail(const char* message) {
+	recovery_failed = 1;
+	snprintf(recovery_error, sizeof(recovery_error), "%s", message);
+	failure_choice = FAILURE_SOLO;
+	failure_buttons_previous = 0;
+	shim_log("%s\n", message);
 }
 
 /* Every TCP generation is a new synchronization barrier. This covers both a
@@ -1252,7 +1654,11 @@ static void netplay_handshake(void) {
 		connection_sync_pending = 1;
 		netplay_synced = 0;
 		recovery_failed = 0;
-		recovery_started.tv_sec = recovery_started.tv_usec = 0;
+		recovery_error[0] = '\0';
+		recovery_kind = NETLINK_RECOVERY_SYNC;
+		recovery_promote_checkpoint = 0;
+		host_reset_pending = 0;
+		recovery_clock_start();
 		recovery_phase = NetLink_getRole() == NETLINK_ROLE_CLIENT
 		               ? RECOVERY_CLIENT_WAIT_BEGIN : RECOVERY_IDLE;
 		NetLink_resetSync();
@@ -1263,10 +1669,12 @@ static void netplay_handshake(void) {
 		NetLinkSessionIdentity mine;
 		memset(&mine, 0, sizeof(mine));
 		memcpy(mine.rom_sha256, rom_sha256, 32);
+		mine.mode = 1;
+		mine.input_delay = (uint32_t)input_delay;
 		mine.core_identity = core_identity();
 		mine.state_size = (uint32_t)core.serialize_size();
 		if (!persistent_memory_sizes(&mine.sram_size, &mine.rtc_size)) {
-			recovery_failed = 1;
+			recovery_fail("Could not inspect local save memory. Exit the game.");
 			return;
 		}
 		connection_identity_sent = NetLink_sendSessionIdentity(&mine);
@@ -1276,7 +1684,7 @@ static void netplay_handshake(void) {
 		NetLinkSessionIdentity peer;
 		if (!NetLink_takeSessionIdentity(&peer)) return;
 		if (!identity_matches(&peer)) {
-			recovery_failed = 1;
+			recovery_fail("Peer game or core is incompatible. Exit the game.");
 			return;
 		}
 		connection_identity_checked = 1;
@@ -1293,12 +1701,15 @@ static void netplay_handshake(void) {
 	if (!netplay_ever_synced)
 		restored = load_checkpoint(&buf, &sz, &source_frame);
 	if (!restored) {
-		if (!capture_authoritative_state(&buf, &sz, NULL)) return;
+		if (!capture_authoritative_state(&buf, &sz, NULL)) {
+			recovery_fail("Host could not capture synchronization state.");
+			return;
+		}
 		source_frame = netplay_ever_synced ? netplay_frame : 0;
 	}
 	if (!apply_authoritative_state(buf, sz)) {
-		free(buf); recovery_failed = 1;
-		shim_log("host could not adopt synchronization state\n");
+		free(buf);
+		recovery_fail("Host could not adopt synchronization state.");
 		return;
 	}
 
@@ -1306,7 +1717,8 @@ static void netplay_handshake(void) {
 	if (!recovery_epoch) recovery_epoch++;
 	recovery_resume_frame = (restored || netplay_ever_synced)
 	                      ? source_frame + RECOVERY_FRAME_JUMP : 0;
-	if (!NetLink_beginResync(recovery_epoch, recovery_resume_frame) ||
+	recovery_kind = NETLINK_RECOVERY_SYNC;
+	if (!NetLink_beginResync(recovery_epoch, recovery_resume_frame, recovery_kind) ||
 	    !NetLink_sendState(buf, sz)) {
 		free(buf); return;
 	}
@@ -1327,22 +1739,128 @@ static void reset_netplay_timeline(uint32_t frame) {
 	last_scheduled = 0;
 	input_scheduled = 0;
 	stall_run = 0;
+	input_stall_since.tv_sec = input_stall_since.tv_usec = 0;
 	stat_frames = stat_stalls = stat_stall_max = 0;
 	memset(&stat_since, 0, sizeof(stat_since));
-	NetLink_resetSync();
+	memset(own_hashes, 0, sizeof(own_hashes));
+	memset(pending_peer_hashes, 0, sizeof(pending_peer_hashes));
+	NetLink_resetTimeline();
 }
 
 static void recovery_clock_start(void) {
 	gettimeofday(&recovery_started, NULL);
 }
 
-static bool recovery_timed_out(void) {
-	if (!recovery_started.tv_sec) return false;
+static long elapsed_ms(const struct timeval* since) {
+	if (!since->tv_sec) return 0;
 	struct timeval now;
 	gettimeofday(&now, NULL);
-	long ms = (now.tv_sec - recovery_started.tv_sec) * 1000L
-	        + (now.tv_usec - recovery_started.tv_usec) / 1000L;
-	return ms > RECOVERY_TIMEOUT_MS;
+	return (now.tv_sec - since->tv_sec) * 1000L
+	     + (now.tv_usec - since->tv_usec) / 1000L;
+}
+
+static long peer_wait_timeout_ms(void) {
+	static long timeout = -1;
+	if (timeout >= 0) return timeout;
+	timeout = PEER_WAIT_TIMEOUT_MS;
+	const char* value = getenv("NETPLAY_PEER_TIMEOUT_MS");
+	if (value) {
+		long requested = strtol(value, NULL, 10);
+		if (requested >= 100 && requested <= 300000) timeout = requested;
+	}
+	return timeout;
+}
+
+static bool recovery_timed_out(void) {
+	if (!recovery_started.tv_sec) return false;
+	return elapsed_ms(&recovery_started) > RECOVERY_TIMEOUT_MS;
+}
+
+static bool desync_recovery_allowed(void) {
+	if (!desync_window_started.tv_sec || elapsed_ms(&desync_window_started) > DESYNC_WINDOW_MS) {
+		gettimeofday(&desync_window_started, NULL);
+		desync_recoveries = 0;
+	}
+	if (desync_recoveries >= MAX_DESYNC_RECOVERIES) return false;
+	desync_recoveries++;
+	return true;
+}
+
+/* Failed shared-screen sessions remain interactive through the ordinary
+ * libretro joypad callback. Continuing solo changes only this emulator process:
+ * the durable session and save/persistence restrictions remain in force. */
+static void retry_failed_session(void) {
+	NetLink_stop();
+	NetLink_resetSync();
+	connection_generation = 0;
+	connection_identity_sent = connection_identity_checked = 0;
+	connection_sync_pending = 1;
+	netplay_synced = 0;
+	recovery_phase = NetLink_getRole() == NETLINK_ROLE_CLIENT
+	               ? RECOVERY_CLIENT_WAIT_BEGIN : RECOVERY_IDLE;
+	peer_missing_since.tv_sec = peer_missing_since.tv_usec = 0;
+	input_stall_since.tv_sec = input_stall_since.tv_usec = 0;
+	recovery_failed = 0;
+	recovery_error[0] = '\0';
+	recovery_clock_start();
+	if (!NetLink_start()) recovery_fail("Could not restart the network session.");
+	else shim_log("user chose to wait and retry the peer connection\n");
+}
+
+static bool failure_input_tick(void) {
+	if (exit_requested) return false;
+	uint32_t buttons = fe_input_state
+	                 ? (uint16_t)fe_input_state(0, RETRO_DEVICE_JOYPAD, 0,
+	                                            RETRO_DEVICE_ID_JOYPAD_MASK)
+	                 : 0;
+	uint32_t a = 1u << RETRO_DEVICE_ID_JOYPAD_A;
+	uint32_t b = 1u << RETRO_DEVICE_ID_JOYPAD_B;
+	uint32_t left = 1u << RETRO_DEVICE_ID_JOYPAD_LEFT;
+	uint32_t right = 1u << RETRO_DEVICE_ID_JOYPAD_RIGHT;
+	uint32_t pressed = buttons & ~failure_buttons_previous;
+	failure_buttons_previous = buttons;
+
+	if (pressed & left)
+		failure_choice = (FailureChoice)((failure_choice + FAILURE_CHOICE_COUNT - 1) % FAILURE_CHOICE_COUNT);
+	if (pressed & right)
+		failure_choice = (FailureChoice)((failure_choice + 1) % FAILURE_CHOICE_COUNT);
+	if (!(pressed & (a | b))) return false;
+
+	/* B is the quick, conservative action: keep waiting. A confirms the
+	 * highlighted choice. */
+	FailureChoice choice = (pressed & b) ? FAILURE_WAIT : failure_choice;
+	if (choice == FAILURE_WAIT) {
+		retry_failed_session();
+		return true;
+	}
+	if (choice == FAILURE_EXIT) {
+		NetLink_stop();
+		exit_requested = 1;
+		shim_log("user requested exit from the netplay failure overlay\n");
+		if (fe_environment) fe_environment(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+		return true;
+	}
+
+	NetLink_stop();
+	solo_mode = 1;
+	netplay_synced = 0;
+	recovery_failed = 0;
+	recovery_error[0] = '\0';
+	recovery_phase = RECOVERY_IDLE;
+	shim_log("user continued this game solo; durable session remains armed\n");
+	return true;
+}
+
+static void failure_overlay_message(char* out, size_t len) {
+	if (exit_requested) {
+		snprintf(out, len, "Exiting game...");
+		return;
+	}
+	const char* choice = failure_choice == FAILURE_WAIT ? "Wait and retry"
+	                   : failure_choice == FAILURE_EXIT ? "Exit game"
+	                   : "Continue solo";
+	snprintf(out, len, "%s Choice: %s. Left Right, A select. B waits.",
+	         recovery_error[0] ? recovery_error : "Synchronization failed.", choice);
 }
 
 /* Advance an authoritative-state recovery transaction at a frame boundary.
@@ -1350,21 +1868,63 @@ static bool recovery_timed_out(void) {
 static bool netplay_recovery_tick(void) {
 	if (recovery_failed) return true;
 
+	if (connection_sync_pending && !connection_identity_checked && recovery_timed_out()) {
+		recovery_fail("Peer identity handshake timed out.");
+		return true;
+	}
+
 	if (recovery_phase != RECOVERY_IDLE && recovery_timed_out()) {
-		recovery_failed = 1;
-		shim_log("authoritative resync timed out - session cannot continue safely\n");
+		recovery_fail("Authoritative synchronization timed out.");
 		return true;
 	}
 
 	if (NetLink_getRole() == NETLINK_ROLE_HOST) {
+		if (recovery_phase == RECOVERY_IDLE && host_reset_pending) {
+			host_reset_pending = 0;
+			/* Reset only the authority, then serialize that exact post-reset
+			 * machine state. The guest never calls core.reset(); adopting this
+			 * bundle is the reset, and ACK/COMMIT keeps both timelines paused
+			 * until it has succeeded. */
+			core.reset();
+			size_t sz = 0;
+			void* buf = NULL;
+			if (!capture_authoritative_state(&buf, &sz, NULL)) {
+				recovery_fail("Host could not capture reset state.");
+				return true;
+			}
+
+			recovery_epoch++;
+			if (!recovery_epoch) recovery_epoch++;
+			recovery_resume_frame = netplay_frame + RECOVERY_FRAME_JUMP;
+			recovery_kind = NETLINK_RECOVERY_RESET;
+			recovery_clock_start();
+
+			bool sent = NetLink_beginResync(recovery_epoch, recovery_resume_frame,
+			                                recovery_kind) &&
+			            NetLink_sendState(buf, sz);
+			bool adopted = apply_authoritative_state(buf, sz);
+			if (!sent || !adopted) {
+				free(buf);
+				recovery_fail("Host could not send or adopt reset state.");
+				return true;
+			}
+
+			set_checkpoint_candidate(buf, sz, recovery_resume_frame, hash_bytes(buf, sz));
+			recovery_promote_checkpoint = 1;
+			reset_netplay_timeline(recovery_resume_frame);
+			recovery_phase = RECOVERY_HOST_WAIT_ACK;
+			shim_log("authoritative reset %u sent; resume frame %u\n",
+			         recovery_epoch, recovery_resume_frame);
+			return true;
+		}
+
 		uint32_t mismatch_frame;
 		if (recovery_phase == RECOVERY_IDLE &&
 		    NetLink_takeResyncRequest(&mismatch_frame)) {
 			size_t sz = 0;
 			void* buf = NULL;
 			if (!capture_authoritative_state(&buf, &sz, NULL)) {
-				recovery_failed = 1;
-				shim_log("cannot create authoritative state for resync\n");
+				recovery_fail("Host could not create authoritative recovery state.");
 				return true;
 			}
 
@@ -1373,14 +1933,15 @@ static bool netplay_recovery_tick(void) {
 			recovery_resume_frame = netplay_frame + RECOVERY_FRAME_JUMP;
 			recovery_clock_start();
 
-			bool sent = NetLink_beginResync(recovery_epoch, recovery_resume_frame) &&
+			recovery_kind = NETLINK_RECOVERY_SYNC;
+			bool sent = NetLink_beginResync(recovery_epoch, recovery_resume_frame,
+			                                recovery_kind) &&
 			            NetLink_sendState(buf, sz);
 			bool adopted = apply_authoritative_state(buf, sz);
 			free(buf);
 
 			if (!sent || !adopted) {
-				recovery_failed = 1;
-				shim_log("authoritative resync state could not be sent or adopted\n");
+				recovery_fail("Host could not send or adopt recovery state.");
 				return true;
 			}
 
@@ -1397,8 +1958,7 @@ static bool netplay_recovery_tick(void) {
 			bool loaded;
 			if (NetLink_takeResyncAck(&epoch, &loaded) && epoch == recovery_epoch) {
 				if (!loaded || !NetLink_commitResync(epoch)) {
-					recovery_failed = 1;
-					shim_log("client could not adopt authoritative resync %u\n", epoch);
+					recovery_fail("Guest could not commit authoritative recovery.");
 					return true;
 				}
 				if (connection_sync_pending) {
@@ -1406,25 +1966,37 @@ static bool netplay_recovery_tick(void) {
 					netplay_synced = netplay_ever_synced = 1;
 					connection_sync_pending = 0;
 				}
+				if (recovery_promote_checkpoint) {
+					promote_checkpoint();
+					recovery_promote_checkpoint = 0;
+				}
 				recovery_phase = RECOVERY_IDLE;
 				recovery_started.tv_sec = recovery_started.tv_usec = 0;
 				recovery_count++;
-				shim_log("authoritative resync %u committed (%u %s this session)\n",
+				shim_log("authoritative %s %u committed (%u %s this session)\n",
+				         recovery_kind == NETLINK_RECOVERY_RESET ? "reset" : "resync",
 				         epoch, recovery_count, recovery_count == 1 ? "recovery" : "recoveries");
+				recovery_kind = NETLINK_RECOVERY_SYNC;
 			}
 			return true;
 		}
 		return false;
 	}
 
-	if (recovery_phase == RECOVERY_CLIENT_WAIT_BEGIN) {
+	/* A normal desync puts the guest in WAIT_BEGIN after it asks for help. A
+	 * host reset is deliberately unsolicited, so an idle guest must also honor
+	 * the authority's BEGIN and pause before advancing another core frame. */
+	if (recovery_phase == RECOVERY_CLIENT_WAIT_BEGIN ||
+	    recovery_phase == RECOVERY_IDLE) {
 		uint32_t epoch, frame;
-		if (NetLink_takeResyncBegin(&epoch, &frame)) {
+		NetLinkRecoveryKind kind;
+		if (NetLink_takeResyncBegin(&epoch, &frame, &kind)) {
 			recovery_epoch = epoch;
 			recovery_resume_frame = frame;
+			recovery_kind = kind;
 			recovery_phase = RECOVERY_CLIENT_WAIT_STATE;
-			shim_log("authoritative resync %u beginning; resume frame %u\n",
-			         epoch, frame);
+			shim_log("authoritative %s %u beginning; resume frame %u\n",
+			         kind == NETLINK_RECOVERY_RESET ? "reset" : "resync", epoch, frame);
 		}
 	}
 
@@ -1437,13 +2009,13 @@ static bool netplay_recovery_tick(void) {
 
 			if (loaded) reset_netplay_timeline(recovery_resume_frame);
 			if (!NetLink_ackResync(recovery_epoch, loaded) || !loaded) {
-				recovery_failed = 1;
-				shim_log("could not adopt authoritative resync %u (%zu-byte bundle)\n",
-				         recovery_epoch, len);
+				recovery_fail("Guest could not adopt authoritative recovery state.");
 				return true;
 			}
 			recovery_phase = RECOVERY_CLIENT_WAIT_COMMIT;
-			shim_log("authoritative resync %u adopted; waiting for commit\n", recovery_epoch);
+			shim_log("authoritative %s %u adopted; waiting for commit\n",
+			         recovery_kind == NETLINK_RECOVERY_RESET ? "reset" : "resync",
+			         recovery_epoch);
 		}
 	}
 
@@ -1457,8 +2029,10 @@ static bool netplay_recovery_tick(void) {
 			recovery_phase = RECOVERY_IDLE;
 			recovery_started.tv_sec = recovery_started.tv_usec = 0;
 			recovery_count++;
-			shim_log("authoritative resync %u committed (%u %s this session)\n",
+			shim_log("authoritative %s %u committed (%u %s this session)\n",
+			         recovery_kind == NETLINK_RECOVERY_RESET ? "reset" : "resync",
 			         epoch, recovery_count, recovery_count == 1 ? "recovery" : "recoveries");
+			recovery_kind = NETLINK_RECOVERY_SYNC;
 			return true;
 		}
 	}
@@ -1500,11 +2074,6 @@ static bool capture_state(void** out, size_t* out_len, uint32_t* out_hash) {
 }
 
 static bool netplay_checkDivergence(void) {
-	#define OWN_HASHES 8
-	static uint32_t own_frame[OWN_HASHES];
-	static uint32_t own_hash[OWN_HASHES];
-	static int own_valid[OWN_HASHES];
-
 	if (NetLink_getRole() == NETLINK_ROLE_HOST) {
 		uint32_t frame, hash;
 		bool matched;
@@ -1541,36 +2110,51 @@ static bool netplay_checkDivergence(void) {
 			return false;
 		}
 		free(snapshot);
-		unsigned slot = (netplay_frame / HASH_INTERVAL) % OWN_HASHES;
-		own_frame[slot] = netplay_frame;
-		own_hash[slot] = mine;
-		own_valid[slot] = 1;
+		unsigned slot = (netplay_frame / HASH_INTERVAL) % HASH_HISTORY;
+		own_hashes[slot] = (StateHash){ netplay_frame, mine, 1 };
 	}
 
 	if (NetLink_getRole() == NETLINK_ROLE_HOST) return false;
+
+	/* The host can reach a checkpoint slightly before this device. Keep those
+	 * hashes instead of popping and discarding them merely because our matching
+	 * serialize has not happened yet. Keying both rings by frame makes ordering
+	 * irrelevant and a later comparison uses exactly the symmetric snapshots. */
 	uint32_t f, h;
 	while (NetLink_takeHash(&f, &h)) {
-		unsigned s = (f / HASH_INTERVAL) % OWN_HASHES;
-		if (!own_valid[s] || own_frame[s] != f) {
-			shim_log("no local hash for frame %u to compare (now at %u)\n", f, netplay_frame);
-			continue;
-		}
+		unsigned p = (f / HASH_INTERVAL) % HASH_HISTORY;
+		pending_peer_hashes[p] = (StateHash){ f, h, 1 };
+	}
+
+	for (unsigned p = 0; p < HASH_HISTORY; p++) {
+		if (!pending_peer_hashes[p].valid) continue;
+		f = pending_peer_hashes[p].frame;
+		h = pending_peer_hashes[p].hash;
+		unsigned s = (f / HASH_INTERVAL) % HASH_HISTORY;
+		if (!own_hashes[s].valid || own_hashes[s].frame != f) continue;
+		pending_peer_hashes[p].valid = 0;
 		if (f == 0)
 			shim_log("state at frame 0: ours %08x, host %08x - handshake %s\n",
-			         own_hash[s], h,
-			         own_hash[s] == h ? "equalised both sides" : "did NOT equalise");
-		if (own_hash[s] != h) {
-			NetLink_ackCheckpoint(f, h, false);
-			shim_log("DESYNC at frame %u (host %08x, ours %08x)\n", f, h, own_hash[s]);
-			if (recovery_phase == RECOVERY_IDLE && NetLink_requestResync(f)) {
+			         own_hashes[s].hash, h,
+			         own_hashes[s].hash == h ? "equalised both sides" : "did NOT equalise");
+		if (own_hashes[s].hash != h) {
+			if (!NetLink_ackCheckpoint(f, h, false)) return true;
+			shim_log("DESYNC at frame %u (host %08x, ours %08x)\n",
+			         f, h, own_hashes[s].hash);
+			if (recovery_phase == RECOVERY_IDLE) {
+				if (!desync_recovery_allowed()) {
+					recovery_fail("Repeated desyncs. Press A to continue solo.");
+					return true;
+				}
+				if (!NetLink_requestResync(f)) return true;
 				recovery_phase = RECOVERY_CLIENT_WAIT_BEGIN;
 				recovery_clock_start();
 				shim_log("requested authoritative state from host\n");
 				return true;
 			}
 		} else {
-			NetLink_ackCheckpoint(f, h, true);
-			shim_log("in sync at frame %u (%08x)\n", f, own_hash[s]);
+			if (!NetLink_ackCheckpoint(f, h, true)) return true;
+			shim_log("in sync at frame %u (%08x)\n", f, own_hashes[s].hash);
 		}
 	}
 	return false;
@@ -1581,7 +2165,23 @@ static bool netplay_checkDivergence(void) {
 static void pump_netpacket(void) {
 	if (!have_netpacket || !session_active) return;
 
+	/* A disconnect and reconnect can both happen while MinArch is in its menu.
+	 * Retire the old core session before starting the new one; doing this in the
+	 * opposite order leaves the newly connected core immediately stopped. */
+	if (NetLink_consumeDisconnectEvent() && netpacket_started) {
+		if (core_netpacket.disconnected)
+			core_netpacket.disconnected(NetLink_remoteClientId());
+		if (core_netpacket.stop) core_netpacket.stop();
+		netpacket_started = 0;
+		shim_log("netpacket session stopped\n");
+	}
+
 	if (NetLink_consumeConnectEvent()) {
+		if (netpacket_started) {
+			if (core_netpacket.disconnected)
+				core_netpacket.disconnected(NetLink_remoteClientId());
+			if (core_netpacket.stop) core_netpacket.stop();
+		}
 		core_netpacket.start(NetLink_localClientId(),
 		                     shim_netpacket_send,
 		                     shim_netpacket_poll_receive);
@@ -1592,19 +2192,6 @@ static void pump_netpacket(void) {
 			core_netpacket.connected(NetLink_remoteClientId());
 		}
 		shim_log("netpacket session started\n");
-	}
-
-	if (NetLink_consumeDisconnectEvent() && netpacket_started) {
-		// Order matters: the core wants to hear about the player leaving before
-		// the session ends. gpSP needs this to unstick its RFU state machine.
-		if (core_netpacket.disconnected) {
-			core_netpacket.disconnected(NetLink_remoteClientId());
-		}
-		if (core_netpacket.stop) {
-			core_netpacket.stop();
-		}
-		netpacket_started = 0;
-		shim_log("netpacket session stopped\n");
 	}
 
 	if (!netpacket_started) return;
@@ -1620,6 +2207,8 @@ static void pump_netpacket(void) {
 	if (core_netpacket.poll) core_netpacket.poll();
 }
 
+static void present_paused_frame(unsigned frame_counter, const char* msg);
+
 static void shim_video_refresh(const void* data, unsigned width, unsigned height, size_t pitch) {
 	if (data && session_active) {
 		size_t need = pitch * height;
@@ -1633,6 +2222,19 @@ static void shim_video_refresh(const void* data, unsigned width, unsigned height
 			last_frame_h = height;
 			last_frame_pitch = pitch;
 		}
+	}
+	/* This is an overlay, not a loading pause: core.run() produced the frame
+	 * above and continues producing audio/input normally. Start the two-second
+	 * clock at the first visible frame so a slow core load cannot consume the
+	 * entire notice before there is anything on screen. */
+	if (startup_notice[0] && last_frame && last_frame_w && last_frame_h) {
+		if (!startup_notice_started.tv_sec)
+			gettimeofday(&startup_notice_started, NULL);
+		if (elapsed_ms(&startup_notice_started) < STARTUP_NOTICE_MS) {
+			present_paused_frame(startup_notice_frame++, startup_notice);
+			return;
+		}
+		startup_notice[0] = '\0';
 	}
 	if (fe_video_refresh) fe_video_refresh(data, width, height, pitch);
 }
@@ -1716,8 +2318,8 @@ static void present_paused_frame(unsigned frame_counter, const char* msg) {
 	int margin_x = 2 * scale;
 	int avail    = (int)fw - margin_x * 2;
 
-	char lines[3][OVL_MAX_LINE];
-	int  nlines = OVL_wrap(MSG, scale, avail, lines, 3);
+	char lines[4][OVL_MAX_LINE];
+	int  nlines = OVL_wrap(MSG, scale, avail, lines, 4);
 	if (nlines <= 0) return;
 
 	int line_h = OVL_GLYPH_H * scale;
@@ -1787,6 +2389,13 @@ static void shim_input_poll(void) {
 }
 
 static int16_t shim_input_state(unsigned port, unsigned device, unsigned index, unsigned id) {
+	if (dual_link_mode && dual_bootstrapped && device == RETRO_DEVICE_JOYPAD &&
+	    index == 0 && port < (dual_core_mode ? 2u : 1u)) {
+		uint32_t buttons = dual_primary_buttons;
+		if (dual_core_mode && port != dual_local_console) buttons = dual_shadow_buttons;
+		if (id == RETRO_DEVICE_ID_JOYPAD_MASK) return (int16_t)buttons;
+		return (buttons >> id) & 1;
+	}
 	// Shared-screen netplay drives both ports from the synced buffers. Stock
 	// minarch returns 0 for every port above 0, which is exactly why the patched
 	// build had to add this - the second player has to come from somewhere.
@@ -1841,6 +2450,10 @@ void retro_set_input_state(retro_input_state_t cb) {
 void retro_init(void) {
 	ensure_loaded();
 	core.init();
+	if (dual_link_mode && !dual_core_mode && !prepare_shadow_core()) {
+		dual_failed = 1;
+		shim_log("instanced Gambatte disabled: %s\n", dual_error);
+	}
 }
 
 void retro_deinit(void) {
@@ -1865,6 +2478,16 @@ void retro_deinit(void) {
 	checkpoint_candidate = NULL;
 	checkpoint_candidate_len = 0;
 
+	stop_shadow_worker();
+	if (shadow_core.handle) {
+		shadow_core.deinit();
+		dlclose(shadow_core.handle);
+		memset(&shadow_core, 0, sizeof(shadow_core));
+	}
+	if (shadow_core_path[0]) {
+		remove(shadow_core_path);
+		shadow_core_path[0] = '\0';
+	}
 	core.deinit();
 }
 
@@ -1895,7 +2518,416 @@ void retro_set_controller_port_device(unsigned port, unsigned device) {
 
 void retro_reset(void) {
 	if (!core.handle) return;
+	if (dual_link_mode && dual_core_mode && !solo_mode) {
+		if (!dual_bootstrapped || !core.dual_reset_console) {
+			show_runtime_notice("Reset unavailable while synchronizing.");
+			return;
+		}
+		dual_reset_pending = 1;
+		show_runtime_notice("Resetting this linked console...");
+		shim_log("queued reset for logical console %c\n", dual_local_console ? 'B' : 'A');
+		return;
+	}
+	if (dual_link_mode && !solo_mode) {
+		show_runtime_notice("Reset unavailable in instanced GB link.");
+		return;
+	}
+	if (session_active && netplay_mode && !solo_mode) {
+		if (NetLink_getRole() != NETLINK_ROLE_HOST) {
+			show_runtime_notice("Only the host can reset shared-screen play.");
+			shim_log("guest reset rejected during shared-screen netplay\n");
+			return;
+		}
+		if (!netplay_synced || recovery_phase != RECOVERY_IDLE || recovery_failed) {
+			show_runtime_notice("Reset unavailable while synchronizing.");
+			shim_log("host reset rejected while synchronization is active\n");
+			return;
+		}
+		host_reset_pending = 1;
+		shim_log("host reset queued for an authoritative frame-boundary transaction\n");
+		return;
+	}
+	/* Link play represents independent consoles, and a shared-screen process
+	 * that explicitly continued solo is independent for the rest of its life. */
 	core.reset();
+}
+
+static const char* recovery_status_message(void) {
+	if (recovery_kind == NETLINK_RECOVERY_RESET)
+		return NetLink_getRole() == NETLINK_ROLE_HOST
+		       ? "Resetting both players..."
+		       : "Host reset. Synchronizing...";
+	if (!netplay_synced)
+		return NetLink_getRole() == NETLINK_ROLE_HOST
+		       ? "Sending starting state..."
+		       : "Receiving state from host...";
+	return NetLink_getRole() == NETLINK_ROLE_HOST
+	       ? "Sending authoritative state..."
+	       : "Resynchronizing from host...";
+}
+
+static void dual_fail(const char* message) {
+	dual_failed = 1;
+	snprintf(dual_error, sizeof(dual_error), "%s", message);
+	shim_log("instanced Gambatte failed: %s\n", dual_error);
+}
+
+/* Both handhelds start with their own visible console's complete state. Each
+ * sends that state once and loads the peer's into its hidden console. This is
+ * what carries SRAM/RTC into the replica without ever persisting the peer's
+ * save locally. After this transaction, only inputs and diagnostics use Wi-Fi. */
+static bool dual_bootstrap_tick(void) {
+	if (dual_failed || dual_bootstrapped) return dual_bootstrapped;
+	if (!NetLink_isConnected()) return false;
+
+	uint32_t generation = NetLink_connectionGeneration();
+	if (generation != dual_generation) {
+		dual_generation = generation;
+		dual_identity_sent = 0;
+		dual_identity_checked = 0;
+		dual_state_sent = 0;
+		dual_state_loaded = 0;
+		dual_checkpoint_sent = 0;
+		dual_checkpoint_loaded = 0;
+		dual_ready_sent = 0;
+		NetLink_resetSync();
+	}
+
+	uint32_t sram = 0, rtc = 0;
+	if (!dual_identity_sent) {
+		if (!rom_hash_ready || !dual_memory_sizes(dual_local_console, &sram, &rtc)) {
+			dual_fail("Could not identify local Gambatte state.");
+			return false;
+		}
+		NetLinkSessionIdentity mine;
+		memset(&mine, 0, sizeof(mine));
+		memcpy(mine.rom_sha256, rom_sha256, sizeof(mine.rom_sha256));
+		mine.mode = 2; /* instanced link */
+		mine.input_delay = (uint32_t)input_delay;
+		mine.core_identity = core_identity();
+		mine.state_size = (uint32_t)core.dual_serialize_size();
+		mine.sram_size = sram;
+		mine.rtc_size = rtc;
+		if (!NetLink_sendSessionIdentity(&mine)) return false;
+		dual_identity_sent = 1;
+		shim_log("sent instanced-link identity\n");
+	}
+
+	if (!dual_identity_checked) {
+		NetLinkSessionIdentity peer;
+		if (!NetLink_takeSessionIdentity(&peer)) return false;
+		if (peer.mode != 2 || peer.input_delay != (uint32_t)input_delay ||
+		    peer.core_identity != core_identity() ||
+		    peer.state_size != core.dual_serialize_size() ||
+		    !dual_memory_sizes(dual_peer_console, &sram, &rtc) ||
+		    peer.sram_size != sram || peer.rtc_size != rtc ||
+		    memcmp(peer.rom_sha256, rom_sha256, sizeof(rom_sha256))) {
+			dual_fail("Instanced link requires the same ROM and Gambatte build.");
+			return false;
+		}
+		dual_identity_checked = 1;
+		shim_log("peer instanced-link identity accepted\n");
+	}
+
+	if (!dual_state_sent) {
+		void* state = NULL;
+		size_t len = 0;
+		if (!capture_dual_memory(dual_local_console, &state, &len)) {
+			dual_fail("Could not capture local Gambatte save memory.");
+			return false;
+		}
+		bool sent = NetLink_sendState(state, len);
+		free(state);
+		if (!sent) return false;
+		dual_state_sent = 1;
+		shim_log("sent console %c save memory to peer (%zu bytes)\n",
+		         dual_local_console ? 'B' : 'A', len);
+	}
+
+	if (!dual_state_loaded) {
+		void* peer_state = NULL;
+		size_t peer_len = 0;
+		if (!NetLink_takeState(&peer_state, &peer_len)) return false;
+		bool loaded = apply_dual_memory(dual_peer_console, peer_state, peer_len);
+		free(peer_state);
+		if (!loaded) {
+			dual_fail("Paired Gambatte could not adopt the peer save memory.");
+			return false;
+		}
+		dual_state_loaded = 1;
+		shim_log("console %c save memory adopted\n",
+		         dual_peer_console ? 'B' : 'A');
+		return false;
+	}
+
+	/* The memory exchange makes both logical consoles equivalent. One paired
+	 * checkpoint from the host then removes any residual initialization or RTC
+	 * timing difference before the first synchronized input frame. */
+	if (NetLink_getRole() == NETLINK_ROLE_HOST && !dual_checkpoint_sent) {
+		if (!core.dual_is_checkpoint_safe()) return false;
+		size_t len = core.dual_serialize_size();
+		void* state = len ? malloc(len) : NULL;
+		if (!state || !core.dual_serialize(state, len)) {
+			free(state);
+			dual_fail("Could not capture paired Gambatte checkpoint.");
+			return false;
+		}
+		bool sent = NetLink_sendState(state, len);
+		free(state);
+		if (!sent) return false;
+		dual_checkpoint_sent = dual_checkpoint_loaded = 1;
+		shim_log("sent authoritative paired checkpoint (%zu bytes)\n", len);
+	}
+	if (NetLink_getRole() == NETLINK_ROLE_CLIENT && !dual_checkpoint_loaded) {
+		void* state = NULL;
+		size_t len = 0;
+		if (!NetLink_takeState(&state, &len)) return false;
+		bool loaded = core.dual_is_checkpoint_safe() &&
+		              len == core.dual_serialize_size() &&
+		              core.dual_unserialize(state, len);
+		free(state);
+		if (!loaded) {
+			dual_fail("Could not adopt host paired Gambatte checkpoint.");
+			return false;
+		}
+		dual_checkpoint_loaded = 1;
+		shim_log("adopted authoritative paired checkpoint\n");
+	}
+	if (!dual_checkpoint_loaded) return false;
+
+	if (!dual_ready_sent) {
+		NetLink_resetTimeline();
+		if (!NetLink_ackResync(DUAL_READY_EPOCH, true)) return false;
+		dual_ready_sent = 1;
+		shim_log("paired checkpoint ready; waiting at input barrier\n");
+		return false;
+	}
+
+	uint32_t ready_epoch = 0;
+	bool peer_loaded = false;
+	if (!NetLink_takeResyncAck(&ready_epoch, &peer_loaded)) return false;
+	if (ready_epoch != DUAL_READY_EPOCH || !peer_loaded) {
+		dual_fail("Peer rejected the instanced-link bootstrap.");
+		return false;
+	}
+	memset(local_inputs, 0, sizeof(local_inputs));
+	dual_frame = 0;
+	last_scheduled = 0;
+	input_scheduled = 0;
+	dual_bootstrapped = 1;
+	shim_log("instanced Gambatte ready; serial is local and Wi-Fi is input-only\n");
+	return true;
+}
+
+static uint32_t timeval_delta_us(const struct timeval* from, const struct timeval* to) {
+	long sec = to->tv_sec - from->tv_sec;
+	long usec = to->tv_usec - from->tv_usec;
+	long long total = (long long)sec * 1000000LL + usec;
+	if (total <= 0) return 0;
+	return total > UINT32_MAX ? UINT32_MAX : (uint32_t)total;
+}
+
+static void* shadow_worker_main(void* unused) {
+	(void)unused;
+	pthread_mutex_lock(&shadow_worker_mutex);
+	for (;;) {
+		while (!shadow_worker_pending && !shadow_worker_stop)
+			pthread_cond_wait(&shadow_worker_request, &shadow_worker_mutex);
+		if (shadow_worker_stop) break;
+		shadow_worker_pending = 0;
+		pthread_mutex_unlock(&shadow_worker_mutex);
+
+		struct timeval started, finished;
+		gettimeofday(&started, NULL);
+		shadow_core.run();
+		gettimeofday(&finished, NULL);
+		uint32_t elapsed = timeval_delta_us(&started, &finished);
+
+		pthread_mutex_lock(&shadow_worker_mutex);
+		shadow_last_run_us = elapsed;
+		shadow_worker_done = 1;
+		pthread_cond_signal(&shadow_worker_complete);
+	}
+	pthread_mutex_unlock(&shadow_worker_mutex);
+	return NULL;
+}
+
+static bool start_shadow_worker(void) {
+	if (shadow_worker_started) return true;
+	pthread_mutex_lock(&shadow_worker_mutex);
+	shadow_worker_pending = shadow_worker_done = shadow_worker_stop = 0;
+	int rc = pthread_create(&shadow_worker_thread, NULL, shadow_worker_main, NULL);
+	if (!rc) shadow_worker_started = 1;
+	pthread_mutex_unlock(&shadow_worker_mutex);
+	if (rc) dual_fail("Could not start the hidden Gambatte worker.");
+	else shim_log("persistent hidden-core worker started\n");
+	return rc == 0;
+}
+
+static void stop_shadow_worker(void) {
+	if (!shadow_worker_started) return;
+	pthread_mutex_lock(&shadow_worker_mutex);
+	shadow_worker_stop = 1;
+	pthread_cond_signal(&shadow_worker_request);
+	pthread_mutex_unlock(&shadow_worker_mutex);
+	pthread_join(shadow_worker_thread, NULL);
+	pthread_mutex_lock(&shadow_worker_mutex);
+	shadow_worker_started = 0;
+	shadow_worker_pending = shadow_worker_done = shadow_worker_stop = 0;
+	pthread_mutex_unlock(&shadow_worker_mutex);
+}
+
+static bool run_dual_frame(void) {
+	if (dual_core_mode) {
+		struct timeval started, finished;
+		gettimeofday(&started, NULL);
+		NetLink_setCoreRunning(true);
+		core.run();
+		NetLink_setCoreRunning(false);
+		gettimeofday(&finished, NULL);
+		uint32_t elapsed = timeval_delta_us(&started, &finished);
+		dual_visible_run_us += elapsed;
+		dual_pair_run_us += elapsed;
+		if (elapsed > dual_visible_run_max_us) dual_visible_run_max_us = elapsed;
+		if (elapsed > dual_pair_run_max_us) dual_pair_run_max_us = elapsed;
+		return true;
+	}
+	if (!start_shadow_worker()) return false;
+	struct timeval pair_started, visible_started, visible_finished, pair_finished;
+	gettimeofday(&pair_started, NULL);
+
+	pthread_mutex_lock(&shadow_worker_mutex);
+	shadow_worker_done = 0;
+	shadow_worker_pending = 1;
+	pthread_cond_signal(&shadow_worker_request);
+	pthread_mutex_unlock(&shadow_worker_mutex);
+
+	NetLink_setCoreRunning(true);
+	gettimeofday(&visible_started, NULL);
+	core.run();
+	gettimeofday(&visible_finished, NULL);
+
+	pthread_mutex_lock(&shadow_worker_mutex);
+	while (!shadow_worker_done)
+		pthread_cond_wait(&shadow_worker_complete, &shadow_worker_mutex);
+	uint32_t shadow_us = shadow_last_run_us;
+	pthread_mutex_unlock(&shadow_worker_mutex);
+	gettimeofday(&pair_finished, NULL);
+	NetLink_setCoreRunning(false);
+
+	uint32_t visible_us = timeval_delta_us(&visible_started, &visible_finished);
+	uint32_t pair_us = timeval_delta_us(&pair_started, &pair_finished);
+	dual_visible_run_us += visible_us;
+	dual_shadow_run_us += shadow_us;
+	dual_pair_run_us += pair_us;
+	if (visible_us > dual_visible_run_max_us) dual_visible_run_max_us = visible_us;
+	if (shadow_us > dual_shadow_run_max_us) dual_shadow_run_max_us = shadow_us;
+	if (pair_us > dual_pair_run_max_us) dual_pair_run_max_us = pair_us;
+	return true;
+}
+
+static void dual_report_pacing(void) {
+	if (!stat_since.tv_sec) { gettimeofday(&stat_since, NULL); return; }
+	if (!dual_frame || dual_frame % PACING_INTERVAL) return;
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	long ms = (now.tv_sec - stat_since.tv_sec) * 1000L
+	        + (now.tv_usec - stat_since.tv_usec) / 1000L;
+	if (ms <= 0) return;
+	unsigned fps10 = (unsigned)((stat_frames * 10000UL) / (unsigned long)ms);
+	unsigned total = stat_frames + stat_stalls;
+	unsigned stall_pct = total ? (unsigned)((stat_stalls * 100UL) / total) : 0;
+	shim_log("instanced pacing: %u paired frames in %ldms (%u.%u fps), "
+	         "input stalls %u (%u%%), longest %u, delay %d\n",
+	         stat_frames, ms, fps10 / 10, fps10 % 10, stat_stalls,
+	         stall_pct, stat_stall_max, input_delay);
+	if (stat_frames) {
+		shim_log("instanced core time: visible avg %lluus max %uus, "
+		         "hidden avg %lluus max %uus, pair avg %lluus max %uus\n",
+		         (unsigned long long)(dual_visible_run_us / stat_frames), dual_visible_run_max_us,
+		         (unsigned long long)(dual_shadow_run_us / stat_frames), dual_shadow_run_max_us,
+		         (unsigned long long)(dual_pair_run_us / stat_frames), dual_pair_run_max_us);
+	}
+	stat_frames = stat_stalls = stat_stall_max = 0;
+	dual_visible_run_us = dual_shadow_run_us = dual_pair_run_us = 0;
+	dual_visible_run_max_us = dual_shadow_run_max_us = dual_pair_run_max_us = 0;
+	stat_since = now;
+}
+
+/* Returns true when this frontend frame was fully handled (including waits). */
+static bool dual_link_tick(void) {
+	NetLink_markFrame();
+	if (dual_failed) {
+		if (fe_input_poll) fe_input_poll();
+		present_paused_frame(dual_frame, dual_error);
+		present_paused_audio();
+		return true;
+	}
+	if (NetLink_isPeerPaused()) {
+		if (fe_input_poll) fe_input_poll();
+		present_paused_frame(dual_frame, "Waiting for other player (menu open)...");
+		present_paused_audio();
+		return true;
+	}
+	if (!dual_bootstrap_tick()) {
+		if (fe_input_poll) fe_input_poll();
+		present_paused_frame(dual_frame, dual_failed ? dual_error : "Starting instanced link...");
+		present_paused_audio();
+		return true;
+	}
+
+	uint32_t target = dual_frame + (uint32_t)input_delay;
+	if (!input_scheduled || target > last_scheduled) {
+		uint32_t local = fe_input_state
+			? (uint32_t)fe_input_state(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK)
+			: 0;
+		if (dual_reset_pending) local |= DUAL_INPUT_RESET;
+		local_inputs[target % 256] = local;
+		if (!NetLink_sendInput(target, local)) {
+			dual_fail("Could not send instanced-link input.");
+			return true;
+		}
+		last_scheduled = target;
+		input_scheduled = 1;
+		dual_reset_pending = 0;
+	}
+	uint32_t mine = dual_frame < (uint32_t)input_delay ? 0 : local_inputs[dual_frame % 256];
+	uint32_t theirs = 0;
+	if (dual_frame >= (uint32_t)input_delay &&
+	    !NetLink_getRemoteInput(dual_frame, &theirs)) {
+		if (fe_input_poll) fe_input_poll();
+		stat_stalls++;
+		stall_run++;
+		if (stall_run > stat_stall_max) stat_stall_max = stall_run;
+		present_paused_frame(stall_run,
+		                     stall_run > STALL_OVERLAY_FRAMES ? "Waiting for other player's input..." : NULL);
+		present_paused_audio();
+		return true;
+	}
+	stall_run = 0;
+	if (dual_core_mode && (mine & DUAL_INPUT_RESET)) {
+		if (!core.dual_reset_console(dual_local_console)) {
+			dual_fail("Could not reset the local logical console.");
+			return true;
+		}
+		shim_log("applied synchronized reset to console %c at frame %u\n",
+		         dual_local_console ? 'B' : 'A', dual_frame);
+	}
+	if (dual_core_mode && (theirs & DUAL_INPUT_RESET)) {
+		if (!core.dual_reset_console(dual_peer_console)) {
+			dual_fail("Could not mirror the peer logical-console reset.");
+			return true;
+		}
+		shim_log("applied synchronized peer reset to console %c at frame %u\n",
+		         dual_peer_console ? 'B' : 'A', dual_frame);
+	}
+	dual_primary_buttons = mine & ~DUAL_INPUT_RESET;
+	dual_shadow_buttons = theirs & ~DUAL_INPUT_RESET;
+	if (!run_dual_frame()) return true;
+	dual_frame++;
+	stat_frames++;
+	dual_report_pacing();
+	return true;
 }
 
 void retro_run(void) {
@@ -1904,18 +2936,30 @@ void retro_run(void) {
 	// Netpacket state and inbound packets are settled before the core runs, so
 	// a frame sees everything that arrived since the last one.
 	pump_netpacket();
+	if (session_active && dual_link_mode && !solo_mode) {
+		dual_link_tick();
+		return;
+	}
 
-	if (session_active && netplay_mode) {
+	if (session_active && netplay_mode && !solo_mode) {
 		NetLink_markFrame();
+		if (NetLink_isConnected()) {
+			peer_missing_since.tv_sec = peer_missing_since.tv_usec = 0;
+		} else {
+			if (!peer_missing_since.tv_sec) gettimeofday(&peer_missing_since, NULL);
+			if (!recovery_failed && elapsed_ms(&peer_missing_since) > peer_wait_timeout_ms())
+				recovery_fail("Peer unavailable.");
+		}
 		netplay_handshake();
 
 		if (netplay_recovery_tick()) {
 			if (fe_input_poll) fe_input_poll();
+			if (recovery_failed) failure_input_tick();
 			static unsigned recovery_wait;
-			present_paused_frame(recovery_wait++, recovery_failed
-			                     ? "Resync failed - exit the game."
-			                     : (netplay_synced ? "Resynchronizing from host..."
-			                                       : "Rejoining from host..."));
+			char failure_message[224];
+			if (recovery_failed) failure_overlay_message(failure_message, sizeof(failure_message));
+			present_paused_frame(recovery_wait++, recovery_failed ? failure_message
+			                     : recovery_status_message());
 			present_paused_audio();
 			return;
 		}
@@ -1955,6 +2999,18 @@ void retro_run(void) {
 			// Peer input for this frame has not arrived. Stall rather than run
 			// ahead: advancing without it would desync immediately.
 			if (fe_input_poll) fe_input_poll();
+			if (!input_stall_since.tv_sec) gettimeofday(&input_stall_since, NULL);
+			if (elapsed_ms(&input_stall_since) > peer_wait_timeout_ms()) {
+				recovery_fail(NetLink_isConnected()
+				              ? "Peer stopped sending input."
+				              : "Peer disconnected.");
+				failure_input_tick();
+				char failure_message[224];
+				failure_overlay_message(failure_message, sizeof(failure_message));
+				present_paused_frame(stall_run, failure_message);
+				present_paused_audio();
+				return;
+			}
 
 			stat_stalls++;
 			stall_run++;
@@ -1970,6 +3026,7 @@ void retro_run(void) {
 			present_paused_audio();
 			return;
 		}
+		input_stall_since.tv_sec = input_stall_since.tv_usec = 0;
 		stall_run = 0;
 
 		int host = (NetLink_getRole() == NETLINK_ROLE_HOST);
@@ -1986,7 +3043,7 @@ void retro_run(void) {
 		stat_frames++;
 		netplay_reportPacing();
 	}
-	else if (session_active) {
+	else if (session_active && !netplay_mode) {
 		NetLink_markFrame();
 
 		// Peer's frontend is blocked - a menu, a sleep. Running ahead would only
@@ -2116,32 +3173,53 @@ static bool hash_game_content(const struct retro_game_info* game, uint8_t out[32
 
 bool retro_load_game(const struct retro_game_info* game) {
 	ensure_loaded();
-	if (session_active && netplay_mode) {
+	if (session_active && (netplay_mode || dual_link_mode)) {
 		rom_hash_ready = hash_game_content(game, rom_sha256);
 		if (!rom_hash_ready) {
-			shim_log("cannot hash ROM content - shared-screen netplay disabled\n");
-			netplay_mode = 0;
+			if (dual_link_mode) {
+				dual_failed = 1;
+				snprintf(dual_error, sizeof(dual_error), "Cannot hash ROM for instanced link.");
+			} else recovery_fail("Cannot hash ROM content. Shared-screen launch refused.");
 		} else {
 			shim_log("ROM SHA-256: %02x%02x%02x%02x...%02x%02x%02x%02x\n",
 			         rom_sha256[0], rom_sha256[1], rom_sha256[2], rom_sha256[3],
 			         rom_sha256[28], rom_sha256[29], rom_sha256[30], rom_sha256[31]);
 		}
 	} else rom_hash_ready = 0;
-	return core.load_game(game);
+	if (!dual_link_mode || !shadow_core.handle) return core.load_game(game);
+
+	/* Whichever local instance is the loopback server must load first. The
+	 * client's initial connect is then immediate instead of waiting for
+	 * Gambatte's reconnect throttle. */
+	bool primary_server = NetLink_getRole() == NETLINK_ROLE_HOST;
+	bool primary_ok, shadow_ok;
+	if (primary_server) {
+		primary_ok = core.load_game(game);
+		shadow_ok = shadow_core.load_game(game);
+	} else {
+		shadow_ok = shadow_core.load_game(game);
+		primary_ok = core.load_game(game);
+	}
+	if (!primary_ok || !shadow_ok) {
+		dual_failed = 1;
+		snprintf(dual_error, sizeof(dual_error), "One Gambatte instance could not load the ROM.");
+	}
+	return primary_ok && shadow_ok;
 }
 
 bool retro_load_game_special(unsigned game_type, const struct retro_game_info* info, size_t num_info) {
 	ensure_loaded();
 	if (!core.load_game_special) return false;
 	if (session_active && netplay_mode) {
-		shim_log("multi-content games do not yet have a complete ROM-set hash - shared-screen netplay disabled\n");
-		netplay_mode = 0;
+		recovery_fail("Cannot hash multi-content game. Shared-screen launch refused.");
 	}
 	return core.load_game_special(game_type, info, num_info);
 }
 
 void retro_unload_game(void) {
 	if (!core.handle) return;
+	stop_shadow_worker();
+	if (shadow_core.handle) shadow_core.unload_game();
 	core.unload_game();
 }
 

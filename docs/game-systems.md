@@ -43,14 +43,15 @@ Seven systems, installed by default.
 | GBA | gpsp | rarely (single-cart multiboot) | **partial** - wireless adapter only, see below | **link** - proven for the supported titles, 213s unbroken (Advance Wars 2) |
 | MD | picodrive | yes (2, or 4 via multitap) | hardware only - EXT port not emulated | **netplay** - proven (Streets of Rage 2, Gunstar Heroes) |
 | PS | pcsx_rearmed | yes (multitap) | hardware only - SIO1 link not emulated | netplay in principle; **blocked by determinism** |
-| SFC | snes9x (tg5040, tg5050, h700, my355) | yes (multitap) | no | netplay - **cannot pair with a my282** |
-| SFC | snes9x2005 (my282) | yes (multitap) | no | netplay - **my282 to my282 only** |
+| SFC | snes9x (tg5040, tg5050, h700, my355) | yes (multitap) | no | shared-screen; packaged Supafaust fallback pairs with my282 |
+| SFC | snes9x2005 (my282) | yes (multitap) | no | shared-screen; packaged Supafaust fallback pairs with arm64 |
 
 The SFC split is not a build-flag difference. Four of the five platforms build
 Snes9x 1.63; my282 builds Snes9x 2005, a 1.43-era fork - **different
-emulators**, which cannot stay in sync with each other at any input delay. Any
-two of the arm64 four can pair, and two my282s can pair. Resolving the split is
-a port-level decision, not a patch.
+emulators**, which cannot stay in sync directly at any input delay. Compatibility
+negotiation resolves the split by loading the same pinned Supafaust revision on
+both devices. Supafaust uses an explicitly encoded state stream: ARMv7 and
+AArch64 produced the same 277,033-byte state and hashes for Kirby Super Star.
 
 `PS` is the hardest determinism case in the set: pcsx_rearmed has two
 architecture-specific subsystems (`assem_arm.c` vs `assem_arm64.c`, and 33 NEON

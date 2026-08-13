@@ -167,9 +167,15 @@ do_up() {
 
 	# Cover EXTRAS paks that own their SD path too, so one command means "all
 	# netplay-capable systems are wrapped" rather than "some of them are".
-	[ -x "$NP/launcher/wrap-pak.sh" ] && "$NP/launcher/wrap-pak.sh" up
+	if [ -x "$NP/launcher/wrap-pak.sh" ] && ! "$NP/launcher/wrap-pak.sh" up; then
+		log "one or more extra paks could not be covered"
+		_fail=$((_fail + 1))
+	fi
 
-	[ $((_n + _owned)) -gt 0 ] && return 0
+	# Arming is all-or-nothing. A partial success used to report success and
+	# silently leave one system launching without the shim. The caller can now
+	# roll this set back and choose the launch-stub fallback consistently.
+	[ "$_fail" -eq 0 ] && [ $((_n + _owned)) -gt 0 ] && return 0
 	return 1
 }
 

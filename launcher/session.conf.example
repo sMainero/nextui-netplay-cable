@@ -17,6 +17,7 @@ port=55437
 # the matching local fallback.
 compatibility_cores=1
 share_cores=0       # frozen; no executable core files cross the network
+verbose_logs=1      # retain one full diagnostic log per game process
 #compat_core.gpsp=1
 
 # --- mode ------------------------------------------------------------------

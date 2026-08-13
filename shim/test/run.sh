@@ -73,6 +73,27 @@ grep -q "frontend save-state load blocked during session" "$OUT/session-state" \
 	|| { echo "  MISS active-session state policy"; fail=1; }
 
 echo
+echo "== selected core outcome is shown over live startup frames"
+NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/session" \
+	NETPLAY_CORE_NOTICE=compatibility HARNESS_EXPECT_OVERLAY=1 \
+	"$OUT/harness" "$SHIM" 2 > "$OUT/startup-notice" 2>&1 || {
+	cat "$OUT/startup-notice"; echo "  MISS compatibility startup notice"; fail=1
+}
+grep -q "startup notice: Starting with compatibility core" "$OUT/startup-notice" \
+	&& grep -q "RESULT: ok" "$OUT/startup-notice" \
+	&& echo "  ok   compatibility notice is drawn while the core runs" \
+	|| { echo "  MISS compatibility startup notice"; fail=1; }
+NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/session" \
+	NETPLAY_CORE_NOTICE=mismatch HARNESS_EXPECT_OVERLAY=1 \
+	"$OUT/harness" "$SHIM" 2 > "$OUT/mismatch-notice" 2>&1 || {
+	cat "$OUT/mismatch-notice"; echo "  MISS core mismatch startup notice"; fail=1
+}
+grep -q "startup notice: Core builds differ. Desyncs may occur" "$OUT/mismatch-notice" \
+	&& grep -q "RESULT: ok" "$OUT/mismatch-notice" \
+	&& echo "  ok   differing-core warning is drawn while the core runs" \
+	|| { echo "  MISS core mismatch startup notice"; fail=1; }
+
+echo
 echo "== fails loudly with no real core"
 if NETPLAY_REAL_CORE= "$OUT/harness" "$SHIM" >"$OUT/nocore" 2>&1; then
 	echo "  MISS expected non-zero exit"

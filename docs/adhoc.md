@@ -223,13 +223,17 @@ The captured command is persisted to `state/wifi_restore`. Holding it only in
 memory meant it vanished the moment the app exited — which is exactly when a
 device is stranded and needs it.
 
-Three ways back:
+Four ways back:
 
 1. **Automatic, at app launch.** `NS_wifiRecoverIfStranded()` restores if the
-   radio is associated to nothing, or is on `nextui-netplay` with no session
+   radio is associated to nothing, or is on a generated `nextui-*` network with no session
    armed. A healthy connection to some other network clears the stale record.
 2. **On join failure**, which restores before returning.
-3. **Manually**, via *Tools → Restore WiFi*, for when neither fires.
+3. **In the detached watchdog**, after three consecutive failures to reach the
+   ad-hoc host. A failed restore retains the breadcrumb and is retried; it must
+   not erase the only route home.
+4. **Manually**, via *Tools → Restore WiFi*, for when neither automatic route
+   has completed.
 
 Restoring waits for association before requesting a lease rather than firing
 DHCP into a link that is not up yet.
@@ -256,6 +260,13 @@ DHCP runs backgrounded and is polled, re-asked every 8 s while unanswered. On
 timeout `udhcpc` is deliberately **left running**: it is the one process that
 might still finish the job, and the caller reports failure honestly rather than
 killing it and claiming success.
+
+On platforms without `wifi_init.sh`, the saved supplicant is restarted once at
+10 s if it is still unassociated. This covers a measured A30 failure where the
+first daemon disappeared during the radio transition but the watchdog's later
+replay of the identical command succeeded. The ending-session UI names the
+**original Wi-Fi** throughout; if the foreground deadline expires it says that
+recovery is continuing rather than looking like a reconnect to ad hoc.
 
 **The breadcrumb is removed only on success.** `NS_wifiRecoverIfStranded` and
 `NS_wifiRestore` both used to `remove(state/wifi_restore)` unconditionally after
@@ -448,6 +459,11 @@ Neither alone is sufficient and the second removes the bootstrap problem, so the
 "agree over WiFi, then create ad hoc" sequence is no longer needed. The client
 keeps its place on the existing network until it commits to joining, and ~20
 SSIDs are visible from the A30 while associated.
+
+If both mechanisms see the same host, the rows are merged without losing the
+fact that the SSID scan succeeded. The resulting row is labelled with the
+`nextui-XXXX` SSID, and the result count is the number actually found by the
+scan—not the number remaining after duplicate removal.
 
 The scan reads `wpa_cli -p <ctrl> -i wlan0 scan_results` - the supplicant's
 cached results, which return in **0 s** - and only falls back to `iw dev wlan0

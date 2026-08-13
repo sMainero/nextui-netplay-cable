@@ -54,9 +54,18 @@ static bool fe_environment(unsigned cmd, void* data) {
 		return false;
 	}
 }
-static int video_frames = 0, audio_batches = 0;
+static int video_frames = 0, audio_batches = 0, overlay_pixels_seen = 0;
 static void fe_video_refresh(const void* d, unsigned w, unsigned h, size_t p) {
 	video_frames++;
+	if (getenv("HARNESS_EXPECT_OVERLAY") && d) {
+		const uint16_t* pixels = d;
+		for (unsigned y = 0; y < h && !overlay_pixels_seen; y++)
+			for (unsigned x = 0; x < w; x++)
+				if (pixels[(size_t)y * (p / sizeof(*pixels)) + x]) {
+					overlay_pixels_seen = 1;
+					break;
+				}
+	}
 	if (video_frames <= 3) printf("fe:video_refresh %ux%u\n", w, h);
 }
 static void fe_audio_sample(int16_t l, int16_t r)                { printf("fe:audio_sample\n"); }
@@ -199,6 +208,10 @@ int main(int argc, char** argv) {
 	struct timeval t0, t1;
 	gettimeofday(&t0, NULL);
 	for (int i = 0; i < frames; i++) {
+		if (getenv("HARNESS_RESET_AT") && i == atoi(getenv("HARNESS_RESET_AT"))) {
+			printf("fe:reset_request at=%d\n", i); fflush(stdout);
+			reset();
+		}
 		if (getenv("HARNESS_DIE_AT") && i == atoi(getenv("HARNESS_DIE_AT"))) {
 			printf("fe:process_crash at=%d\n", i); fflush(stdout);
 			_exit(86);
@@ -237,6 +250,8 @@ int main(int argc, char** argv) {
 	}
 
 	CHECK(get_region() == RETRO_REGION_NTSC, "get_region not forwarded");
+	if (getenv("HARNESS_EXPECT_OVERLAY"))
+		CHECK(overlay_pixels_seen, "startup notice was not drawn over the core frame");
 	if (getenv("HARNESS_EXPECT_NO_PERSISTENCE")) {
 		CHECK(get_memory_size(RETRO_MEMORY_SAVE_RAM) == 0,
 		      "shared-screen guest exposed SRAM size");

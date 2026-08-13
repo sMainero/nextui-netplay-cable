@@ -97,3 +97,4 @@ This is an unofficial modification. Use at your own risk. Always backup your SD 
 
 - [NextUI](https://github.com/LoveRetro/NextUI) by LoveRetro
 - [mohammadsyuhada](https://github.com/mohammadsyuhada/nextui-netplay) for original netplay implementation
+- My son, who wanted to trade Pokemon with me

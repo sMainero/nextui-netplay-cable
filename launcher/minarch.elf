@@ -74,27 +74,75 @@ case "$PLATFORM" in
 	*)     COMPAT_ARCH=aarch64 ;;
 esac
 COMPAT_CORE="$NP/cores/compatibility/$COMPAT_ARCH/$CORE_NAME"
+# The A30's stock SFC pak asks for Snes9x 2005. Compatibility negotiation marks
+# that requested identity, but deliberately routes it to the portable Supafaust
+# artifact shared with the other platforms under the canonical snes9x filename.
+if [ "$CORE_ID" = "snes9x2005" ]; then
+	COMPAT_CORE="$NP/cores/compatibility/$COMPAT_ARCH/snes9x_libretro.so"
+fi
 NETPLAY_CORE="$NP/cores/override/$PLATFORM/$CORE_NAME"
+DUAL_GAMBATTE_CORE="$NP/cores/override/$PLATFORM/gambatte_dual_libretro.so"
+CORE_NOTICE=""
 
 # The stock gambatte has Game Link compiled out and stock gpSP lacks this
 # pak's RFU fixes. During an armed session these two packaged builds are the
 # implementation, not merely a version fallback.
 case "$CORE_ID" in
-	gambatte|gpsp)
+	gambatte)
+		# Same-ROM GB/GBC link sessions use the paired core: both consoles and
+		# the serial cable stay in-process, while the shim exchanges only inputs.
+		# If the paired artifact is absent, retain the network-link core below.
+		if [ -n "$NETPLAY_SESSION" ] &&
+		   grep -q '^instanced_gambatte=1$' "$NETPLAY_SESSION" 2>/dev/null &&
+		   [ -f "$DUAL_GAMBATTE_CORE" ]; then
+			REAL_CORE="$DUAL_GAMBATTE_CORE"
+			NETPLAY_DUAL_CORE=1
+			export NETPLAY_DUAL_CORE
+		elif [ -f "$NETPLAY_CORE" ]; then
+			REAL_CORE="$NETPLAY_CORE"
+		fi
+		if [ "$REAL_CORE" != "$CORE" ]; then
+			NETPLAY_COMPAT_CORE=1
+			export NETPLAY_COMPAT_CORE
+			CORE_NOTICE=compatibility
+		fi
+		;;
+	gpsp)
 		if [ -f "$NETPLAY_CORE" ]; then
 			REAL_CORE="$NETPLAY_CORE"
 			NETPLAY_COMPAT_CORE=1
 			export NETPLAY_COMPAT_CORE
+			CORE_NOTICE=compatibility
 		fi
 		;;
 esac
-if [ -n "$NETPLAY_SESSION" ] &&
+if [ "$NETPLAY_DUAL_CORE" != "1" ] && [ -n "$NETPLAY_SESSION" ] &&
    grep -q "^compat_core\.$CORE_ID=1$" "$NETPLAY_SESSION" 2>/dev/null &&
    [ -f "$COMPAT_CORE" ]; then
 	REAL_CORE="$COMPAT_CORE"
 	NETPLAY_COMPAT_CORE=1
 	export NETPLAY_COMPAT_CORE
+	CORE_NOTICE=compatibility
 	echo "[netplay] installed cores differ; using compatibility core for $CORE_NAME" >&2
+fi
+
+# If negotiation found no common fallback (including when the option is off),
+# retain the installed core but tell the player that determinism is no longer
+# assured. A selected compatibility artifact missing at launch is treated the
+# same way: it is unexpected, but warning and continuing is the requested UX.
+if [ -n "$NETPLAY_SESSION" ] &&
+   grep -q "^compat_core\.$CORE_ID=1$" "$NETPLAY_SESSION" 2>/dev/null &&
+   [ ! -f "$COMPAT_CORE" ]; then
+	CORE_NOTICE=mismatch
+	echo "[netplay] selected compatibility core missing; using installed core" >&2
+elif [ -z "$CORE_NOTICE" ] && [ -n "$NETPLAY_SESSION" ] &&
+     grep -q "^core_mismatch\.$CORE_ID=1$" "$NETPLAY_SESSION" 2>/dev/null; then
+	CORE_NOTICE=mismatch
+fi
+
+if [ -n "$CORE_NOTICE" ]; then
+	NETPLAY_CORE_NOTICE="$CORE_NOTICE"
+	export NETPLAY_CORE_NOTICE
 fi
 
 SHIM_DIR="$NP/cores"
@@ -114,5 +162,55 @@ fi
 
 NETPLAY_REAL_CORE="$REAL_CORE"
 export NETPLAY_REAL_CORE
+
+# NextUI's ordinary per-system log is truncated by every launch. In verbose
+# mode, mirror the complete emulator process output into an immutable file so
+# a crash is not erased by the rejoin attempt that follows it. Launches are
+# grouped by game and session id, but never appended to one ambiguous stream:
+# each process gets its own timestamp/role/pid file.
+if [ -n "$NETPLAY_SESSION" ] &&
+   grep -q '^verbose_logs=1$' "$NETPLAY_SESSION" 2>/dev/null &&
+   command -v tee >/dev/null 2>&1; then
+	: "${USERDATA_PATH:=$SDCARD_PATH/.userdata/$PLATFORM}"
+	ROM_PATH="$1"
+	GAME_NAME="$(basename "$ROM_PATH")"
+	SAFE_GAME="$(printf '%s' "$GAME_NAME" | sed 's/[^A-Za-z0-9._-]/_/g')"
+	[ -n "$SAFE_GAME" ] || SAFE_GAME=unknown-game
+	SESSION_ID="$(sed -n 's/^session_id=//p' "$NETPLAY_SESSION" | head -n 1)"
+	ROLE="$(sed -n 's/^role=//p' "$NETPLAY_SESSION" | head -n 1)"
+	case "$SESSION_ID" in *[!0-9A-Fa-f]*|'') SESSION_ID=unknown-session ;; esac
+	case "$ROLE" in host|client) ;; *) ROLE=unknown ;; esac
+	LOG_DIR="$USERDATA_PATH/logs/netplay-games/$SAFE_GAME/$SESSION_ID"
+	STAMP="$(date +%Y%m%d-%H%M%S 2>/dev/null)"
+	[ -n "$STAMP" ] || STAMP=unknown-time
+	LOG_BASENAME="$LOG_DIR/$STAMP-$ROLE-$$"
+	ARCHIVE_LOG="$LOG_BASENAME.log"
+	LOG_SEQUENCE=1
+	while [ -e "$ARCHIVE_LOG" ]; do
+		ARCHIVE_LOG="$LOG_BASENAME-$LOG_SEQUENCE.log"
+		LOG_SEQUENCE=$((LOG_SEQUENCE + 1))
+	done
+	STATUS_FILE="/tmp/netplay-minarch-status-$$"
+	if mkdir -p "$LOG_DIR" 2>/dev/null; then
+		{
+			echo "=== Netplay game process ==="
+			echo "time=$STAMP platform=$PLATFORM role=$ROLE session=$SESSION_ID pid=$$"
+			echo "rom=$ROM_PATH"
+			echo "requested_core=$CORE"
+			echo "real_core=$REAL_CORE"
+			"$REAL_MINARCH" "$SHIM_AS" "$@"
+			rc=$?
+			echo "=== process exited status=$rc ==="
+			printf '%s\n' "$rc" > "$STATUS_FILE"
+		} 2>&1 | tee "$ARCHIVE_LOG"
+		if [ -f "$STATUS_FILE" ]; then
+			read rc < "$STATUS_FILE"
+			rm -f "$STATUS_FILE"
+		else
+			rc=1
+		fi
+		exit "$rc"
+	fi
+fi
 
 exec "$REAL_MINARCH" "$SHIM_AS" "$@"
