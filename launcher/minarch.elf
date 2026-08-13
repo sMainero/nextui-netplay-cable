@@ -86,25 +86,36 @@ CORE_NOTICE=""
 
 # The stock gambatte has Game Link compiled out and stock gpSP lacks this
 # pak's RFU fixes. During an armed session these two packaged builds are the
-# implementation, not merely a version fallback.
+# implementation, not merely a version fallback - so they get their own notice
+# ("net-enabled core"), distinct from the compatibility artifact that is only
+# ever selected because two devices' installed builds disagree.
+#
+# NETPLAY_SERIAL_FALLBACK names the file the shim writes when a pairing turns
+# out not to be hostable on both devices. It is created *by that process*, so
+# a stale one from a crash must not silently demote the next launch: the retry
+# loop at the bottom removes it before every attempt.
+SERIAL_FALLBACK_MARKER="/tmp/netplay-serial-fallback.$$"
 case "$CORE_ID" in
 	gambatte)
-		# Same-ROM GB/GBC link sessions use the paired core: both consoles and
-		# the serial cable stay in-process, while the shim exchanges only inputs.
-		# If the paired artifact is absent, retain the network-link core below.
+		# GB/GBC link sessions use the paired core: both consoles and the serial
+		# cable stay in-process, while the shim exchanges only inputs. Linked
+		# cartridges may differ, but each device must own both of them; when the
+		# shim finds it cannot, it asks for the relaunch handled below. If the
+		# paired artifact is absent, retain the network-link core.
 		if [ -n "$NETPLAY_SESSION" ] &&
+		   [ "$NETPLAY_DUAL_DISABLE" != "1" ] &&
 		   grep -q '^instanced_gambatte=1$' "$NETPLAY_SESSION" 2>/dev/null &&
 		   [ -f "$DUAL_GAMBATTE_CORE" ]; then
 			REAL_CORE="$DUAL_GAMBATTE_CORE"
 			NETPLAY_DUAL_CORE=1
-			export NETPLAY_DUAL_CORE
+			NETPLAY_SERIAL_FALLBACK="$SERIAL_FALLBACK_MARKER"
+			export NETPLAY_DUAL_CORE NETPLAY_SERIAL_FALLBACK
+			CORE_NOTICE=paired
 		elif [ -f "$NETPLAY_CORE" ]; then
 			REAL_CORE="$NETPLAY_CORE"
-		fi
-		if [ "$REAL_CORE" != "$CORE" ]; then
 			NETPLAY_COMPAT_CORE=1
 			export NETPLAY_COMPAT_CORE
-			CORE_NOTICE=compatibility
+			CORE_NOTICE=netlink
 		fi
 		;;
 	gpsp)
@@ -112,7 +123,7 @@ case "$CORE_ID" in
 			REAL_CORE="$NETPLAY_CORE"
 			NETPLAY_COMPAT_CORE=1
 			export NETPLAY_COMPAT_CORE
-			CORE_NOTICE=compatibility
+			CORE_NOTICE=netlink
 		fi
 		;;
 esac
@@ -130,7 +141,10 @@ fi
 # retain the installed core but tell the player that determinism is no longer
 # assured. A selected compatibility artifact missing at launch is treated the
 # same way: it is unexpected, but warning and continuing is the requested UX.
-if [ -n "$NETPLAY_SESSION" ] &&
+#
+# The paired core is chosen for what it is, not because two builds disagreed,
+# so a compatibility verdict about the ordinary gambatte must not relabel it.
+if [ "$NETPLAY_DUAL_CORE" != "1" ] && [ -n "$NETPLAY_SESSION" ] &&
    grep -q "^compat_core\.$CORE_ID=1$" "$NETPLAY_SESSION" 2>/dev/null &&
    [ ! -f "$COMPAT_CORE" ]; then
 	CORE_NOTICE=mismatch
@@ -167,50 +181,95 @@ export NETPLAY_REAL_CORE
 # mode, mirror the complete emulator process output into an immutable file so
 # a crash is not erased by the rejoin attempt that follows it. Launches are
 # grouped by game and session id, but never appended to one ambiguous stream:
-# each process gets its own timestamp/role/pid file.
+# each process gets its own timestamp/role/pid file. A demotion relaunch is a
+# second process and gets its own file for the same reason.
+VERBOSE_LOGS=0
 if [ -n "$NETPLAY_SESSION" ] &&
    grep -q '^verbose_logs=1$' "$NETPLAY_SESSION" 2>/dev/null &&
    command -v tee >/dev/null 2>&1; then
-	: "${USERDATA_PATH:=$SDCARD_PATH/.userdata/$PLATFORM}"
-	ROM_PATH="$1"
-	GAME_NAME="$(basename "$ROM_PATH")"
-	SAFE_GAME="$(printf '%s' "$GAME_NAME" | sed 's/[^A-Za-z0-9._-]/_/g')"
-	[ -n "$SAFE_GAME" ] || SAFE_GAME=unknown-game
-	SESSION_ID="$(sed -n 's/^session_id=//p' "$NETPLAY_SESSION" | head -n 1)"
-	ROLE="$(sed -n 's/^role=//p' "$NETPLAY_SESSION" | head -n 1)"
-	case "$SESSION_ID" in *[!0-9A-Fa-f]*|'') SESSION_ID=unknown-session ;; esac
-	case "$ROLE" in host|client) ;; *) ROLE=unknown ;; esac
-	LOG_DIR="$USERDATA_PATH/logs/netplay-games/$SAFE_GAME/$SESSION_ID"
-	STAMP="$(date +%Y%m%d-%H%M%S 2>/dev/null)"
-	[ -n "$STAMP" ] || STAMP=unknown-time
-	LOG_BASENAME="$LOG_DIR/$STAMP-$ROLE-$$"
-	ARCHIVE_LOG="$LOG_BASENAME.log"
-	LOG_SEQUENCE=1
-	while [ -e "$ARCHIVE_LOG" ]; do
-		ARCHIVE_LOG="$LOG_BASENAME-$LOG_SEQUENCE.log"
-		LOG_SEQUENCE=$((LOG_SEQUENCE + 1))
-	done
-	STATUS_FILE="/tmp/netplay-minarch-status-$$"
-	if mkdir -p "$LOG_DIR" 2>/dev/null; then
-		{
-			echo "=== Netplay game process ==="
-			echo "time=$STAMP platform=$PLATFORM role=$ROLE session=$SESSION_ID pid=$$"
-			echo "rom=$ROM_PATH"
-			echo "requested_core=$CORE"
-			echo "real_core=$REAL_CORE"
-			"$REAL_MINARCH" "$SHIM_AS" "$@"
-			rc=$?
-			echo "=== process exited status=$rc ==="
-			printf '%s\n' "$rc" > "$STATUS_FILE"
-		} 2>&1 | tee "$ARCHIVE_LOG"
-		if [ -f "$STATUS_FILE" ]; then
-			read rc < "$STATUS_FILE"
-			rm -f "$STATUS_FILE"
-		else
-			rc=1
-		fi
-		exit "$rc"
-	fi
+	VERBOSE_LOGS=1
 fi
 
-exec "$REAL_MINARCH" "$SHIM_AS" "$@"
+run_minarch() {
+	if [ "$VERBOSE_LOGS" = "1" ]; then
+		: "${USERDATA_PATH:=$SDCARD_PATH/.userdata/$PLATFORM}"
+		ROM_PATH="$1"
+		GAME_NAME="$(basename "$ROM_PATH")"
+		SAFE_GAME="$(printf '%s' "$GAME_NAME" | sed 's/[^A-Za-z0-9._-]/_/g')"
+		[ -n "$SAFE_GAME" ] || SAFE_GAME=unknown-game
+		SESSION_ID="$(sed -n 's/^session_id=//p' "$NETPLAY_SESSION" | head -n 1)"
+		ROLE="$(sed -n 's/^role=//p' "$NETPLAY_SESSION" | head -n 1)"
+		case "$SESSION_ID" in *[!0-9A-Fa-f]*|'') SESSION_ID=unknown-session ;; esac
+		case "$ROLE" in host|client) ;; *) ROLE=unknown ;; esac
+		LOG_DIR="$USERDATA_PATH/logs/netplay-games/$SAFE_GAME/$SESSION_ID"
+		STAMP="$(date +%Y%m%d-%H%M%S 2>/dev/null)"
+		[ -n "$STAMP" ] || STAMP=unknown-time
+		LOG_BASENAME="$LOG_DIR/$STAMP-$ROLE-$$"
+		ARCHIVE_LOG="$LOG_BASENAME.log"
+		LOG_SEQUENCE=1
+		while [ -e "$ARCHIVE_LOG" ]; do
+			ARCHIVE_LOG="$LOG_BASENAME-$LOG_SEQUENCE.log"
+			LOG_SEQUENCE=$((LOG_SEQUENCE + 1))
+		done
+		STATUS_FILE="/tmp/netplay-minarch-status-$$"
+		if mkdir -p "$LOG_DIR" 2>/dev/null; then
+			{
+				echo "=== Netplay game process ==="
+				echo "time=$STAMP platform=$PLATFORM role=$ROLE session=$SESSION_ID pid=$$"
+				echo "rom=$ROM_PATH"
+				echo "requested_core=$CORE"
+				echo "real_core=$REAL_CORE"
+				"$REAL_MINARCH" "$SHIM_AS" "$@"
+				rc=$?
+				echo "=== process exited status=$rc ==="
+				printf '%s\n' "$rc" > "$STATUS_FILE"
+			} 2>&1 | tee "$ARCHIVE_LOG"
+			if [ -f "$STATUS_FILE" ]; then
+				read rc < "$STATUS_FILE"
+				rm -f "$STATUS_FILE"
+			else
+				rc=1
+			fi
+			return "$rc"
+		fi
+	fi
+	"$REAL_MINARCH" "$SHIM_AS" "$@"
+}
+
+# Nothing to demote from and nothing to capture: hand the process straight over,
+# exactly as before. Anything else needs this shell to outlive minarch.
+if [ "$NETPLAY_DUAL_CORE" != "1" ] && [ "$VERBOSE_LOGS" != "1" ]; then
+	exec "$REAL_MINARCH" "$SHIM_AS" "$@"
+fi
+if [ "$NETPLAY_DUAL_CORE" != "1" ]; then
+	run_minarch "$@"
+	exit $?
+fi
+
+# Instanced link needs both devices to own both cartridges, and neither device
+# can know that until two running games have compared notes. The paired core
+# has no network Game Link of its own - it owns the cable between its own two
+# consoles - so a pairing that cannot be hosted here has to become a different
+# process running the net-enabled core. The shim writes the marker and asks the
+# frontend to shut down; we relaunch once, with instancing off.
+#
+# Once, deliberately. The second attempt cannot ask for a third, so a bug in the
+# negotiation costs a reload rather than an unbreakable loop.
+rm -f "$SERIAL_FALLBACK_MARKER"
+run_minarch "$@"
+rc=$?
+if [ -f "$SERIAL_FALLBACK_MARKER" ]; then
+	REASON="$(cat "$SERIAL_FALLBACK_MARKER" 2>/dev/null)"
+	rm -f "$SERIAL_FALLBACK_MARKER"
+	if [ -f "$NETPLAY_CORE" ]; then REAL_CORE="$NETPLAY_CORE"; else REAL_CORE="$CORE"; fi
+	echo "[netplay] instanced link declined (reason=$REASON); relaunching $CORE_NAME on network serial" >&2
+	NETPLAY_REAL_CORE="$REAL_CORE"
+	NETPLAY_DUAL_DISABLE=1
+	NETPLAY_CORE_NOTICE=serial-fallback
+	NETPLAY_DUAL_CORE=
+	unset NETPLAY_SERIAL_FALLBACK
+	export NETPLAY_REAL_CORE NETPLAY_DUAL_DISABLE NETPLAY_CORE_NOTICE NETPLAY_DUAL_CORE
+	run_minarch "$@"
+	rc=$?
+fi
+exit "$rc"

@@ -16,7 +16,10 @@
 #include <unistd.h>
 
 #define NETLINK_MAGIC    0x4E504C4BU /* 'NPLK' */
-#define NETLINK_PROTOCOL 9
+/* 10: CMD_STATE carries a transfer kind and completed transfers are queued
+ *     rather than overwritten; CMD_SESSION_IDENTITY carries rom_size;
+ *     CMD_LINK_VERDICT added. */
+#define NETLINK_PROTOCOL 10
 
 #define QUEUE_SIZE    512
 /* Inputs are indexed by frame; the ring only has to outlast the input delay
@@ -24,6 +27,15 @@
 #define INPUT_RING    256
 #define HASH_RING       8
 #define STATE_CHUNK   1024
+/* {total, offset, kind} ahead of every chunk's bytes. */
+#define STATE_HEADER    12
+/* Completed state transfers waiting for the emulator thread. One transfer is
+ * reassembled at a time, but a finished one is queued rather than overwritten:
+ * the instanced-link bootstrap sends two payloads back to back (peer save
+ * memory, then the paired checkpoint) while the consumer reads at most one per
+ * frontend frame. Four is far more than any exchange needs and bounds the
+ * memory a peer can pin here. */
+#define STATE_QUEUE     4
 /* Stop reading the socket above this; TCP holds the rest for us. */
 #define QUEUE_HIGH_WATER (QUEUE_SIZE - 64)
 #define HEARTBEAT_MS  1000
@@ -48,7 +60,7 @@ enum {
 	CMD_PAUSE = 0x03, /* our frontend stalled; hold off */
 	CMD_RESUME = 0x04,
 	CMD_INPUT  = 0x05, /* {frame, buttons} */
-	CMD_STATE  = 0x06, /* {total, offset, bytes} */
+	CMD_STATE  = 0x06, /* {total, offset, kind, bytes} */
 	CMD_HASH   = 0x07, /* {frame, hash} */
 	CMD_RESYNC_REQUEST = 0x08, /* {mismatched frame} */
 	CMD_RESYNC_BEGIN   = 0x09, /* {epoch, resume_frame, kind}; CMD_STATE follows */
@@ -56,6 +68,7 @@ enum {
 	CMD_RESYNC_COMMIT  = 0x0B, /* {epoch} */
 	CMD_SESSION_IDENTITY = 0x0C, /* {rom sha256, mode, delay, core/state/save identity} */
 	CMD_CHECKPOINT_ACK = 0x0D, /* {frame, hash, matched} */
+	CMD_LINK_VERDICT   = 0x0E, /* {can_pair, reason} - instanced-link agreement */
 };
 
 typedef struct __attribute__((packed)) {
@@ -102,10 +115,19 @@ static struct {
 		bool     valid;
 	} inputs[INPUT_RING];
 
+	/* In-progress reassembly. */
 	uint8_t* state_buf;
 	size_t   state_len;
 	size_t   state_have;
-	bool     state_ready;
+	uint32_t state_kind;
+
+	/* Completed transfers, oldest first. */
+	struct {
+		uint8_t* buf;
+		size_t   len;
+		uint32_t kind;
+	}        state_done[STATE_QUEUE];
+	unsigned state_done_head, state_done_count;
 
 	struct {
 		uint32_t frame;
@@ -138,6 +160,9 @@ static struct {
 
 	NetLinkSessionIdentity peer_session_identity;
 	bool peer_session_identity_ready;
+	uint32_t link_verdict_reason;
+	bool link_verdict_can_pair;
+	bool link_verdict_ready;
 	uint32_t checkpoint_ack_frame;
 	uint32_t checkpoint_ack_hash;
 	bool checkpoint_ack_matched;
@@ -439,6 +464,31 @@ static void queue_push(const uint8_t* data, size_t len) {
 	nl.q_tail = next;
 }
 
+/* Hand a finished transfer to the emulator thread. Takes ownership of buf on
+ * success. Caller holds nl.lock. */
+static bool push_state_locked(uint8_t* buf, size_t len, uint32_t kind) {
+	if (nl.state_done_count >= STATE_QUEUE) return false;
+	unsigned slot = (nl.state_done_head + nl.state_done_count) % STATE_QUEUE;
+	nl.state_done[slot].buf = buf;
+	nl.state_done[slot].len = len;
+	nl.state_done[slot].kind = kind;
+	nl.state_done_count++;
+	return true;
+}
+
+static void clear_states_locked(void) {
+	while (nl.state_done_count) {
+		free(nl.state_done[nl.state_done_head].buf);
+		nl.state_done[nl.state_done_head].buf = NULL;
+		nl.state_done_head = (nl.state_done_head + 1) % STATE_QUEUE;
+		nl.state_done_count--;
+	}
+	free(nl.state_buf);
+	nl.state_buf = NULL;
+	nl.state_len = nl.state_have = 0;
+	nl.state_kind = 0;
+}
+
 // Always say why. "peer lost" alone is not diagnosable after the fact, and the
 // interesting failures here are all distinguishable at the point of detection.
 static void drop_connection(const char* reason) {
@@ -451,6 +501,15 @@ static void drop_connection(const char* reason) {
 		 * strands us waiting for a CMD_RESUME that can never arrive. */
 		nl.peer_paused = false;
 		nl.told_peer_paused = false;
+		/* Everything the departed peer told us dies with it, so a reconnecting
+		 * process cannot be accepted on the strength of its predecessor's
+		 * handshake. This runs on the worker thread, ahead of any byte of the
+		 * next connection. */
+		clear_states_locked();
+		nl.peer_session_identity_ready = false;
+		nl.link_verdict_ready = false;
+		nl.resync_request_ready = nl.resync_begin_ready = false;
+		nl.resync_ack_ready = nl.resync_commit_ready = false;
 		nl_log("peer lost: %s (rx %ldms ago, tx %ldms ago, %u pkts in, %u dropped)\n",
 		       reason, ms_since(&nl.last_rx), ms_since(&nl.last_tx),
 		       nl.rx_count, nl.dropped);
@@ -611,35 +670,54 @@ static void* worker(void* arg) {
 			pthread_mutex_unlock(&nl.lock);
 		}
 
-		if (hdr.cmd == CMD_STATE && size > 8) {
+		if (hdr.cmd == CMD_STATE && size > STATE_HEADER) {
 			uint32_t total = ntohl(*(uint32_t*)buf);
 			uint32_t off   = ntohl(*(uint32_t*)(buf + 4));
-			size_t   n     = size - 8;
+			uint32_t kind  = ntohl(*(uint32_t*)(buf + 8));
+			size_t   n     = size - STATE_HEADER;
 
 			pthread_mutex_lock(&nl.lock);
 			bool valid = total != 0 && total <= NETLINK_MAX_STATE &&
 			             off <= total && n <= total - off;
 			if (!valid) {
 				nl_log("bad state chunk (total=%u off=%u n=%zu) - ignoring\n", total, off, n);
-			} else if (!nl.state_buf || nl.state_len != total || off == 0) {
+			} else if (off == 0) {
+				/* A new transfer starts. Anything half-received is abandoned; a
+				 * transfer that already completed is safe on the done queue. */
 				free(nl.state_buf);
 				nl.state_buf = malloc(total);
-				nl.state_len = total;
+				nl.state_len = nl.state_buf ? total : 0;
 				nl.state_have = 0;
-				nl.state_ready = false;
+				nl.state_kind = kind;
 			}
-			if (valid && nl.state_buf && nl.state_len == total && off == nl.state_have) {
-				memcpy(nl.state_buf + off, buf + 8, n);
+			if (valid && nl.state_buf && nl.state_len == total &&
+			    nl.state_kind == kind && off == nl.state_have) {
+				memcpy(nl.state_buf + off, buf + STATE_HEADER, n);
 				nl.state_have += n;
-				if (nl.state_have >= total) nl.state_ready = true;
-			} else if (valid && nl.state_buf && off != nl.state_have) {
-				nl_log("out-of-order state chunk (wanted=%zu got=%u) - discarding\n",
-				       nl.state_have, off);
+				if (nl.state_have >= total) {
+					if (!push_state_locked(nl.state_buf, total, kind)) {
+						nl_log("state queue full - dropping a %u-byte kind=%u transfer\n",
+						       total, kind);
+						free(nl.state_buf);
+					}
+					nl.state_buf = NULL;
+					nl.state_len = nl.state_have = 0;
+				}
+			} else if (valid && nl.state_buf) {
+				nl_log("out-of-order state chunk (wanted=%zu/kind=%u got=%u/kind=%u)"
+				       " - discarding\n", nl.state_have, nl.state_kind, off, kind);
 				free(nl.state_buf);
 				nl.state_buf = NULL;
 				nl.state_len = nl.state_have = 0;
-				nl.state_ready = false;
 			}
+			pthread_mutex_unlock(&nl.lock);
+		}
+
+		if (hdr.cmd == CMD_LINK_VERDICT && size == 8) {
+			pthread_mutex_lock(&nl.lock);
+			nl.link_verdict_can_pair = ntohl(*(uint32_t*)buf) != 0;
+			nl.link_verdict_reason = ntohl(*(uint32_t*)(buf + 4));
+			nl.link_verdict_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
 
@@ -708,11 +786,9 @@ static void* worker(void* arg) {
 			nl.resync_begin_kind = kind == NETLINK_RECOVERY_RESET
 			                     ? NETLINK_RECOVERY_RESET : NETLINK_RECOVERY_SYNC;
 			nl.resync_begin_ready = true;
-			/* BEGIN owns the state stream which follows it. */
-			free(nl.state_buf);
-			nl.state_buf = NULL;
-			nl.state_len = nl.state_have = 0;
-			nl.state_ready = false;
+			/* BEGIN owns the state stream which follows it: anything still
+			 * queued or half-received belongs to an abandoned attempt. */
+			clear_states_locked();
 			pthread_mutex_unlock(&nl.lock);
 		}
 
@@ -731,7 +807,7 @@ static void* worker(void* arg) {
 			pthread_mutex_unlock(&nl.lock);
 		}
 
-		if (hdr.cmd == CMD_SESSION_IDENTITY && size == 56) {
+		if (hdr.cmd == CMD_SESSION_IDENTITY && size == 60) {
 			pthread_mutex_lock(&nl.lock);
 			memcpy(nl.peer_session_identity.rom_sha256, buf, 32);
 			nl.peer_session_identity.mode = ntohl(*(uint32_t*)(buf + 32));
@@ -740,6 +816,7 @@ static void* worker(void* arg) {
 			nl.peer_session_identity.state_size = ntohl(*(uint32_t*)(buf + 44));
 			nl.peer_session_identity.sram_size = ntohl(*(uint32_t*)(buf + 48));
 			nl.peer_session_identity.rtc_size = ntohl(*(uint32_t*)(buf + 52));
+			nl.peer_session_identity.rom_size = ntohl(*(uint32_t*)(buf + 56));
 			nl.peer_session_identity_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
@@ -865,12 +942,16 @@ void NetLink_resetTimeline(void) {
 void NetLink_resetSync(void) {
 	pthread_mutex_lock(&nl.lock);
 	reset_timeline_locked();
-	free(nl.state_buf);
-	nl.state_buf = NULL;
-	nl.state_len = nl.state_have = 0;
-	nl.state_ready = false;
+	clear_states_locked();
 	nl.resync_request_ready = nl.resync_begin_ready = false;
 	nl.resync_ack_ready = nl.resync_commit_ready = false;
+	/* Deliberately not the peer identity or the link verdict. Both peers detect
+	 * a new connection at different moments - the client is connected as soon as
+	 * connect() returns, the host only once its greeting completes - so the peer
+	 * can legitimately have sent its identity before this side gets here.
+	 * Discarding it strands both. Staleness is handled where it belongs, at
+	 * drop_connection(): anything from the connection that just died is cleared
+	 * before the next one can deliver anything. */
 	pthread_mutex_unlock(&nl.lock);
 }
 
@@ -900,21 +981,39 @@ bool NetLink_getRemoteInput(uint32_t frame, uint32_t* buttons) {
 	return ok;
 }
 
-bool NetLink_sendState(const void* data, size_t len) {
+bool NetLink_sendState(NetLinkStateKind kind, const void* data, size_t len) {
+	if (!len || len > NETLINK_MAX_STATE) return false;
 	const uint8_t* p = data;
 	for (size_t off = 0; off < len; off += STATE_CHUNK) {
 		size_t n = len - off;
 		if (n > STATE_CHUNK) n = STATE_CHUNK;
 
-		uint8_t pkt[8 + STATE_CHUNK];
-		uint32_t hdr[2] = { htonl((uint32_t)len), htonl((uint32_t)off) };
-		memcpy(pkt, hdr, 8);
-		memcpy(pkt + 8, p + off, n);
+		uint8_t pkt[STATE_HEADER + STATE_CHUNK];
+		uint32_t hdr[3] = { htonl((uint32_t)len), htonl((uint32_t)off), htonl((uint32_t)kind) };
+		memcpy(pkt, hdr, STATE_HEADER);
+		memcpy(pkt + STATE_HEADER, p + off, n);
 
-		bool ok = send_command(CMD_STATE, pkt, n + 8);
+		bool ok = send_command(CMD_STATE, pkt, n + STATE_HEADER);
 		if (!ok) return false;
 	}
 	return true;
+}
+
+bool NetLink_sendLinkVerdict(bool can_pair, uint32_t reason) {
+	uint32_t wire[2] = { htonl(can_pair ? 1u : 0u), htonl(reason) };
+	return send_command(CMD_LINK_VERDICT, wire, sizeof(wire));
+}
+
+bool NetLink_takeLinkVerdict(bool* can_pair, uint32_t* reason) {
+	pthread_mutex_lock(&nl.lock);
+	bool ok = nl.link_verdict_ready;
+	if (ok) {
+		if (can_pair) *can_pair = nl.link_verdict_can_pair;
+		if (reason) *reason = nl.link_verdict_reason;
+		nl.link_verdict_ready = false;
+	}
+	pthread_mutex_unlock(&nl.lock);
+	return ok;
 }
 
 #if 0 /* Frozen executable-sharing API. */
@@ -966,16 +1065,21 @@ bool NetLink_takeCore(void** data, size_t* len) {
 }
 #endif
 
-bool NetLink_takeState(void** data, size_t* len) {
+/* Kinds keep the two bootstrap transfers apart even if they arrive back to
+ * back: a payload of the wrong kind stays queued rather than being handed to a
+ * caller that would reject it and fail the session. */
+bool NetLink_takeState(NetLinkStateKind kind, void** data, size_t* len) {
 	pthread_mutex_lock(&nl.lock);
-	if (!nl.state_ready) { pthread_mutex_unlock(&nl.lock); return false; }
-	*data = nl.state_buf;
-	*len  = nl.state_len;
-	nl.state_buf = NULL;
-	nl.state_len = nl.state_have = 0;
-	nl.state_ready = false;
+	bool ok = nl.state_done_count && nl.state_done[nl.state_done_head].kind == (uint32_t)kind;
+	if (ok) {
+		*data = nl.state_done[nl.state_done_head].buf;
+		*len  = nl.state_done[nl.state_done_head].len;
+		nl.state_done[nl.state_done_head].buf = NULL;
+		nl.state_done_head = (nl.state_done_head + 1) % STATE_QUEUE;
+		nl.state_done_count--;
+	}
 	pthread_mutex_unlock(&nl.lock);
-	return true;
+	return ok;
 }
 
 bool NetLink_sendHash(uint32_t frame, uint32_t hash) {
@@ -984,7 +1088,7 @@ bool NetLink_sendHash(uint32_t frame, uint32_t hash) {
 }
 
 bool NetLink_sendSessionIdentity(const NetLinkSessionIdentity* identity) {
-	uint8_t wire[56];
+	uint8_t wire[60];
 	memcpy(wire, identity->rom_sha256, 32);
 	uint32_t v = htonl(identity->mode); memcpy(wire + 32, &v, 4);
 	v = htonl(identity->input_delay); memcpy(wire + 36, &v, 4);
@@ -992,6 +1096,7 @@ bool NetLink_sendSessionIdentity(const NetLinkSessionIdentity* identity) {
 	v = htonl(identity->state_size); memcpy(wire + 44, &v, 4);
 	v = htonl(identity->sram_size); memcpy(wire + 48, &v, 4);
 	v = htonl(identity->rtc_size); memcpy(wire + 52, &v, 4);
+	v = htonl(identity->rom_size); memcpy(wire + 56, &v, 4);
 	return send_command(CMD_SESSION_IDENTITY, wire, sizeof(wire));
 }
 

@@ -365,7 +365,7 @@ static void render(SDL_Surface* s) {
 		case SET_SIMPLE:
 			hint = "Planned: accept invitations for matching local games."; break;
 		case SET_INSTANCED:
-			hint = "Gambatte: local link; WiFi carries delayed inputs."; break;
+			hint = "Both devices, and both carts on each. Else link cable."; break;
 		}
 		y = draw_line(s, hint, y, COLOR_GRAY, true);
 		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);

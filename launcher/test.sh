@@ -34,6 +34,10 @@ cat > "$SYSTEM_PATH/bin/minarch.elf" <<'EOF'
 [ "$NETPLAY_DUAL_CORE" = "1" ] && echo "dual=1"
 [ -n "$NETPLAY_CORE_NOTICE" ] && echo "notice=$NETPLAY_CORE_NOTICE"
 echo "minarch core=$1 rom=$2 real=$NETPLAY_REAL_CORE session=$NETPLAY_SESSION"
+# Stand in for the shim deciding this pairing cannot run instanced here.
+if [ "$FAKE_WRITE_FALLBACK" = "1" ] && [ -n "$NETPLAY_SERIAL_FALLBACK" ]; then
+	echo 1 > "$NETPLAY_SERIAL_FALLBACK"
+fi
 EOF
 chmod 755 "$SYSTEM_PATH/bin/minarch.elf"
 
@@ -162,8 +166,8 @@ echo "$OUT" | grep -q "real=$NP/cores/override/$PLATFORM/gpsp_libretro.so" \
 	&& ok "packaged gpSP used for link implementation" || bad "packaged gpSP ignored: $OUT"
 echo "$OUT" | grep -q "compat=1" \
 	&& ok "packaged-core launch is marked" || bad "compatibility environment missing: $OUT"
-echo "$OUT" | grep -q "notice=compatibility" \
-	&& ok "packaged-core startup notice selected" || bad "compatibility notice missing: $OUT"
+echo "$OUT" | grep -q "notice=netlink" \
+	&& ok "net-enabled core gets its own startup notice" || bad "netlink notice missing: $OUT"
 echo "$OUT" | grep -q "core=$NP/cores/gpsp_libretro.so" \
 	&& ok "shim still staged under the real core name" || bad "shim name wrong: $OUT"
 
@@ -181,6 +185,22 @@ echo "$OUT" | grep -q "real=$NP/cores/override/$PLATFORM/gambatte_dual_libretro.
 	&& echo "$OUT" | grep -q "dual=1" \
 	&& ok "instanced GB link selected the paired Gambatte core" \
 	|| bad "paired Gambatte selection failed: $OUT"
+echo "$OUT" | grep -q "notice=paired" \
+	&& ok "paired core is announced as itself, not as a compatibility core" \
+	|| bad "paired notice missing: $OUT"
+
+# A pairing neither device can host demotes to the net-enabled core. The shim
+# writes the marker and asks to shut down; one relaunch, and only one.
+OUT=$(NETPLAY_SESSION="$ROOT/dual.session" FAKE_WRITE_FALLBACK=1 \
+	"$ROOT/Emus/$PLATFORM/GB.pak/launch.sh" /roms/game.gb 2>&1)
+echo "$OUT" | grep -q "instanced link declined" \
+	&& ok "declined pairing is reported" || bad "no demotion message: $OUT"
+echo "$OUT" | grep -q "real=$NP/cores/override/$PLATFORM/gambatte_libretro.so" \
+	&& ok "demotion relaunched on the network-serial core" || bad "no serial relaunch: $OUT"
+echo "$OUT" | grep -q "notice=serial-fallback" \
+	&& ok "demotion explains itself to the player" || bad "no fallback notice: $OUT"
+[ "$(echo "$OUT" | grep -c 'dual=1')" -eq 1 ] \
+	&& ok "demotion relaunches exactly once" || bad "relaunch loop: $OUT"
 printf 'role=host\nport=55437\nmode=link\ninstanced_gambatte=0\n' > "$ROOT/serial.session"
 OUT=$(NETPLAY_SESSION="$ROOT/serial.session" "$ROOT/Emus/$PLATFORM/GB.pak/launch.sh" /roms/game.gb 2>&1)
 echo "$OUT" | grep -q "real=$NP/cores/override/$PLATFORM/gambatte_libretro.so" \

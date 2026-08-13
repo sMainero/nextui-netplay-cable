@@ -112,9 +112,34 @@ void NetLink_resetSync(void);
 void NetLink_resetTimeline(void);
 
 /* Both sides must start from bit-identical state, so the host ships one.
- * Chunked: a save state is far larger than a packet. */
-bool NetLink_sendState(const void* data, size_t len);
-bool NetLink_takeState(void** data, size_t* len);  /* caller frees */
+ * Chunked: a save state is far larger than a packet.
+ *
+ * Every transfer is tagged. The instanced-link bootstrap sends two payloads
+ * back to back and the consumer reads at most one per frontend frame, so a
+ * finished transfer is queued rather than overwritten and a take of the wrong
+ * kind returns false instead of handing over a payload that would be rejected
+ * and fail the session. */
+typedef enum {
+	NETLINK_STATE_AUTHORITATIVE = 0, /* shared-screen core state + raw SRAM/RTC */
+	NETLINK_STATE_CONSOLE_MEMORY = 1, /* one logical console's raw SRAM/RTC */
+	NETLINK_STATE_PAIRED_CHECKPOINT = 2, /* both emulators + link coordinator */
+} NetLinkStateKind;
+
+bool NetLink_sendState(NetLinkStateKind kind, const void* data, size_t len);
+bool NetLink_takeState(NetLinkStateKind kind, void** data, size_t* len); /* caller frees */
+
+/* Instanced-link agreement. Each side reports whether it can host both logical
+ * consoles locally; pairing proceeds only when both say yes. Reason codes are
+ * NetLinkLinkReason and exist so the peer's overlay can explain the demotion. */
+typedef enum {
+	NETLINK_LINK_OK = 0,
+	NETLINK_LINK_NO_PEER_ROM = 1,   /* peer's cartridge is not installed here */
+	NETLINK_LINK_NO_PAIRED_CORE = 2,/* paired core or ABI unavailable here */
+	NETLINK_LINK_CORE_MISMATCH = 3, /* builds differ */
+} NetLinkLinkReason;
+
+bool NetLink_sendLinkVerdict(bool can_pair, uint32_t reason);
+bool NetLink_takeLinkVerdict(bool* can_pair, uint32_t* reason);
 
 /* Periodic agreement check. Without it a divergence is silent and the two
  * games quietly tell different stories. */
@@ -123,12 +148,16 @@ bool NetLink_takeHash(uint32_t* frame, uint32_t* hash);
 
 typedef struct {
 	uint8_t  rom_sha256[32];
-	uint32_t mode;          /* 1 = shared-screen; link identity follows separately */
+	uint32_t mode;          /* 1 = shared-screen, 2 = instanced link */
 	uint32_t input_delay;   /* timeline priming must agree exactly */
 	uint32_t core_identity;
 	uint32_t state_size;
 	uint32_t sram_size;
 	uint32_t rtc_size;
+	/* Instanced link only. Linked cartridges may legitimately differ (Red/Blue,
+	 * Seasons/Ages), so the peer's ROM has to be findable locally rather than
+	 * merely equal to ours - and a size narrows that search to a hash or two. */
+	uint32_t rom_size;
 } NetLinkSessionIdentity;
 
 /* Sent afresh on each TCP connection, before any serialized state is accepted. */

@@ -580,10 +580,13 @@ static bool io_all(int fd, void* buf, size_t len, bool writing) {
 	return true;
 }
 
+static bool instanced_gambatte_available(void);
+
 static bool send_manifest(int fd, NS_CoreInfo* m, int n) {
-	uint32_t hdr[4] = { htonl(CORE_MAGIC), htonl((uint32_t)n),
+	uint32_t hdr[5] = { htonl(CORE_MAGIC), htonl((uint32_t)n),
 	                    htonl(NS_settings()->compatibility_cores ? 1u : 0u),
-	                    htonl(NS_settings()->force_compatibility ? 1u : 0u) };
+	                    htonl(NS_settings()->force_compatibility ? 1u : 0u),
+	                    htonl(instanced_gambatte_available() ? 1u : 0u) };
 	if (!io_all(fd, hdr, sizeof(hdr), true)) return false;
 	for (int i = 0; i < n; i++) {
 		CoreWire w;
@@ -603,13 +606,15 @@ static bool send_manifest(int fd, NS_CoreInfo* m, int n) {
 }
 
 static int recv_manifest(int fd, NS_CoreInfo* out, int max,
-                         bool* peer_compat_enabled, bool* peer_force_compatibility) {
-	uint32_t hdr[4];
+                         bool* peer_compat_enabled, bool* peer_force_compatibility,
+                         bool* peer_instanced) {
+	uint32_t hdr[5];
 	if (!io_all(fd, hdr, sizeof(hdr), false)) return -1;
 	if (ntohl(hdr[0]) != CORE_MAGIC) return -1;
 	int n = (int)ntohl(hdr[1]);
 	*peer_compat_enabled = ntohl(hdr[2]) != 0;
 	*peer_force_compatibility = ntohl(hdr[3]) != 0;
+	*peer_instanced = ntohl(hdr[4]) != 0;
 	if (n < 0 || n > NS_MAX_MANIFEST) return -1;
 
 	int kept = 0;
@@ -664,7 +669,8 @@ static bool compatibility_builds_match(const NS_CoreInfo* a, const NS_CoreInfo* 
  * launcher reads state/session while session.conf is the durable template. */
 static bool write_compat_file(const char* path,
                               const char selected[][32], int count,
-                              const char mismatched[][32], int mismatch_count) {
+                              const char mismatched[][32], int mismatch_count,
+                              bool instanced_gambatte) {
 	char tmp[560];
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	FILE* in = fopen(path, "r");
@@ -675,10 +681,16 @@ static bool write_compat_file(const char* path,
 	char line[512];
 	while (fgets(line, sizeof(line), in))
 		if (strncmp(line, "compat_core.", 12) &&
-		    strncmp(line, "core_mismatch.", 14)) fputs(line, out);
+		    strncmp(line, "core_mismatch.", 14) &&
+		    strncmp(line, "instanced_gambatte=", 19)) fputs(line, out);
 	for (int i = 0; i < count; i++) fprintf(out, "compat_core.%s=1\n", selected[i]);
 	for (int i = 0; i < mismatch_count; i++)
 		fprintf(out, "core_mismatch.%s=1\n", mismatched[i]);
+	/* NS_arm wrote this device's wish; the exchange replaces it with the
+	 * agreement. Instanced play cannot be one-sided - a device running the
+	 * paired core against a peer running the ordinary network-serial core has
+	 * nothing to talk to - and both session files are rewritten here. */
+	fprintf(out, "instanced_gambatte=%d\n", instanced_gambatte ? 1 : 0);
 
 	fclose(in);
 	if (fclose(out) != 0 || rename(tmp, path) != 0) {
@@ -688,8 +700,19 @@ static bool write_compat_file(const char* path,
 	return true;
 }
 
+/* Whether this device can even offer instanced play: the setting is on for
+ * Gambatte and the paired artifact is actually staged here. Both halves have to
+ * hold on both devices, so this is exchanged with the manifest and ANDed. */
+static bool instanced_gambatte_available(void) {
+	char path[512];
+	snprintf(path, sizeof(path), "%s/cores/override/%s/gambatte_dual_libretro.so",
+	         ns_pak, ns_platform);
+	return instanced_core_enabled("gambatte") && file_exists(path);
+}
+
 static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, int tn,
-								bool peer_enabled, bool peer_force) {
+								bool peer_enabled, bool peer_force,
+								bool peer_instanced) {
 	char selected[NS_MAX_MANIFEST][32];
 	char mismatched[NS_MAX_MANIFEST][32];
 	int count = 0;
@@ -726,18 +749,23 @@ static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, 
 			       MANIFEST_CORES[i]);
 		}
 	}
+	bool instanced = instanced_gambatte_available() && peer_instanced;
+	ns_log("instanced gambatte: here=%d peer=%d -> %s\n",
+	       instanced_gambatte_available() ? 1 : 0, peer_instanced ? 1 : 0,
+	       instanced ? "enabled" : "network serial");
+
 	char path[512];
 	snprintf(path, sizeof(path), "%s/session.conf", ns_pak);
-	if (!write_compat_file(path, selected, count, mismatched, mismatch_count)) {
+	if (!write_compat_file(path, selected, count, mismatched, mismatch_count, instanced)) {
 		ns_log("cannot update compatibility selections in session.conf\n");
 		return -1;
 	}
 	snprintf(path, sizeof(path), "%s/state/session", ns_pak);
-	if (!write_compat_file(path, selected, count, mismatched, mismatch_count)) {
+	if (!write_compat_file(path, selected, count, mismatched, mismatch_count, instanced)) {
 		ns_log("cannot update compatibility selections in active session\n");
 		/* Do not leave a durable selection that disagrees with the active file. */
 		snprintf(path, sizeof(path), "%s/session.conf", ns_pak);
-		write_compat_file(path, selected, 0, mismatched, 0);
+		write_compat_file(path, selected, 0, mismatched, 0, false);
 		return -1;
 	}
 	return count;
@@ -790,8 +818,10 @@ void NS_compatServeTick(void) {
 	NS_CoreInfo theirs[NS_MAX_MANIFEST];
 	bool peer_compat_enabled = false;
 	bool peer_force_compatibility = false;
+	bool peer_instanced = false;
 	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST,
-	                       &peer_compat_enabled, &peer_force_compatibility);
+	                       &peer_compat_enabled, &peer_force_compatibility,
+	                       &peer_instanced);
 	if (tn < 0 ||
 	    !send_manifest(fd, mine, n)) {
 		ns_log("core compatibility negotiation: manifest failed\n");
@@ -799,7 +829,8 @@ void NS_compatServeTick(void) {
 		return;
 	}
 	int selected = select_compatibility(mine, n, theirs, tn,
-	                                    peer_compat_enabled, peer_force_compatibility);
+	                                    peer_compat_enabled, peer_force_compatibility,
+	                                    peer_instanced);
 	if (selected < 0)
 		ns_log("core compatibility negotiation: could not activate selections\n");
 	else
@@ -900,13 +931,15 @@ int NS_compatSync(const char* host_ip, char* err, int errlen) {
 	NS_CoreInfo theirs[NS_MAX_MANIFEST];
 	bool peer_compat_enabled = false;
 	bool peer_force_compatibility = false;
+	bool peer_instanced = false;
 	if (!send_manifest(fd, mine, n)) {
 		close(fd);
 		snprintf(err, errlen, "manifest exchange failed");
 		return -1;
 	}
 	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST,
-	                       &peer_compat_enabled, &peer_force_compatibility);
+	                       &peer_compat_enabled, &peer_force_compatibility,
+	                       &peer_instanced);
 	if (tn < 0) {
 		close(fd);
 		snprintf(err, errlen, "manifest exchange failed");
@@ -914,7 +947,8 @@ int NS_compatSync(const char* host_ip, char* err, int errlen) {
 	}
 
 	int selected = select_compatibility(mine, n, theirs, tn,
-	                                    peer_compat_enabled, peer_force_compatibility);
+	                                    peer_compat_enabled, peer_force_compatibility,
+	                                    peer_instanced);
 	if (selected == -2)
 		snprintf(err, errlen, "forced compatibility core unavailable");
 	else if (selected < 0)

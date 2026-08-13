@@ -255,25 +255,32 @@ barrier. The host remains authoritative; this is not host migration.
 
 ## Local multi-instance mode
 
-### 14. Instanced cores — Partial; Gambatte prototype implemented
+### 14. Instanced cores — Partial; Gambatte implemented
 
-For Gambatte, each handheld now loads two physically distinct copies of the
-same core and the same ROM. The visible instance begins from that handheld's
-save; at startup each device sends its complete visible state (including raw
-SRAM/RTC), and the peer loads it into its hidden instance. The two local cores
-then use Gambatte's Game Link protocol over loopback while Wi-Fi carries only
-frame-numbered controller inputs through the existing input-delay buffer.
+For Gambatte, each handheld runs a paired core (`gambatte_dual_libretro.so`)
+holding both logical consoles and the cable between them. One core call per
+frontend frame advances the pair; Wi-Fi carries only frame-numbered controller
+inputs through the existing input-delay buffer, so no emulated serial exchange
+costs a network round trip. Only the locally visible console produces video and
+audio and only its save persists — the peer's console lives in-process and is
+discarded at teardown, exactly as a second handheld would be.
 
-This removes a Wi-Fi round trip from every emulated serial exchange. Both cores
-run concurrently for each frontend frame because Gambatte's serial master may
-block waiting for its local peer. Only the visible core emits video/audio and
-only its save persists. The hidden core uses a process-local save directory.
+At startup each device sends its own console's raw SRAM/RTC, the peer adopts it
+into the replica, and the host establishes one paired checkpoint so both devices
+hold bit-identical copies of both consoles before the first synchronized input
+frame.
 
-The prototype currently requires identical ROM content and matching Gambatte
-builds on both devices. Different-version Pokémon pairings remain on direct
-link mode: supporting them would require both cartridges to be available and
-identified on both handhelds. Disconnect/rejoin, reset, and continue-solo need
-an explicit two-core policy before this mode is production-ready.
+Different linked cartridges are supported — Red with Blue, Seasons with Ages —
+provided *both* cartridges are installed on *both* devices, because no ROM ever
+crosses the network. Both sides search for the peer's cartridge by size and
+SHA-256 and exchange a verdict; if either cannot host the pair, the game
+relaunches once on the network-serial core, which needs only one cartridge per
+device. Matching Gambatte builds are still required either way.
+
+A lost link is recoverable: the same Wait / Continue solo / Exit overlay as
+shared-screen sessions, with a reconnect re-pairing from scratch rather than
+resuming a timeline the peer cannot vouch for. Continue solo keeps the paired
+core and leaves the abandoned console on neutral input.
 
 gpSP and mGBA remain planned. This is core-specific orchestration, not a generic
 toggle over the existing one-core shim; their entries are visibly marked

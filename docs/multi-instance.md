@@ -2,15 +2,18 @@
 
 ## Status
 
-Dual-instance link play is experimental. The shipping Game Boy implementation
-currently loads two copies of the patched Gambatte libretro core, links them over
-localhost TCP, and sends only controller inputs between handhelds. It is correct
-enough to establish and sustain a Game Link session, but it is not fast enough on
-the tested A30/Brick pair.
+Dual-instance link play is experimental but is now built on the paired core:
+`gambatte_dual_libretro.so` holds both logical consoles and the cable between
+them, and one `retro_run` advances the pair. Wi-Fi carries only delayed,
+frame-indexed controller inputs.
 
-The replacement described here is under development. It will remain a separate
-prototype core until it passes correctness, performance, state-bootstrap, menu,
-and disconnect tests. The existing Gambatte core remains the fallback.
+It is selected only when both devices agree at arm time and both can host both
+cartridges at launch; otherwise the session runs ordinary network serial. It has
+not yet had the device testing listed at the end of this document.
+
+The earlier implementation - two copies of the core linked over localhost TCP -
+is retired. Its measurements are below because they are the argument for the
+current design, and the code is retained, disabled, in `shim/shim.c`.
 
 ## User-visible goal
 
@@ -46,48 +49,41 @@ Mirroring both simulations on both handhelds also means normal wireless jitter i
 absorbed by the existing input delay rather than stalling every serial transfer.
 The cost is that every handheld must have enough CPU for two emulator instances.
 
-## Current Gambatte implementation
+## Retired: the two-copy implementation
 
-The current implementation lives primarily in `shim/shim.c` and in three tracked
-Gambatte patches:
+The first implementation copied the selected Gambatte shared object to `/tmp` so
+`dlopen` would give it its own file-scope globals, loaded the same ROM into both
+copies, gave them distinct inputs, ran the hidden copy on a persistent worker
+thread, and linked them with Gambatte's own `NetSerial` over `127.0.0.1`. The
+host's visible copy was the local server and its hidden copy the local client;
+the guest reversed those roles, so the same logical console held the same
+GameLink role on both handhelds.
 
-- `gambatte-platforms.patch` adds the NextUI cross-build targets.
-- `gambatte-network-hardening.patch` makes GameLink's two-byte TCP protocol safer,
-  adds `TCP_NODELAY`, complete reads/writes, timeouts, and pacing diagnostics.
-- `gambatte-local-instance.patch` adds private `Local Server` and `Local Client`
-  modes and a short client rendezvous.
+Everything it needed from the core - the cross-build targets, the GameLink
+network hardening, and the private `Local Server`/`Local Client` modes - now
+lives in the pinned `bmpriest/gambatte-libretro` fork rather than in tracked
+patches. The patches that introduced them are kept for reference under
+`cores/patches/superseded/`; no build rule applies them.
 
-At launch, the shim copies the selected Gambatte shared object to `/tmp` so that
-`dlopen` creates a second set of the core's file-scope globals. It loads the same
-ROM into both cores, gives the visible and hidden instances distinct inputs, and
-runs the hidden instance on a persistent worker thread. The two instances still
-use Gambatte's `NetSerial` implementation over `127.0.0.1`.
-
-The host's visible instance is the local server and its hidden instance is the
-local client. The guest reverses those roles. Thus console identity is mirrored:
-the same logical console has the same GameLink role on both handhelds.
-
-### Bootstrap
-
-The devices exchange core identity and initial visible-console state. Each peer's
-visible state becomes the other peer's hidden state. Once both local pairs contain
-the same console-A and console-B states, frame-tagged inputs are scheduled with the
-negotiated delay and both local simulations advance.
+The shim-side code is kept, disabled behind `#if 0`, next to the live paired
+implementation in `shim/shim.c`. It is the shape a future core that cannot host
+two consoles itself would need again.
 
 ### Persistence
 
-Only the locally visible console may expose persistent SRAM to the frontend. The
-hidden console uses a temporary save/system directory and must not overwrite the
-visible console's files. Host SRAM may be supplied to a guest for the duration of
-the session, but guest-side copies do not persist after the session.
+Only the locally visible console exposes persistent SRAM to the frontend. In the
+paired core that is enforced by the core itself: `retro_get_memory_*` resolves to
+the visible console, and the peer console's memory exists only in-process and is
+discarded at teardown. Each device keeps its own save, as it would with a real
+cable.
 
-Save states are not supported during netplay. Paired recovery checkpoints are an
-internal protocol mechanism, not user save states.
+Save states are not supported during netplay. Paired checkpoints are an internal
+protocol mechanism, not user save states.
 
 ## Measurements from the A30/Brick test
 
-The persistent worker removed per-frame thread creation but did not make the
-current approach playable:
+These are the two-copy numbers. The persistent worker removed per-frame thread
+creation but did not make that approach playable:
 
 | Device | Visible role | Visible core | Hidden role | Hidden core | Pair | Speed |
 | --- | --- | ---: | --- | ---: | ---: | ---: |
@@ -203,18 +199,18 @@ scheduler, not a rewrite of its CPU, cartridge, video, or audio emulation.
 ## ROM identity
 
 Link mode requires matching link protocol and core build, but does not require
-matching ROM hashes. Each logical console's ROM identity must nevertheless match
-its mirror on the other handheld:
+matching ROM hashes - Red links to Blue, Seasons links to Ages. Each logical
+console's ROM identity must nevertheless match its mirror on the other handheld:
 
 ```text
 device A visible ROM == device B hidden ROM
 device B visible ROM == device A hidden ROM
 ```
 
-The first prototype may load the same ROM twice because that matches the current
-launcher flow. Supporting different linked ROMs requires negotiating both ROM
-identities and providing the peer's ROM content or locating an installed match;
-that is a separate feature from the scheduler itself.
+No ROM crosses the network, so this holds only when both cartridges are already
+installed on both devices. That is what the runtime agreement below establishes.
+When it does not hold, the pairing is declined and the session runs ordinary
+network serial instead, which needs only one cartridge per device.
 
 ## Correctness requirements
 
@@ -318,32 +314,126 @@ The maintained core is pinned from `bmpriest/gambatte-libretro` at commit
 the core responsible for two emulators and the local serial coordinator while
 the Netplay shim owns devices, transport, identity, input lockstep, and policy.
 
-The initial Netplay integration now:
+The Netplay integration now:
 
 - detects ABI v1 and its required capabilities at runtime;
 - selects console A on the host and console B on the guest;
-- loads the same selected ROM into both local consoles;
+- loads the selected cartridge into both local consoles, or one cartridge per
+  console when the two devices launched different linked games;
 - exchanges each device's raw SRAM/RTC into the peer-owned logical console;
 - has the host establish one authoritative paired checkpoint before play;
 - maps host input to logical A and guest input to logical B on both replicas;
 - advances one paired core call per frontend frame, with no second DSO or
   shadow-core worker;
+- pins `gambatte_gb_link_mode` to `Not Connected` so the core's ordinary network
+  Game Link never opens a socket beside the in-process coordinator;
 - encodes a link-console reset in the delayed input timeline so both replicas
   reset only the requesting player's logical console on the same frame;
 - persists only the locally visible console through the standard libretro
   memory API; peer memory remains in-process and disappears at teardown;
-- falls back to the ordinary network-serial Gambatte core when the requested
-  paired artifact or ABI is unavailable.
+- treats a lost link as recoverable, offering the same Wait / Continue solo /
+  Exit choice shared-screen sessions use, and re-pairing from scratch on
+  reconnect rather than resuming a timeline the peer cannot vouch for.
 
 The release package carries `gambatte_dual_libretro.so` per platform beside the
 ordinary Gambatte and gpSP implementation cores. These are implementation
-artifacts, not compatibility-core fallbacks.
+artifacts, not compatibility-core fallbacks, and the launcher says so: the
+startup notice reads "dual-instance core" for the paired build and "net-enabled
+core" for the packaged network-serial builds, leaving "compatibility core" to
+mean what it says.
+
+### Agreeing to pair
+
+Instanced play cannot be one-sided - a device running the paired core against a
+device running network serial has nothing to talk to - so it is agreed twice.
+
+At arm time the setup app already exchanges core manifests on `NS_CORE_PORT`.
+That exchange now also carries whether each device has Gambatte instancing
+switched on *and* has `gambatte_dual_libretro.so` staged. `instanced_gambatte=1`
+is written into both session files only if both say yes, so the common mismatch -
+one player has the setting off, or an older pak - never reaches a running game.
+
+At launch the two shims exchange cartridge identity, including ROM size. If the
+peer's cartridge differs from ours, each side searches its own `Roms` tree for a
+file of that exact size and then confirms the SHA-256; the size comes over the
+wire precisely so this is a directory walk and a hash or two rather than hashing
+a library. Archives are not opened, so a zipped copy of the peer's cartridge does
+not count. Each side then sends a verdict and both must say yes:
+
+```text
+A can host B's cartridge  AND  B can host A's cartridge  ->  instanced
+otherwise                                                ->  network serial
+```
+
+A no is not a failure. The shim writes the file named by `NETPLAY_SERIAL_FALLBACK`
+and asks the frontend to shut down; `launcher/minarch.elf` sees the marker,
+relaunches the same game once with `NETPLAY_DUAL_DISABLE=1`, and the ordinary
+network-serial core takes over. Once, deliberately: the second attempt cannot ask
+for a third.
+
+### Paired-state agreement
+
+Both replicas hold the same two consoles, so both hash them - there is no
+authority here the way there is in shared screen, and nothing to recover to
+either: an in-process cable has no resync protocol. Every `HASH_INTERVAL`
+frames each device serializes the pair, hashes it, and sends the value; the
+comparison happens whenever the peer's hash for that frame arrives, so a late
+hash is not itself a source of divergence. The first check is at frame 0, which
+is the assertion that the bootstrap checkpoint actually equalised both devices.
+
+A mismatch ends link play with `Consoles have diverged` and the ordinary
+Wait / Continue solo / Exit overlay. That is worth having even though it cannot
+repair anything: before it existed a divergence was silent, and both players
+simply watched the other's console do things it had never done.
+
+## Known broken: the coordinator is not deterministic
+
+Mirrored replicas require the paired core to be a pure function of (initial
+state, input sequence). `NetplayLocalSerialBus` is not, in four places:
+
+| Where | Why it diverges |
+| --- | --- |
+| `waitForService(ep, 250)` | a timed wait; whether a service slice runs at all is thread scheduling |
+| the service-slice loop | runs `runFor(..., 32)` a wall-clock-dependent number of times, so consoles advance different cycle counts for the same frame |
+| `send()` 50ms timeout | fabricates an `0xFF` into the emulated serial stream on one device only |
+| simultaneous-clock arbitration | "first claimant" is whoever wins the mutex |
+
+A fifth sits in the wrapper: `retro_run`'s frame-dupe gate returns without
+advancing either console, and `libretro_samples_count` is fed only by the
+*visible* console - console A on the host, console B on the guest - so the two
+devices skip on different frames while the shim advances `dual_frame` on both.
+
+This is fine for the single-device GBLC feasibility pak, where there is one
+simulation and nondeterminism is invisible. It cannot work for two devices, and
+it is why Tetris DX desynced immediately on an A30/Brick pair: the two SoCs
+never make the same scheduling choices. Fixing it is the phase-two
+cycle-aware yield/resume design, not a patch.
+
+### Measured: the CPU was never the problem
+
+From the same failing session, per paired frame:
+
+| | Brick (tg5040) | A30 (my282) |
+| --- | ---: | ---: |
+| core: primary / secondary / pair | 1.38 / 1.37 / 1.59 ms | 2.23 / 2.20 / 2.43 ms |
+| core: claimed capacity | 631 fps | 412 fps |
+| shim: measured paired call | 16.3 ms | 16.4 ms |
+| observed | 53.6 fps, 11% stalls | 48.0 fps, 20% stalls |
+
+Emulating both Game Boys costs 1.6-2.4ms. The other ~15ms is the two threads
+waiting on each other: `idle_polls` climbs at a steady 60 per frame and each
+poll is a `waitForService` that times out at the full 250us. 60 x 250us = 15ms,
+which accounts for the whole deficit on both devices.
+
+So both handhelds have six to ten times the headroom two consoles need, and the
+22-23fps of the two-copy implementation and the 48-53fps of this one were never
+CPU limits. They are the wrapper scheduler polling. The performance gate and the
+determinism requirement have the same fix.
 
 Still required before treating the path as complete:
 
-- periodic paired-state agreement checks and host-authoritative correction;
+- a deterministic serial coordinator (the above);
 - checkpoint persistence and correct host/guest process-crash rejoin;
-- explicit Continue Solo semantics for an in-process cable;
-- different-ROM discovery/loading; until then that case uses network serial;
 - device testing of menu pause, reset, disconnect, repeated launch, SRAM
-  ownership, and thermal/power behavior on ARMv7 and AArch64.
+  ownership, linked-cartridge pairs, and thermal/power behavior on ARMv7 and
+  AArch64.

@@ -174,6 +174,16 @@ void retro_run(void) {
 		state_blob[2] ^= 0x5A;
 		printf("core:state_corrupted run=%u\n", core_runs);
 	}
+#ifdef FAKE_DUAL
+	/* One replica quietly stops matching the other, the way a wall-clock
+	 * dependent serial coordinator does on real hardware. Only the paired
+	 * state changes; nothing tells the shim. */
+	const char* diverge_at = getenv("FAKE_DUAL_DIVERGE_AT");
+	if (diverge_at && core_runs == (unsigned)atoi(diverge_at)) {
+		dual_state[0][3] ^= 0x5A;
+		printf("core:dual_diverged run=%u\n", core_runs);
+	}
+#endif
 	core_runs++;
 
 	// FAKE_CORE_BLOCK_AT/_MS reproduce a link-capable core blocking inside

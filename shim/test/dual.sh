@@ -10,7 +10,7 @@ CC="${CC:-cc}"
 OUT=$(mktemp -d)
 PORT=${PORT:-$((42000 + ($$ % 18000)))}
 cleanup() {
-	kill "$HOST_PID" "$CLIENT_PID" 2>/dev/null || true
+	kill "$HOST_PID" "$CLIENT_PID" "$HOST2_PID" "$CLIENT2_PID" "$HOST3_PID" "$CLIENT3_PID" 2>/dev/null || true
 	if [ -n "$KEEP_TEST_OUTPUT" ]; then echo "test logs kept at $OUT"; else rm -rf "$OUT"; fi
 }
 trap cleanup EXIT
@@ -52,8 +52,13 @@ expect "$OUT/host.log"   "sent authoritative paired checkpoint" "host establishe
 expect "$OUT/client.log" "adopted authoritative paired checkpoint" "client adopted authoritative paired state"
 expect "$OUT/host.log"   "applied synchronized reset to console A" "host applied its logical-console reset"
 expect "$OUT/client.log" "applied synchronized peer reset to console A" "client mirrored the host console reset"
+expect "$OUT/host.log"   "instanced link agreed by both devices" "host recorded the pairing agreement"
+expect "$OUT/client.log" "instanced link agreed by both devices" "client recorded the pairing agreement"
+expect "$OUT/host.log"   "both consoles run the same cartridge" "host recognised the shared cartridge"
 expect "$OUT/host.log"   "serial is local and Wi-Fi is input-only" "host completed bootstrap"
 expect "$OUT/client.log" "serial is local and Wi-Fi is input-only" "client completed bootstrap"
+expect "$OUT/host.log"   "paired consoles agree at frame" "host confirmed paired-state agreement"
+expect "$OUT/client.log" "paired consoles agree at frame" "client confirmed paired-state agreement"
 expect "$OUT/host.log"   "core:ports p0=11 p1=22" "host mapped A/B inputs into the paired core"
 expect "$OUT/client.log" "core:ports p0=11 p1=22" "client mapped the same A/B inputs into its replica"
 host_runs=$(grep -c '^core:run$' "$OUT/host.log" || true)
@@ -65,8 +70,76 @@ client_runs=$(grep -c '^core:run$' "$OUT/client.log" || true)
 [ "$HRC" -eq 0 ] || { echo "  MISS host exited $HRC"; fail=1; }
 [ "$CRC" -eq 0 ] || { echo "  MISS client exited $CRC"; fail=1; }
 
+# Different cartridges are legal - Red links to Blue - but only when each device
+# owns both of them. Neither of these has the other's, so both must decline and
+# ask the launcher for the network-serial core rather than pairing anyway.
+echo
+echo "== declining a pairing neither device can host"
+printf 'role=host\nport=%s\nmode=link\ninput_delay=3\ninstanced_gambatte=1\n' "$((PORT + 1))" \
+	> "$OUT/host2.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\ninput_delay=3\ninstanced_gambatte=1\n' \
+	"$((PORT + 1))" > "$OUT/client2.session"
+
+FAKE_CORE_NAME=Gambatte FAKE_CORE_NO_NETPACKET=1 HARNESS_EXPECT_CORE_NAME=Gambatte \
+	HARNESS_ROM_ID=cartridge-red NETPLAY_REAL_CORE="$OUT/gambatte_libretro.so" \
+	NETPLAY_SERIAL_FALLBACK="$OUT/host.fallback" \
+	NETPLAY_SESSION="$OUT/host2.session" "$OUT/harness" "$SHIM" 180 5 > "$OUT/host2.log" 2>&1 &
+HOST2_PID=$!
+sleep 0.3
+FAKE_CORE_NAME=Gambatte FAKE_CORE_NO_NETPACKET=1 HARNESS_EXPECT_CORE_NAME=Gambatte \
+	HARNESS_ROM_ID=cartridge-blue NETPLAY_REAL_CORE="$OUT/gambatte_libretro.so" \
+	NETPLAY_SERIAL_FALLBACK="$OUT/client.fallback" \
+	NETPLAY_SESSION="$OUT/client2.session" "$OUT/harness" "$SHIM" 180 5 > "$OUT/client2.log" 2>&1 &
+CLIENT2_PID=$!
+wait "$HOST2_PID" 2>/dev/null || true
+wait "$CLIENT2_PID" 2>/dev/null || true
+
+expect "$OUT/host2.log"   "is not installed under" "host searched for the peer cartridge"
+expect "$OUT/host2.log"   "instanced link declined" "host declined the pairing"
+expect "$OUT/client2.log" "instanced link declined" "client declined the pairing"
+[ -f "$OUT/host.fallback" ] && echo "  ok   host asked the launcher for network serial" \
+	|| { echo "  MISS host wrote no fallback marker"; fail=1; }
+[ -f "$OUT/client.fallback" ] && echo "  ok   client asked the launcher for network serial" \
+	|| { echo "  MISS client wrote no fallback marker"; fail=1; }
+! grep -q "serial is local and Wi-Fi is input-only" "$OUT/host2.log" \
+	&& ok_msg="  ok   declined pairing never reached the input barrier" \
+	|| { ok_msg="  MISS declined pairing bootstrapped anyway"; fail=1; }
+echo "$ok_msg"
+
+# A replica that stops matching its peer used to be silent - each player simply
+# watched the other's console do something it had never done. It must now be
+# named, and it must land in the failure overlay rather than the dead end that
+# a terminal dual_failed would be.
+echo
+echo "== a diverged replica is detected and reported"
+printf 'role=host\nport=%s\nmode=link\ninput_delay=3\ninstanced_gambatte=1\n' "$((PORT + 2))" \
+	> "$OUT/host3.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\ninput_delay=3\ninstanced_gambatte=1\n' \
+	"$((PORT + 2))" > "$OUT/client3.session"
+
+FAKE_CORE_NAME=Gambatte FAKE_CORE_NO_NETPACKET=1 HARNESS_EXPECT_CORE_NAME=Gambatte \
+	FAKE_DUAL_DIVERGE_AT=40 NETPLAY_REAL_CORE="$OUT/gambatte_libretro.so" \
+	NETPLAY_SESSION="$OUT/host3.session" "$OUT/harness" "$SHIM" 900 3 > "$OUT/host3.log" 2>&1 &
+HOST3_PID=$!
+sleep 0.3
+FAKE_CORE_NAME=Gambatte FAKE_CORE_NO_NETPACKET=1 HARNESS_EXPECT_CORE_NAME=Gambatte \
+	NETPLAY_REAL_CORE="$OUT/gambatte_libretro.so" \
+	NETPLAY_SESSION="$OUT/client3.session" "$OUT/harness" "$SHIM" 900 3 > "$OUT/client3.log" 2>&1 &
+CLIENT3_PID=$!
+wait "$HOST3_PID" 2>/dev/null || true
+wait "$CLIENT3_PID" 2>/dev/null || true
+
+expect "$OUT/host3.log"   "core:dual_diverged" "host replica was made to diverge"
+expect "$OUT/host3.log"   "PAIRED DESYNC at frame" "host detected the divergence"
+expect "$OUT/client3.log" "PAIRED DESYNC at frame" "client detected the divergence"
+expect "$OUT/host3.log"   "Consoles have diverged" "host reported it to the player"
+
 if [ "$fail" -ne 0 ]; then
+	echo "--- host3 ---"; tail -n 40 "$OUT/host3.log"
+	echo "--- client3 ---"; tail -n 40 "$OUT/client3.log"
 	echo "--- host ---"; tail -n 100 "$OUT/host.log"
 	echo "--- client ---"; tail -n 100 "$OUT/client.log"
+	echo "--- host2 ---"; tail -n 60 "$OUT/host2.log"
+	echo "--- client2 ---"; tail -n 60 "$OUT/client2.log"
 fi
 exit "$fail"

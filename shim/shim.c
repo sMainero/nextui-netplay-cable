@@ -24,6 +24,7 @@
 
 #include <dlfcn.h>
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gnu/libc-version.h>
@@ -48,6 +49,10 @@
 #define SHIM_ENV_REAL_CORE "NETPLAY_REAL_CORE"
 #define SHIM_ENV_SESSION   "NETPLAY_SESSION"
 #define SHIM_ENV_NOTICE    "NETPLAY_CORE_NOTICE"
+#define SHIM_ENV_NO_DUAL   "NETPLAY_DUAL_DISABLE"
+/* Written when instanced link cannot be used for this pairing; the launcher
+ * relaunches once with the network-serial core. See request_serial_fallback. */
+#define SHIM_ENV_FALLBACK  "NETPLAY_SERIAL_FALLBACK"
 #define STARTUP_NOTICE_MS  2000
 
 /* Bound on packets handed to the core per frame. Without a cap, a peer that
@@ -176,17 +181,22 @@ typedef struct {
 
 static Core core;
 
-/* Gambatte instanced link: the visible core is paired with a second copy in
- * this process. They exchange serial bytes over loopback; only delayed,
- * frame-indexed controller inputs cross Wi-Fi. */
-static Core shadow_core;
+/* Gambatte instanced link: one paired core (gambatte_dual_libretro.so, dual ABI
+ * v1) holds both logical consoles and an in-process serial coordinator. Only
+ * delayed, frame-indexed controller inputs cross Wi-Fi. */
 static int dual_link_mode;
-static int dual_core_mode;
 static unsigned dual_local_console;
 static unsigned dual_peer_console;
 static int dual_bootstrapped;
 static int dual_identity_sent;
 static int dual_identity_checked;
+static int dual_verdict_sent;
+static int dual_verdict_agreed;
+/* Which peer cartridge the pair is currently built from, "" meaning our own
+ * loaded into both consoles. Compared rather than assumed, because a peer that
+ * reconnects may have relaunched a different game. */
+static char dual_content_rom[512];
+static int dual_content_built;
 static int dual_state_sent;
 static int dual_state_loaded;
 static int dual_checkpoint_sent;
@@ -201,28 +211,56 @@ static uint32_t dual_primary_buttons;
 static uint32_t dual_shadow_buttons;
 #define DUAL_INPUT_RESET 0x80000000u
 static int dual_reset_pending;
-static char shadow_core_path[256];
-/* The hidden core has to run concurrently with the visible core because either
- * side of Gambatte's local serial link may block waiting for the other. Keep
- * one worker alive for the game: creating and joining a pthread for every
- * emulated frame was measurable as a larger cost than Gambatte itself on the
- * A30. */
-static pthread_t shadow_worker_thread;
-static pthread_mutex_t shadow_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t shadow_worker_request = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t shadow_worker_complete = PTHREAD_COND_INITIALIZER;
-static int shadow_worker_started;
-static int shadow_worker_pending;
-static int shadow_worker_done;
-static int shadow_worker_stop;
-static uint32_t shadow_last_run_us;
-static uint64_t dual_visible_run_us;
-static uint64_t dual_shadow_run_us;
+static struct timeval dual_wait_since;
+/* Paired-state agreement. Both replicas hold the same two consoles, so both can
+ * hash them - there is no authority here the way there is in shared screen, and
+ * nothing to recover from either: an in-process cable has no resync protocol.
+ * The value is telling the players immediately instead of leaving them to
+ * discover it by watching each other's console do something it never did. */
+static void* dual_hash_buf;
+static size_t dual_hash_buf_len;
+static uint32_t dual_hash_skips;
 static uint64_t dual_pair_run_us;
-static uint32_t dual_visible_run_max_us;
-static uint32_t dual_shadow_run_max_us;
 static uint32_t dual_pair_run_max_us;
-static void stop_shadow_worker(void);
+
+/* Linked cartridges do not have to match: Red links to Blue, Seasons to Ages.
+ * What instanced play does require is that each handheld can run *both*
+ * consoles locally, because neither ROM ever crosses the network. When the
+ * peer's cartridge is not installed here, the session is demoted to ordinary
+ * network serial - see request_serial_fallback(). */
+static char dual_local_rom_path[512];
+static uint32_t dual_local_rom_size;
+static char dual_peer_rom_path[512];
+static int dual_peer_rom_found;
+static int dual_same_rom;
+static int dual_demoted;
+/* Our own cartridge, kept because retro_game_info.data belongs to the frontend
+ * and a linked pair has to be handed to the core again as two contents. */
+static void* dual_own_rom;
+static size_t dual_own_rom_len;
+
+static bool hash_content_path(Sha256* hash, const char* path, unsigned depth);
+static uint32_t timeval_delta_us(const struct timeval* from, const struct timeval* to);
+static long elapsed_ms(const struct timeval* since);
+static long peer_wait_timeout_ms(void);
+static void recovery_fail(const char* why);
+static bool failure_input_tick(void);
+static void failure_overlay_message(char* out, size_t len);
+
+static bool read_whole_file(const char* path, void** out, size_t* out_len) {
+	FILE* f = fopen(path, "rb");
+	if (!f) return false;
+	bool ok = fseek(f, 0, SEEK_END) == 0;
+	long len = ok ? ftell(f) : -1;
+	ok = ok && len > 0 && len <= 8L * 1024L * 1024L && fseek(f, 0, SEEK_SET) == 0;
+	void* buf = ok ? malloc((size_t)len) : NULL;
+	ok = buf && fread(buf, 1, (size_t)len, f) == (size_t)len;
+	fclose(f);
+	if (!ok) { free(buf); return false; }
+	*out = buf;
+	*out_len = (size_t)len;
+	return true;
+}
 
 // Callbacks the frontend handed us. We pass our own wrappers to the real core
 // and forward through these, so we can intercept in either direction.
@@ -320,7 +358,6 @@ static int session_active = 0;
  * directory in /tmp so those files can function during play but never touch
  * the user's persistent save tree. */
 static char guest_save_dir[256];
-static char shadow_save_dir[256];
 static char startup_notice[96];
 static struct timeval startup_notice_started;
 static unsigned startup_notice_frame;
@@ -1018,11 +1055,26 @@ static void ensure_loaded(void) {
 	const char* session = getenv(SHIM_ENV_SESSION);
 	session_active = (session && session[0] && NetLink_configure(session));
 	if (session_active) NetLink_start();
+	/* Four different reasons the running core is not the installed one, and the
+	 * player is owed the difference. "Compatibility" means the two devices'
+	 * builds disagreed and both fell back to a packaged one; the link cores are
+	 * substituted because NextUI builds them without the networking this pak
+	 * needs at all, which is an implementation detail rather than a fallback;
+	 * and the paired core is a different implementation again. */
 	const char* notice = getenv(SHIM_ENV_NOTICE);
 	if (session_active && notice) {
 		if (!strcmp(notice, "compatibility"))
 			snprintf(startup_notice, sizeof(startup_notice),
 			         "Starting with compatibility core...");
+		else if (!strcmp(notice, "netlink"))
+			snprintf(startup_notice, sizeof(startup_notice),
+			         "Starting with net-enabled core...");
+		else if (!strcmp(notice, "paired"))
+			snprintf(startup_notice, sizeof(startup_notice),
+			         "Starting with dual-instance core...");
+		else if (!strcmp(notice, "serial-fallback"))
+			snprintf(startup_notice, sizeof(startup_notice),
+			         "Cartridges not paired locally. Using link cable...");
 		else if (!strcmp(notice, "mismatch"))
 			snprintf(startup_notice, sizeof(startup_notice),
 			         "Core builds differ. Desyncs may occur...");
@@ -1063,17 +1115,21 @@ static void ensure_loaded(void) {
 		         override >= 0 ? "from session" : "from core");
 
 		input_delay = session_input_delay(session);
+		/* NETPLAY_DUAL_DISABLE is set by the launcher when a previous process of
+		 * this game demoted itself: the paired core is not even staged, so this
+		 * is belt and braces against relaunching into the same negotiation. */
+		const char* dual_disabled = getenv(SHIM_ENV_NO_DUAL);
 		bool dual_requested = !netplay_mode && core_is_gambatte() &&
-		                      session_instanced_gambatte(session);
-		dual_core_mode = dual_requested && core_has_dual_contract();
-		dual_link_mode = dual_core_mode;
-		if (dual_core_mode) {
+		                      session_instanced_gambatte(session) &&
+		                      !(dual_disabled && dual_disabled[0] == '1');
+		dual_link_mode = dual_requested && core_has_dual_contract();
+		if (dual_link_mode) {
 			dual_local_console = NetLink_getRole() == NETLINK_ROLE_HOST
 			                   ? GAMBATTE_DUAL_CONSOLE_A : GAMBATTE_DUAL_CONSOLE_B;
 			dual_peer_console = dual_local_console == GAMBATTE_DUAL_CONSOLE_A
 			                  ? GAMBATTE_DUAL_CONSOLE_B : GAMBATTE_DUAL_CONSOLE_A;
 			if (!core.dual_set_visible_console(dual_local_console)) {
-				dual_core_mode = dual_link_mode = 0;
+				dual_link_mode = 0;
 				shim_log("dual contract rejected visible-console selection; using network serial\n");
 			} else {
 				shim_log("Gambatte dual ABI v%u enabled (console %c visible); Wi-Fi carries inputs only\n",
@@ -1096,16 +1152,6 @@ static void ensure_loaded(void) {
 				guest_save_dir[0] = '\0';
 			} else {
 				shim_log("guest core-managed saves redirected to %s\n", guest_save_dir);
-			}
-		}
-		if (dual_link_mode && !dual_core_mode) {
-			snprintf(shadow_save_dir, sizeof(shadow_save_dir),
-			         "/tmp/netplay-shadow-%s%ld",
-			         session_id[0] ? session_id : "process-", (long)getpid());
-			if (mkdir(shadow_save_dir, 0700) != 0 && errno != EEXIST) {
-				shim_log("WARNING: cannot create hidden-core save directory %s: %s\n",
-				         shadow_save_dir, strerror(errno));
-				shadow_save_dir[0] = '\0';
 			}
 		}
 	}
@@ -1135,7 +1181,7 @@ static void shim_netpacket_send(int flags, const void* buf, size_t len, uint16_t
 static void shim_netpacket_poll_receive(void) {
 }
 
-static const char* dual_link_option(const char* key, bool shadow);
+static const char* dual_core_option(const char* key);
 
 static bool shim_environment(unsigned cmd, void* data) {
 	if (cmd == RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE) {
@@ -1180,8 +1226,8 @@ static bool shim_environment(unsigned cmd, void* data) {
 	if (cmd == RETRO_ENVIRONMENT_GET_VARIABLE && session_active && data) {
 		struct retro_variable* var = data;
 		if (dual_link_mode && var->key) {
-			const char* local = dual_link_option(var->key, false);
-			if (local) { var->value = local; return true; }
+			const char* pinned = dual_core_option(var->key);
+			if (pinned) { var->value = pinned; return true; }
 		}
 		const char* forced = var->key ? find_option_override(var->key) : NULL;
 		if (forced) {
@@ -1207,6 +1253,69 @@ static bool shim_environment(unsigned cmd, void* data) {
 
 	return fe_environment ? fe_environment(cmd, data) : false;
 }
+
+/* The paired core owns both consoles and the cable between them, so Gambatte's
+ * ordinary network Game Link must stay switched off inside it.
+ *
+ * This is not cosmetic. check_variables() still runs the stock handler in a
+ * NETPLAY_DUAL_INSTANCE build, and it acts on whatever this returns before the
+ * wrapper reattaches its private bus: "Network Server" would bind a real
+ * GameLink listener on the session's own Wi-Fi, and the "Local Server"/"Local
+ * Client" values the two-copy implementation used would open a loopback
+ * listener on every device plus a connect that can only ever be refused. The
+ * session file always carries gambatte_gb_link_* for the serial path, so an
+ * override here is required, not merely tidy. "Not Connected" takes the
+ * handler's default branch: gb_net_serial.stop() and setSerialIO(NULL), which
+ * the wrapper then replaces with the in-process coordinator. */
+static const char* dual_core_option(const char* key) {
+	if (!strcmp(key, "gambatte_gb_link_mode")) return "Not Connected";
+	return NULL;
+}
+
+#if 0
+/* ---------------------------------------------------------------------------
+ * Disabled: the two-copy ("shadow core") instanced link.
+ *
+ * The first instanced implementation copied gambatte_libretro.so to a second
+ * path so dlopen would give it its own file-scope globals, drove it from a
+ * persistent worker thread, and linked the two copies with Gambatte's own
+ * GameLink over loopback TCP. It established and sustained sessions correctly,
+ * but the clock-owning console's synchronous SerialIO::send() held an A30/Brick
+ * pair to 22-23fps whichever device owned the clock (docs/multi-instance.md).
+ *
+ * The paired core replaced it: gambatte_dual_libretro.so holds both consoles
+ * and an in-memory serial coordinator, and one retro_run advances the pair.
+ * These functions are kept, disabled, because the shape is what a future core
+ * that cannot host two consoles itself would need again, and because the
+ * measurements above are only meaningful next to the code that produced them.
+ *
+ * Reading this later: it was gated on `dual_link_mode && !dual_core_mode`.
+ * Those two flags were always equal by the time this was retired, which is what
+ * made the whole path unreachable; `dual_core_mode` is now gone and
+ * `dual_link_mode` alone means "paired core in use".
+ * ------------------------------------------------------------------------- */
+
+static Core shadow_core;
+static char shadow_core_path[256];
+static char shadow_save_dir[256];
+/* The hidden core has to run concurrently with the visible core because either
+ * side of Gambatte's local serial link may block waiting for the other. Keep
+ * one worker alive for the game: creating and joining a pthread for every
+ * emulated frame was measurable as a larger cost than Gambatte itself on the
+ * A30. */
+static pthread_t shadow_worker_thread;
+static pthread_mutex_t shadow_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t shadow_worker_request = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t shadow_worker_complete = PTHREAD_COND_INITIALIZER;
+static int shadow_worker_started;
+static int shadow_worker_pending;
+static int shadow_worker_done;
+static int shadow_worker_stop;
+static uint32_t shadow_last_run_us;
+static uint64_t dual_shadow_run_us;
+static uint32_t dual_shadow_run_max_us;
+static uint64_t dual_visible_run_us;
+static uint32_t dual_visible_run_max_us;
 
 static const char* dual_link_option(const char* key, bool shadow) {
 	static const char* digits = "127000000001";
@@ -1319,6 +1428,95 @@ static bool prepare_shadow_core(void) {
 	return true;
 }
 
+static void* shadow_worker_main(void* unused) {
+	(void)unused;
+	pthread_mutex_lock(&shadow_worker_mutex);
+	for (;;) {
+		while (!shadow_worker_pending && !shadow_worker_stop)
+			pthread_cond_wait(&shadow_worker_request, &shadow_worker_mutex);
+		if (shadow_worker_stop) break;
+		shadow_worker_pending = 0;
+		pthread_mutex_unlock(&shadow_worker_mutex);
+
+		struct timeval started, finished;
+		gettimeofday(&started, NULL);
+		shadow_core.run();
+		gettimeofday(&finished, NULL);
+		uint32_t elapsed = timeval_delta_us(&started, &finished);
+
+		pthread_mutex_lock(&shadow_worker_mutex);
+		shadow_last_run_us = elapsed;
+		shadow_worker_done = 1;
+		pthread_cond_signal(&shadow_worker_complete);
+	}
+	pthread_mutex_unlock(&shadow_worker_mutex);
+	return NULL;
+}
+
+static bool start_shadow_worker(void) {
+	if (shadow_worker_started) return true;
+	pthread_mutex_lock(&shadow_worker_mutex);
+	shadow_worker_pending = shadow_worker_done = shadow_worker_stop = 0;
+	int rc = pthread_create(&shadow_worker_thread, NULL, shadow_worker_main, NULL);
+	if (!rc) shadow_worker_started = 1;
+	pthread_mutex_unlock(&shadow_worker_mutex);
+	if (rc) dual_fail("Could not start the hidden Gambatte worker.");
+	else shim_log("persistent hidden-core worker started\n");
+	return rc == 0;
+}
+
+static void stop_shadow_worker(void) {
+	if (!shadow_worker_started) return;
+	pthread_mutex_lock(&shadow_worker_mutex);
+	shadow_worker_stop = 1;
+	pthread_cond_signal(&shadow_worker_request);
+	pthread_mutex_unlock(&shadow_worker_mutex);
+	pthread_join(shadow_worker_thread, NULL);
+	pthread_mutex_lock(&shadow_worker_mutex);
+	shadow_worker_started = 0;
+	shadow_worker_pending = shadow_worker_done = shadow_worker_stop = 0;
+	pthread_mutex_unlock(&shadow_worker_mutex);
+}
+
+/* Ran the visible core on this thread and the hidden core on the worker, then
+ * joined. Concurrency was mandatory: whichever console owned the link clock
+ * blocked inside GB::runFor() until its peer answered. */
+static bool run_shadow_pair(void) {
+	if (!start_shadow_worker()) return false;
+	struct timeval pair_started, visible_started, visible_finished, pair_finished;
+	gettimeofday(&pair_started, NULL);
+
+	pthread_mutex_lock(&shadow_worker_mutex);
+	shadow_worker_done = 0;
+	shadow_worker_pending = 1;
+	pthread_cond_signal(&shadow_worker_request);
+	pthread_mutex_unlock(&shadow_worker_mutex);
+
+	NetLink_setCoreRunning(true);
+	gettimeofday(&visible_started, NULL);
+	core.run();
+	gettimeofday(&visible_finished, NULL);
+
+	pthread_mutex_lock(&shadow_worker_mutex);
+	while (!shadow_worker_done)
+		pthread_cond_wait(&shadow_worker_complete, &shadow_worker_mutex);
+	uint32_t shadow_us = shadow_last_run_us;
+	pthread_mutex_unlock(&shadow_worker_mutex);
+	gettimeofday(&pair_finished, NULL);
+	NetLink_setCoreRunning(false);
+
+	uint32_t visible_us = timeval_delta_us(&visible_started, &visible_finished);
+	uint32_t pair_us = timeval_delta_us(&pair_started, &pair_finished);
+	dual_visible_run_us += visible_us;
+	dual_shadow_run_us += shadow_us;
+	dual_pair_run_us += pair_us;
+	if (visible_us > dual_visible_run_max_us) dual_visible_run_max_us = visible_us;
+	if (shadow_us > dual_shadow_run_max_us) dual_shadow_run_max_us = shadow_us;
+	if (pair_us > dual_pair_run_max_us) dual_pair_run_max_us = pair_us;
+	return true;
+}
+#endif /* two-copy instanced link */
+
 // Bring both sides to a bit-identical starting point. The host ships its state;
 // the client adopts it. Without this the two simulations differ from frame one
 // and every synced input afterwards is meaningless.
@@ -1335,8 +1533,16 @@ static uint32_t core_identity(void) {
 		for (const char* p = parts[i]; p && *p; p++) { h ^= (uint8_t)*p; h *= 16777619u; }
 
 	/* Serialize size differs between builds far more often than the version
-	 * string does, so fold it in. */
-	size_t sz = dual_core_mode ? core.dual_serialize_size() : core.serialize_size();
+	 * string does, so fold it in.
+	 *
+	 * Not for instanced link. There the state covers *both* consoles, so the
+	 * size depends on which two cartridges are loaded - and identity is
+	 * exchanged before the pair is rebuilt with one cartridge each, when the two
+	 * devices still hold their own game twice. Two handhelds carrying Red and
+	 * Blue would read as different builds. The paired ABI version answers the
+	 * same question without depending on content. */
+	size_t sz = dual_link_mode ? (size_t)core.dual_get_abi_version()
+	                           : core.serialize_size();
 	h ^= (uint32_t)sz;
 	h *= 16777619u;
 
@@ -1345,10 +1551,10 @@ static uint32_t core_identity(void) {
 	 * a mismatch" is exactly the case worth telling apart, because a differing
 	 * serialize_size means the two sides cannot exchange state at all, while a
 	 * differing version is only a build to line up. */
-	shim_log("core identity: name='%s' version='%s' serialize_size=%zu -> %08x\n",
+	shim_log("core identity: name='%s' version='%s' %s=%zu -> %08x\n",
 	         info.library_name ? info.library_name : "?",
 	         info.library_version ? info.library_version : "?",
-	         sz, h);
+	         dual_link_mode ? "paired_abi" : "serialize_size", sz, h);
 	return h;
 }
 
@@ -1719,7 +1925,7 @@ static void netplay_handshake(void) {
 	                      ? source_frame + RECOVERY_FRAME_JUMP : 0;
 	recovery_kind = NETLINK_RECOVERY_SYNC;
 	if (!NetLink_beginResync(recovery_epoch, recovery_resume_frame, recovery_kind) ||
-	    !NetLink_sendState(buf, sz)) {
+	    !NetLink_sendState(NETLINK_STATE_AUTHORITATIVE, buf, sz)) {
 		free(buf); return;
 	}
 	set_checkpoint_candidate(buf, sz, recovery_resume_frame, hash_bytes(buf, sz));
@@ -1789,9 +1995,17 @@ static bool desync_recovery_allowed(void) {
 /* Failed shared-screen sessions remain interactive through the ordinary
  * libretro joypad callback. Continuing solo changes only this emulator process:
  * the durable session and save/persistence restrictions remain in force. */
+static void dual_reset_bootstrap(void);
+
 static void retry_failed_session(void) {
 	NetLink_stop();
 	NetLink_resetSync();
+	if (dual_link_mode) {
+		/* The peer's replica of our console cannot be trusted across a break, so
+		 * a retry is a fresh pairing rather than a resumed timeline. */
+		dual_reset_bootstrap();
+		dual_generation = 0;
+	}
 	connection_generation = 0;
 	connection_identity_sent = connection_identity_checked = 0;
 	connection_sync_pending = 1;
@@ -1901,7 +2115,7 @@ static bool netplay_recovery_tick(void) {
 
 			bool sent = NetLink_beginResync(recovery_epoch, recovery_resume_frame,
 			                                recovery_kind) &&
-			            NetLink_sendState(buf, sz);
+			            NetLink_sendState(NETLINK_STATE_AUTHORITATIVE, buf, sz);
 			bool adopted = apply_authoritative_state(buf, sz);
 			if (!sent || !adopted) {
 				free(buf);
@@ -1936,7 +2150,7 @@ static bool netplay_recovery_tick(void) {
 			recovery_kind = NETLINK_RECOVERY_SYNC;
 			bool sent = NetLink_beginResync(recovery_epoch, recovery_resume_frame,
 			                                recovery_kind) &&
-			            NetLink_sendState(buf, sz);
+			            NetLink_sendState(NETLINK_STATE_AUTHORITATIVE, buf, sz);
 			bool adopted = apply_authoritative_state(buf, sz);
 			free(buf);
 
@@ -2003,7 +2217,7 @@ static bool netplay_recovery_tick(void) {
 	if (recovery_phase == RECOVERY_CLIENT_WAIT_STATE) {
 		void* buf = NULL;
 		size_t len = 0;
-		if (NetLink_takeState(&buf, &len)) {
+		if (NetLink_takeState(NETLINK_STATE_AUTHORITATIVE, &buf, &len)) {
 			bool loaded = apply_authoritative_state(buf, len);
 			free(buf);
 
@@ -2389,10 +2603,10 @@ static void shim_input_poll(void) {
 }
 
 static int16_t shim_input_state(unsigned port, unsigned device, unsigned index, unsigned id) {
-	if (dual_link_mode && dual_bootstrapped && device == RETRO_DEVICE_JOYPAD &&
-	    index == 0 && port < (dual_core_mode ? 2u : 1u)) {
-		uint32_t buttons = dual_primary_buttons;
-		if (dual_core_mode && port != dual_local_console) buttons = dual_shadow_buttons;
+	if (dual_link_mode && (dual_bootstrapped || solo_mode) &&
+	    device == RETRO_DEVICE_JOYPAD && index == 0 && port < 2) {
+		uint32_t buttons = port == dual_local_console
+		                 ? dual_primary_buttons : dual_shadow_buttons;
 		if (id == RETRO_DEVICE_ID_JOYPAD_MASK) return (int16_t)buttons;
 		return (buttons >> id) & 1;
 	}
@@ -2450,10 +2664,6 @@ void retro_set_input_state(retro_input_state_t cb) {
 void retro_init(void) {
 	ensure_loaded();
 	core.init();
-	if (dual_link_mode && !dual_core_mode && !prepare_shadow_core()) {
-		dual_failed = 1;
-		shim_log("instanced Gambatte disabled: %s\n", dual_error);
-	}
 }
 
 void retro_deinit(void) {
@@ -2477,17 +2687,12 @@ void retro_deinit(void) {
 	free(checkpoint_candidate);
 	checkpoint_candidate = NULL;
 	checkpoint_candidate_len = 0;
-
-	stop_shadow_worker();
-	if (shadow_core.handle) {
-		shadow_core.deinit();
-		dlclose(shadow_core.handle);
-		memset(&shadow_core, 0, sizeof(shadow_core));
-	}
-	if (shadow_core_path[0]) {
-		remove(shadow_core_path);
-		shadow_core_path[0] = '\0';
-	}
+	free(dual_own_rom);
+	dual_own_rom = NULL;
+	dual_own_rom_len = 0;
+	free(dual_hash_buf);
+	dual_hash_buf = NULL;
+	dual_hash_buf_len = 0;
 	core.deinit();
 }
 
@@ -2518,7 +2723,7 @@ void retro_set_controller_port_device(unsigned port, unsigned device) {
 
 void retro_reset(void) {
 	if (!core.handle) return;
-	if (dual_link_mode && dual_core_mode && !solo_mode) {
+	if (dual_link_mode && !solo_mode) {
 		if (!dual_bootstrapped || !core.dual_reset_console) {
 			show_runtime_notice("Reset unavailable while synchronizing.");
 			return;
@@ -2526,10 +2731,6 @@ void retro_reset(void) {
 		dual_reset_pending = 1;
 		show_runtime_notice("Resetting this linked console...");
 		shim_log("queued reset for logical console %c\n", dual_local_console ? 'B' : 'A');
-		return;
-	}
-	if (dual_link_mode && !solo_mode) {
-		show_runtime_notice("Reset unavailable in instanced GB link.");
 		return;
 	}
 	if (session_active && netplay_mode && !solo_mode) {
@@ -2566,37 +2767,272 @@ static const char* recovery_status_message(void) {
 	       : "Resynchronizing from host...";
 }
 
+/* A dual-link failure is recoverable unless it is a statement about the two
+ * builds. Everything that can be blamed on the network goes through the same
+ * Wait / Continue solo / Exit overlay shared-screen sessions already use, so a
+ * dropped packet costs a resynchronization rather than the session. */
 static void dual_fail(const char* message) {
 	dual_failed = 1;
 	snprintf(dual_error, sizeof(dual_error), "%s", message);
 	shim_log("instanced Gambatte failed: %s\n", dual_error);
 }
 
-/* Both handhelds start with their own visible console's complete state. Each
- * sends that state once and loads the peer's into its hidden console. This is
- * what carries SRAM/RTC into the replica without ever persisting the peer's
- * save locally. After this transaction, only inputs and diagnostics use Wi-Fi. */
+static void dual_reset_bootstrap(void) {
+	dual_identity_sent = dual_identity_checked = 0;
+	dual_verdict_sent = dual_verdict_agreed = 0;
+	dual_state_sent = dual_state_loaded = 0;
+	dual_checkpoint_sent = dual_checkpoint_loaded = 0;
+	dual_ready_sent = 0;
+	dual_bootstrapped = 0;
+	dual_peer_rom_found = dual_same_rom = 0;
+	dual_peer_rom_path[0] = '\0';
+	dual_wait_since.tv_sec = dual_wait_since.tv_usec = 0;
+	memset(own_hashes, 0, sizeof(own_hashes));
+	memset(pending_peer_hashes, 0, sizeof(pending_peer_hashes));
+	dual_hash_skips = 0;
+	NetLink_resetSync();
+}
+
+/* The transport is gone or misbehaving. Tear the pairing down to its bootstrap
+ * so the next connection generation re-establishes both consoles from scratch,
+ * and hand the player the ordinary failure overlay meanwhile. Resuming an
+ * instanced timeline across a reconnect is not possible: the peer's replica of
+ * our console advanced under inputs we can no longer prove it received. */
+static void dual_recoverable_fail(const char* message) {
+	if (recovery_failed) return;
+	dual_reset_bootstrap();
+	recovery_fail(message);
+}
+
+/* Hand the launcher a demotion request and ask the frontend to close. The
+ * paired core cannot speak Gambatte's network Game Link - it owns the cable
+ * between its own two consoles - so a pairing this device cannot host has to
+ * become a different process running the network-serial core. */
+static void request_serial_fallback(uint32_t reason) {
+	static const char* WHY[] = {
+		"agreed", "cartridge not installed on both devices",
+		"paired core unavailable", "core builds differ",
+	};
+	const char* why = reason < sizeof(WHY) / sizeof(WHY[0]) ? WHY[reason] : "unknown";
+	const char* marker = getenv(SHIM_ENV_FALLBACK);
+	if (marker && marker[0]) {
+		FILE* f = fopen(marker, "w");
+		if (f) { fprintf(f, "%u\n", reason); fclose(f); }
+		else shim_log("could not write serial-fallback marker %s: %s\n",
+		              marker, strerror(errno));
+	} else {
+		shim_log("no serial-fallback marker configured; cannot demote automatically\n");
+	}
+	shim_log("instanced link declined (%s); relaunching on network serial\n", why);
+	dual_demoted = 1;
+	exit_requested = 1;
+	if (fe_environment) fe_environment(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+}
+
+/* Find the peer's cartridge in the local library.
+ *
+ * Linked play does not require equal ROMs, but it does require that this
+ * device can run the peer's console, and no ROM ever crosses the network. Size
+ * comes over with the identity precisely so this is a directory walk plus a
+ * hash or two rather than hashing an entire Roms tree: distinct Game Boy
+ * cartridges of the same length are common, cheap to reject, and rare enough
+ * that the SHA-256 is computed only a handful of times.
+ *
+ * Archives are deliberately not opened. minarch hands us extracted content, so
+ * a zipped copy of the peer's ROM cannot be size-matched from the outside and
+ * that pairing falls back to network serial. */
+static bool rom_extension(const char* name) {
+	const char* dot = strrchr(name, '.');
+	return dot && (!strcasecmp(dot, ".gb") || !strcasecmp(dot, ".gbc") ||
+	               !strcasecmp(dot, ".dmg"));
+}
+
+static bool find_rom_by_hash(const char* dir, const uint8_t want[32], uint32_t size,
+                             unsigned depth, char* out, size_t out_len) {
+	if (depth > 4) return false;
+	DIR* d = opendir(dir);
+	if (!d) return false;
+	struct dirent* e;
+	bool found = false;
+	while (!found && (e = readdir(d))) {
+		if (e->d_name[0] == '.') continue;
+		char path[512];
+		if ((size_t)snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= sizeof(path))
+			continue;
+		struct stat st;
+		if (stat(path, &st) != 0) continue;
+		if (S_ISDIR(st.st_mode)) {
+			found = find_rom_by_hash(path, want, size, depth + 1, out, out_len);
+			continue;
+		}
+		if (!S_ISREG(st.st_mode) || (uint32_t)st.st_size != size || !rom_extension(e->d_name))
+			continue;
+		uint8_t have[32];
+		Sha256 hash;
+		sha256_init(&hash);
+		if (!hash_content_path(&hash, path, 0)) continue;
+		sha256_final(&hash, have);
+		if (memcmp(have, want, 32)) continue;
+		snprintf(out, out_len, "%s", path);
+		found = true;
+	}
+	closedir(d);
+	return found;
+}
+
+static bool locate_peer_rom(const uint8_t sha256[32], uint32_t size) {
+	const char* sd = getenv("SDCARD_PATH");
+	char roms[512];
+	snprintf(roms, sizeof(roms), "%s/Roms", sd && sd[0] ? sd : "/mnt/SDCARD");
+	struct timeval started, finished;
+	gettimeofday(&started, NULL);
+	/* A large library can take this well past a frame. That is work, not a
+	 * frontend that has gone away, and telling the peer we are stalled would
+	 * only make it stop sending us the thing we are about to need. */
+	NetLink_setCoreRunning(true);
+	bool found = find_rom_by_hash(roms, sha256, size, 0,
+	                              dual_peer_rom_path, sizeof(dual_peer_rom_path));
+	NetLink_setCoreRunning(false);
+	gettimeofday(&finished, NULL);
+	if (found)
+		shim_log("peer cartridge found at %s (%ums)\n", dual_peer_rom_path,
+		         timeval_delta_us(&started, &finished) / 1000);
+	else
+		shim_log("peer cartridge (%u bytes) is not installed under %s (%ums)\n",
+		         size, roms, timeval_delta_us(&started, &finished) / 1000);
+	return found;
+}
+
+/* Reload the pair with one ROM per console. Console A is always index 0 and
+ * console B index 1, so both handhelds build the same two-console machine
+ * regardless of which one they present. minarch has already populated the
+ * visible console's SRAM from this device's .sav, and that is the only copy of
+ * the player's save in the process, so it is carried across the reload. */
+static bool dual_rebuild_content(const char* peer_rom) {
+	bool linked = peer_rom && peer_rom[0];
+	/* Everything that can fail is checked before the running content is torn
+	 * down. Past core.unload_game() there is no clean way back except loading
+	 * something, and the frontend would be left with a core holding no game. */
+	if (!dual_own_rom || !dual_own_rom_len || (linked && !core.load_game_special)) {
+		shim_log("cannot rebuild the pair: %s\n",
+		         !dual_own_rom_len ? "local cartridge was not retained"
+		                           : "core has no two-content entry point");
+		return false;
+	}
+	uint32_t sram_size = 0, rtc_size = 0;
+	if (!dual_memory_sizes(dual_local_console, &sram_size, &rtc_size)) return false;
+	uint8_t* sram = sram_size ? malloc(sram_size) : NULL;
+	uint8_t* rtc = rtc_size ? malloc(rtc_size) : NULL;
+	bool ok = (!sram_size || sram) && (!rtc_size || rtc);
+	if (ok && sram_size) {
+		void* p = core.dual_get_memory_data(dual_local_console, RETRO_MEMORY_SAVE_RAM);
+		if (p) memcpy(sram, p, sram_size); else ok = false;
+	}
+	if (ok && rtc_size) {
+		void* p = core.dual_get_memory_data(dual_local_console, RETRO_MEMORY_RTC);
+		if (p) memcpy(rtc, p, rtc_size); else ok = false;
+	}
+
+	void* peer_data = NULL;
+	size_t peer_len = 0;
+	if (ok && linked) ok = read_whole_file(peer_rom, &peer_data, &peer_len);
+
+	struct retro_game_info own;
+	memset(&own, 0, sizeof(own));
+	own.path = dual_local_rom_path[0] ? dual_local_rom_path : NULL;
+	own.data = dual_own_rom;
+	own.size = dual_own_rom_len;
+
+	if (ok) {
+		core.unload_game();
+		ok = core.dual_set_visible_console(dual_local_console);
+		if (ok && linked) {
+			struct retro_game_info infos[2];
+			memset(infos, 0, sizeof(infos));
+			/* Index is the console, not the owner: console A is always 0 on both
+			 * handhelds, so each builds the same two-console machine. */
+			unsigned local = dual_local_console == GAMBATTE_DUAL_CONSOLE_A ? 0 : 1;
+			infos[local] = own;
+			infos[!local].path = peer_rom;
+			infos[!local].data = peer_data;
+			infos[!local].size = peer_len;
+			ok = core.load_game_special(GAMBATTE_DUAL_SUBSYSTEM_ID, infos, 2);
+		} else if (ok) {
+			ok = core.load_game(&own);
+		}
+		if (!ok) {
+			/* Put the player's own game back rather than leaving the frontend
+			 * attached to a core with no content. The session is finished either
+			 * way, but a visible game beats a black screen. */
+			core.dual_set_visible_console(dual_local_console);
+			if (!core.load_game(&own))
+				shim_log("could not restore the local cartridge after a failed pair rebuild\n");
+		}
+	}
+
+	/* Restore after the reload: the core reallocates both consoles' memory. */
+	if (ok && sram_size) {
+		void* p = core.dual_get_memory_data(dual_local_console, RETRO_MEMORY_SAVE_RAM);
+		uint32_t now_size = 0, now_rtc = 0;
+		if (p && dual_memory_sizes(dual_local_console, &now_size, &now_rtc) &&
+		    now_size == sram_size) memcpy(p, sram, sram_size);
+		else ok = false;
+	}
+	if (ok && rtc_size) {
+		void* p = core.dual_get_memory_data(dual_local_console, RETRO_MEMORY_RTC);
+		if (p) memcpy(p, rtc, rtc_size); else ok = false;
+	}
+
+	free(sram);
+	free(rtc);
+	free(peer_data);
+	if (ok && linked)
+		shim_log("loaded linked cartridges: console %c local, console %c from %s\n",
+		         dual_local_console ? 'B' : 'A', dual_peer_console ? 'B' : 'A', peer_rom);
+	else if (ok)
+		shim_log("rebuilt the pair from the local cartridge alone\n");
+	return ok;
+}
+
+/* Both handhelds end up running the same two consoles. Each sends its own
+ * console's save memory once and loads the peer's into its replica, which is
+ * what carries SRAM/RTC across without ever persisting the peer's save locally.
+ * After the ready barrier only inputs and diagnostics use Wi-Fi.
+ *
+ * Ahead of that sits the agreement: identity, then a verdict each. Instanced
+ * play needs *both* devices able to run *both* cartridges, and only this side
+ * can answer that about this side's library - so the verdict is exchanged and
+ * ANDed rather than inferred. A no from either demotes both to network serial,
+ * which is a relaunch, not a failure. */
 static bool dual_bootstrap_tick(void) {
 	if (dual_failed || dual_bootstrapped) return dual_bootstrapped;
-	if (!NetLink_isConnected()) return false;
+	/* Already asked the launcher for the network-serial core; the frontend is
+	 * shutting down. Asking again every frame would rewrite the marker and
+	 * re-issue SHUTDOWN for as long as it takes to get there. */
+	if (dual_demoted) return false;
+
+	if (!NetLink_isConnected()) {
+		if (!dual_wait_since.tv_sec) gettimeofday(&dual_wait_since, NULL);
+		if (elapsed_ms(&dual_wait_since) > peer_wait_timeout_ms())
+			dual_recoverable_fail("Peer unavailable.");
+		return false;
+	}
 
 	uint32_t generation = NetLink_connectionGeneration();
 	if (generation != dual_generation) {
 		dual_generation = generation;
-		dual_identity_sent = 0;
-		dual_identity_checked = 0;
-		dual_state_sent = 0;
-		dual_state_loaded = 0;
-		dual_checkpoint_sent = 0;
-		dual_checkpoint_loaded = 0;
-		dual_ready_sent = 0;
-		NetLink_resetSync();
+		dual_reset_bootstrap();
+		shim_log("connection %u requires a fresh instanced bootstrap\n", generation);
+	}
+	if (!dual_wait_since.tv_sec) gettimeofday(&dual_wait_since, NULL);
+	if (elapsed_ms(&dual_wait_since) > peer_wait_timeout_ms()) {
+		dual_recoverable_fail("Peer stopped responding during setup.");
+		return false;
 	}
 
-	uint32_t sram = 0, rtc = 0;
 	if (!dual_identity_sent) {
-		if (!rom_hash_ready || !dual_memory_sizes(dual_local_console, &sram, &rtc)) {
-			dual_fail("Could not identify local Gambatte state.");
+		if (!rom_hash_ready) {
+			dual_fail("Could not identify the local cartridge.");
 			return false;
 		}
 		NetLinkSessionIdentity mine;
@@ -2605,9 +3041,12 @@ static bool dual_bootstrap_tick(void) {
 		mine.mode = 2; /* instanced link */
 		mine.input_delay = (uint32_t)input_delay;
 		mine.core_identity = core_identity();
-		mine.state_size = (uint32_t)core.dual_serialize_size();
-		mine.sram_size = sram;
-		mine.rtc_size = rtc;
+		mine.rom_size = dual_local_rom_size;
+		/* state_size and the save-memory sizes describe the *pair*, and the pair
+		 * is not final until linked content is loaded below. They are checked
+		 * where they are used: apply_dual_memory compares sizes against the
+		 * console it is writing, and the checkpoint length must equal
+		 * dual_serialize_size() exactly. */
 		if (!NetLink_sendSessionIdentity(&mine)) return false;
 		dual_identity_sent = 1;
 		shim_log("sent instanced-link identity\n");
@@ -2616,17 +3055,66 @@ static bool dual_bootstrap_tick(void) {
 	if (!dual_identity_checked) {
 		NetLinkSessionIdentity peer;
 		if (!NetLink_takeSessionIdentity(&peer)) return false;
-		if (peer.mode != 2 || peer.input_delay != (uint32_t)input_delay ||
-		    peer.core_identity != core_identity() ||
-		    peer.state_size != core.dual_serialize_size() ||
-		    !dual_memory_sizes(dual_peer_console, &sram, &rtc) ||
-		    peer.sram_size != sram || peer.rtc_size != rtc ||
-		    memcmp(peer.rom_sha256, rom_sha256, sizeof(rom_sha256))) {
-			dual_fail("Instanced link requires the same ROM and Gambatte build.");
+		if (peer.mode != 2 || peer.input_delay != (uint32_t)input_delay) {
+			dual_fail("Peer is not set up for instanced link play.");
 			return false;
 		}
+		if (peer.core_identity != core_identity()) {
+			request_serial_fallback(NETLINK_LINK_CORE_MISMATCH);
+			return false;
+		}
+		dual_same_rom = !memcmp(peer.rom_sha256, rom_sha256, sizeof(rom_sha256));
+		/* A GB cartridge is at most 8MB; anything else is not one, and hunting
+		 * for it would only waste the player's time. */
+		if (dual_same_rom) {
+			dual_peer_rom_found = 1;
+			shim_log("both consoles run the same cartridge\n");
+		} else if (peer.rom_size && peer.rom_size <= 8u * 1024u * 1024u) {
+			dual_peer_rom_found = locate_peer_rom(peer.rom_sha256, peer.rom_size);
+		} else {
+			dual_peer_rom_found = 0;
+			shim_log("peer declared an implausible cartridge size %u\n", peer.rom_size);
+		}
 		dual_identity_checked = 1;
-		shim_log("peer instanced-link identity accepted\n");
+	}
+
+	if (!dual_verdict_sent) {
+		if (!NetLink_sendLinkVerdict(dual_peer_rom_found != 0,
+		                             dual_peer_rom_found ? NETLINK_LINK_OK
+		                                                 : NETLINK_LINK_NO_PEER_ROM))
+			return false;
+		dual_verdict_sent = 1;
+	}
+
+	if (!dual_verdict_agreed) {
+		bool peer_can_pair = false;
+		uint32_t peer_reason = NETLINK_LINK_OK;
+		if (!NetLink_takeLinkVerdict(&peer_can_pair, &peer_reason)) return false;
+		if (!dual_peer_rom_found || !peer_can_pair) {
+			request_serial_fallback(!dual_peer_rom_found ? NETLINK_LINK_NO_PEER_ROM
+			                                             : peer_reason);
+			return false;
+		}
+		dual_verdict_agreed = 1;
+		shim_log("instanced link agreed by both devices\n");
+	}
+
+	/* Different cartridges need the pair rebuilt with one per console. The
+	 * same-cartridge case arrives already loaded that way and must not be
+	 * disturbed - a reload would discard the frontend's SRAM population for
+	 * nothing - so this compares against what is loaded rather than doing it
+	 * once. A peer that reconnects having relaunched a different game is the
+	 * case that makes the difference. */
+	{
+		const char* want = dual_same_rom ? "" : dual_peer_rom_path;
+		if (!dual_content_built || strcmp(dual_content_rom, want)) {
+			if (!dual_rebuild_content(want)) {
+				dual_fail("Could not load the linked cartridges together.");
+				return false;
+			}
+			snprintf(dual_content_rom, sizeof(dual_content_rom), "%s", want);
+			dual_content_built = 1;
+		}
 	}
 
 	if (!dual_state_sent) {
@@ -2636,7 +3124,7 @@ static bool dual_bootstrap_tick(void) {
 			dual_fail("Could not capture local Gambatte save memory.");
 			return false;
 		}
-		bool sent = NetLink_sendState(state, len);
+		bool sent = NetLink_sendState(NETLINK_STATE_CONSOLE_MEMORY, state, len);
 		free(state);
 		if (!sent) return false;
 		dual_state_sent = 1;
@@ -2647,7 +3135,8 @@ static bool dual_bootstrap_tick(void) {
 	if (!dual_state_loaded) {
 		void* peer_state = NULL;
 		size_t peer_len = 0;
-		if (!NetLink_takeState(&peer_state, &peer_len)) return false;
+		if (!NetLink_takeState(NETLINK_STATE_CONSOLE_MEMORY, &peer_state, &peer_len))
+			return false;
 		bool loaded = apply_dual_memory(dual_peer_console, peer_state, peer_len);
 		free(peer_state);
 		if (!loaded) {
@@ -2657,7 +3146,6 @@ static bool dual_bootstrap_tick(void) {
 		dual_state_loaded = 1;
 		shim_log("console %c save memory adopted\n",
 		         dual_peer_console ? 'B' : 'A');
-		return false;
 	}
 
 	/* The memory exchange makes both logical consoles equivalent. One paired
@@ -2672,7 +3160,7 @@ static bool dual_bootstrap_tick(void) {
 			dual_fail("Could not capture paired Gambatte checkpoint.");
 			return false;
 		}
-		bool sent = NetLink_sendState(state, len);
+		bool sent = NetLink_sendState(NETLINK_STATE_PAIRED_CHECKPOINT, state, len);
 		free(state);
 		if (!sent) return false;
 		dual_checkpoint_sent = dual_checkpoint_loaded = 1;
@@ -2681,7 +3169,8 @@ static bool dual_bootstrap_tick(void) {
 	if (NetLink_getRole() == NETLINK_ROLE_CLIENT && !dual_checkpoint_loaded) {
 		void* state = NULL;
 		size_t len = 0;
-		if (!NetLink_takeState(&state, &len)) return false;
+		if (!NetLink_takeState(NETLINK_STATE_PAIRED_CHECKPOINT, &state, &len))
+			return false;
 		bool loaded = core.dual_is_checkpoint_safe() &&
 		              len == core.dual_serialize_size() &&
 		              core.dual_unserialize(state, len);
@@ -2715,6 +3204,9 @@ static bool dual_bootstrap_tick(void) {
 	last_scheduled = 0;
 	input_scheduled = 0;
 	dual_bootstrapped = 1;
+	dual_wait_since.tv_sec = dual_wait_since.tv_usec = 0;
+	recovery_failed = 0;
+	recovery_error[0] = '\0';
 	shim_log("instanced Gambatte ready; serial is local and Wi-Fi is input-only\n");
 	return true;
 }
@@ -2727,102 +3219,17 @@ static uint32_t timeval_delta_us(const struct timeval* from, const struct timeva
 	return total > UINT32_MAX ? UINT32_MAX : (uint32_t)total;
 }
 
-static void* shadow_worker_main(void* unused) {
-	(void)unused;
-	pthread_mutex_lock(&shadow_worker_mutex);
-	for (;;) {
-		while (!shadow_worker_pending && !shadow_worker_stop)
-			pthread_cond_wait(&shadow_worker_request, &shadow_worker_mutex);
-		if (shadow_worker_stop) break;
-		shadow_worker_pending = 0;
-		pthread_mutex_unlock(&shadow_worker_mutex);
-
-		struct timeval started, finished;
-		gettimeofday(&started, NULL);
-		shadow_core.run();
-		gettimeofday(&finished, NULL);
-		uint32_t elapsed = timeval_delta_us(&started, &finished);
-
-		pthread_mutex_lock(&shadow_worker_mutex);
-		shadow_last_run_us = elapsed;
-		shadow_worker_done = 1;
-		pthread_cond_signal(&shadow_worker_complete);
-	}
-	pthread_mutex_unlock(&shadow_worker_mutex);
-	return NULL;
-}
-
-static bool start_shadow_worker(void) {
-	if (shadow_worker_started) return true;
-	pthread_mutex_lock(&shadow_worker_mutex);
-	shadow_worker_pending = shadow_worker_done = shadow_worker_stop = 0;
-	int rc = pthread_create(&shadow_worker_thread, NULL, shadow_worker_main, NULL);
-	if (!rc) shadow_worker_started = 1;
-	pthread_mutex_unlock(&shadow_worker_mutex);
-	if (rc) dual_fail("Could not start the hidden Gambatte worker.");
-	else shim_log("persistent hidden-core worker started\n");
-	return rc == 0;
-}
-
-static void stop_shadow_worker(void) {
-	if (!shadow_worker_started) return;
-	pthread_mutex_lock(&shadow_worker_mutex);
-	shadow_worker_stop = 1;
-	pthread_cond_signal(&shadow_worker_request);
-	pthread_mutex_unlock(&shadow_worker_mutex);
-	pthread_join(shadow_worker_thread, NULL);
-	pthread_mutex_lock(&shadow_worker_mutex);
-	shadow_worker_started = 0;
-	shadow_worker_pending = shadow_worker_done = shadow_worker_stop = 0;
-	pthread_mutex_unlock(&shadow_worker_mutex);
-}
-
+/* One paired core call advances both consoles and the cable between them. */
 static bool run_dual_frame(void) {
-	if (dual_core_mode) {
-		struct timeval started, finished;
-		gettimeofday(&started, NULL);
-		NetLink_setCoreRunning(true);
-		core.run();
-		NetLink_setCoreRunning(false);
-		gettimeofday(&finished, NULL);
-		uint32_t elapsed = timeval_delta_us(&started, &finished);
-		dual_visible_run_us += elapsed;
-		dual_pair_run_us += elapsed;
-		if (elapsed > dual_visible_run_max_us) dual_visible_run_max_us = elapsed;
-		if (elapsed > dual_pair_run_max_us) dual_pair_run_max_us = elapsed;
-		return true;
-	}
-	if (!start_shadow_worker()) return false;
-	struct timeval pair_started, visible_started, visible_finished, pair_finished;
-	gettimeofday(&pair_started, NULL);
-
-	pthread_mutex_lock(&shadow_worker_mutex);
-	shadow_worker_done = 0;
-	shadow_worker_pending = 1;
-	pthread_cond_signal(&shadow_worker_request);
-	pthread_mutex_unlock(&shadow_worker_mutex);
-
+	struct timeval started, finished;
+	gettimeofday(&started, NULL);
 	NetLink_setCoreRunning(true);
-	gettimeofday(&visible_started, NULL);
 	core.run();
-	gettimeofday(&visible_finished, NULL);
-
-	pthread_mutex_lock(&shadow_worker_mutex);
-	while (!shadow_worker_done)
-		pthread_cond_wait(&shadow_worker_complete, &shadow_worker_mutex);
-	uint32_t shadow_us = shadow_last_run_us;
-	pthread_mutex_unlock(&shadow_worker_mutex);
-	gettimeofday(&pair_finished, NULL);
 	NetLink_setCoreRunning(false);
-
-	uint32_t visible_us = timeval_delta_us(&visible_started, &visible_finished);
-	uint32_t pair_us = timeval_delta_us(&pair_started, &pair_finished);
-	dual_visible_run_us += visible_us;
-	dual_shadow_run_us += shadow_us;
-	dual_pair_run_us += pair_us;
-	if (visible_us > dual_visible_run_max_us) dual_visible_run_max_us = visible_us;
-	if (shadow_us > dual_shadow_run_max_us) dual_shadow_run_max_us = shadow_us;
-	if (pair_us > dual_pair_run_max_us) dual_pair_run_max_us = pair_us;
+	gettimeofday(&finished, NULL);
+	uint32_t elapsed = timeval_delta_us(&started, &finished);
+	dual_pair_run_us += elapsed;
+	if (elapsed > dual_pair_run_max_us) dual_pair_run_max_us = elapsed;
 	return true;
 }
 
@@ -2842,24 +3249,115 @@ static void dual_report_pacing(void) {
 	         stat_frames, ms, fps10 / 10, fps10 % 10, stat_stalls,
 	         stall_pct, stat_stall_max, input_delay);
 	if (stat_frames) {
-		shim_log("instanced core time: visible avg %lluus max %uus, "
-		         "hidden avg %lluus max %uus, pair avg %lluus max %uus\n",
-		         (unsigned long long)(dual_visible_run_us / stat_frames), dual_visible_run_max_us,
-		         (unsigned long long)(dual_shadow_run_us / stat_frames), dual_shadow_run_max_us,
+		shim_log("instanced core time: paired call avg %lluus max %uus "
+		         "(both consoles and the local cable)\n",
 		         (unsigned long long)(dual_pair_run_us / stat_frames), dual_pair_run_max_us);
 	}
 	stat_frames = stat_stalls = stat_stall_max = 0;
-	dual_visible_run_us = dual_shadow_run_us = dual_pair_run_us = 0;
-	dual_visible_run_max_us = dual_shadow_run_max_us = dual_pair_run_max_us = 0;
+	dual_pair_run_us = 0;
+	dual_pair_run_max_us = 0;
 	stat_since = now;
+}
+
+/* Hash both consoles plus the link coordinator at fixed frames and compare with
+ * the peer's hash of the same frame.
+ *
+ * Symmetric and identically timed on both devices: each hashes at the same
+ * dual_frame and the comparison happens separately, whenever the peer's value
+ * turns up, so a hash arriving a frame late is not itself a source of
+ * divergence. Frame-keyed rings make ordering irrelevant.
+ *
+ * The paired checkpoint deliberately excludes presentation, diagnostics and
+ * cached input, which is what lets two devices showing different consoles hash
+ * the same bytes.
+ *
+ * Returns true if the session has been failed. */
+static bool dual_check_agreement(void) {
+	if (!core.dual_serialize_size || !core.dual_serialize) return false;
+
+	if (dual_frame % HASH_INTERVAL == 0) {
+		if (!core.dual_is_checkpoint_safe()) {
+			/* A transfer is mid-flight. Skipping keeps both sides' hashing
+			 * symmetric in content; it costs this round's comparison. */
+			dual_hash_skips++;
+		} else {
+			size_t len = core.dual_serialize_size();
+			if (len && len != dual_hash_buf_len) {
+				free(dual_hash_buf);
+				dual_hash_buf = malloc(len);
+				dual_hash_buf_len = dual_hash_buf ? len : 0;
+			}
+			if (dual_hash_buf && core.dual_serialize(dual_hash_buf, dual_hash_buf_len)) {
+				uint32_t mine = hash_bytes(dual_hash_buf, dual_hash_buf_len);
+				unsigned slot = (dual_frame / HASH_INTERVAL) % HASH_HISTORY;
+				own_hashes[slot] = (StateHash){ dual_frame, mine, 1 };
+				NetLink_sendHash(dual_frame, mine);
+				if (!dual_frame)
+					shim_log("paired state at frame 0: %08x (%zu bytes)\n",
+					         mine, dual_hash_buf_len);
+			}
+		}
+	}
+
+	uint32_t f, h;
+	while (NetLink_takeHash(&f, &h)) {
+		unsigned p = (f / HASH_INTERVAL) % HASH_HISTORY;
+		pending_peer_hashes[p] = (StateHash){ f, h, 1 };
+	}
+
+	for (unsigned p = 0; p < HASH_HISTORY; p++) {
+		if (!pending_peer_hashes[p].valid) continue;
+		f = pending_peer_hashes[p].frame;
+		h = pending_peer_hashes[p].hash;
+		unsigned sl = (f / HASH_INTERVAL) % HASH_HISTORY;
+		if (!own_hashes[sl].valid || own_hashes[sl].frame != f) continue;
+		pending_peer_hashes[p].valid = 0;
+		if (own_hashes[sl].hash == h) {
+			shim_log("paired consoles agree at frame %u (%08x)\n", f, h);
+			continue;
+		}
+		/* Nothing can be salvaged: an in-process cable has no resync, and both
+		 * replicas have been feeding their players a different game since some
+		 * frame before this one. Say so and offer the usual choices. */
+		shim_log("PAIRED DESYNC at frame %u (ours %08x, peer %08x) after %u skipped checks\n",
+		         f, own_hashes[sl].hash, h, dual_hash_skips);
+		dual_recoverable_fail("Consoles have diverged. Link play stopped.");
+		return true;
+	}
+	return false;
 }
 
 /* Returns true when this frontend frame was fully handled (including waits). */
 static bool dual_link_tick(void) {
 	NetLink_markFrame();
+	/* Continue solo keeps the paired core - it is the only thing that can run
+	 * this content - and simply stops taking the peer's console anywhere. The
+	 * abandoned console holds neutral input; it is still emulated, so the link
+	 * cable stays electrically sane and the local save keeps working. */
+	if (solo_mode) {
+		dual_primary_buttons = fe_input_state
+			? (uint16_t)fe_input_state(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK)
+			: 0;
+		dual_shadow_buttons = 0;
+		run_dual_frame();
+		dual_frame++;
+		return true;
+	}
+	/* dual_failed is terminal - the two builds or the two cartridges cannot be
+	 * paired at all. recovery_failed is the recoverable kind and shares the
+	 * shared-screen overlay, so a dropped link offers Wait / Solo / Exit. */
 	if (dual_failed) {
 		if (fe_input_poll) fe_input_poll();
 		present_paused_frame(dual_frame, dual_error);
+		present_paused_audio();
+		return true;
+	}
+	if (recovery_failed) {
+		if (fe_input_poll) fe_input_poll();
+		failure_input_tick();
+		char failure_message[224];
+		failure_overlay_message(failure_message, sizeof(failure_message));
+		present_paused_frame(dual_frame, failure_message);
 		present_paused_audio();
 		return true;
 	}
@@ -2871,20 +3369,29 @@ static bool dual_link_tick(void) {
 	}
 	if (!dual_bootstrap_tick()) {
 		if (fe_input_poll) fe_input_poll();
-		present_paused_frame(dual_frame, dual_failed ? dual_error : "Starting instanced link...");
+		present_paused_frame(dual_frame,
+		                     exit_requested ? "Switching to link cable..."
+		                     : dual_failed ? dual_error
+		                     : dual_verdict_agreed ? "Synchronizing linked consoles..."
+		                     : "Starting instanced link...");
 		present_paused_audio();
 		return true;
 	}
 
 	uint32_t target = dual_frame + (uint32_t)input_delay;
 	if (!input_scheduled || target > last_scheduled) {
+		/* uint16_t first: the callback returns int16_t, and a set bit 15 (R3)
+		 * would otherwise sign-extend across the reset flag below and reset a
+		 * console on both replicas. */
 		uint32_t local = fe_input_state
-			? (uint32_t)fe_input_state(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK)
+			? (uint16_t)fe_input_state(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK)
 			: 0;
 		if (dual_reset_pending) local |= DUAL_INPUT_RESET;
 		local_inputs[target % 256] = local;
 		if (!NetLink_sendInput(target, local)) {
-			dual_fail("Could not send instanced-link input.");
+			/* The transport closed the connection. Do not consume the queued
+			 * reset: the next generation re-bootstraps and can still carry it. */
+			dual_recoverable_fail("Lost contact with the other player.");
 			return true;
 		}
 		last_scheduled = target;
@@ -2896,6 +3403,13 @@ static bool dual_link_tick(void) {
 	if (dual_frame >= (uint32_t)input_delay &&
 	    !NetLink_getRemoteInput(dual_frame, &theirs)) {
 		if (fe_input_poll) fe_input_poll();
+		if (!input_stall_since.tv_sec) gettimeofday(&input_stall_since, NULL);
+		if (elapsed_ms(&input_stall_since) > peer_wait_timeout_ms()) {
+			dual_recoverable_fail(NetLink_isConnected()
+			                      ? "Peer stopped sending input."
+			                      : "Peer disconnected.");
+			return true;
+		}
 		stat_stalls++;
 		stall_run++;
 		if (stall_run > stat_stall_max) stat_stall_max = stall_run;
@@ -2904,8 +3418,9 @@ static bool dual_link_tick(void) {
 		present_paused_audio();
 		return true;
 	}
+	input_stall_since.tv_sec = input_stall_since.tv_usec = 0;
 	stall_run = 0;
-	if (dual_core_mode && (mine & DUAL_INPUT_RESET)) {
+	if (mine & DUAL_INPUT_RESET) {
 		if (!core.dual_reset_console(dual_local_console)) {
 			dual_fail("Could not reset the local logical console.");
 			return true;
@@ -2913,7 +3428,7 @@ static bool dual_link_tick(void) {
 		shim_log("applied synchronized reset to console %c at frame %u\n",
 		         dual_local_console ? 'B' : 'A', dual_frame);
 	}
-	if (dual_core_mode && (theirs & DUAL_INPUT_RESET)) {
+	if (theirs & DUAL_INPUT_RESET) {
 		if (!core.dual_reset_console(dual_peer_console)) {
 			dual_fail("Could not mirror the peer logical-console reset.");
 			return true;
@@ -2923,6 +3438,10 @@ static bool dual_link_tick(void) {
 	}
 	dual_primary_buttons = mine & ~DUAL_INPUT_RESET;
 	dual_shadow_buttons = theirs & ~DUAL_INPUT_RESET;
+	/* Before the advance, so dual_frame names the state being hashed and the
+	 * first check covers frame 0 - which is exactly the assertion that the
+	 * bootstrap checkpoint left both devices holding the same two consoles. */
+	if (dual_check_agreement()) return true;
 	if (!run_dual_frame()) return true;
 	dual_frame++;
 	stat_frames++;
@@ -2936,7 +3455,7 @@ void retro_run(void) {
 	// Netpacket state and inbound packets are settled before the core runs, so
 	// a frame sees everything that arrived since the last one.
 	pump_netpacket();
-	if (session_active && dual_link_mode && !solo_mode) {
+	if (session_active && dual_link_mode) {
 		dual_link_tick();
 		return;
 	}
@@ -3186,25 +3705,36 @@ bool retro_load_game(const struct retro_game_info* game) {
 			         rom_sha256[28], rom_sha256[29], rom_sha256[30], rom_sha256[31]);
 		}
 	} else rom_hash_ready = 0;
-	if (!dual_link_mode || !shadow_core.handle) return core.load_game(game);
 
-	/* Whichever local instance is the loopback server must load first. The
-	 * client's initial connect is then immediate instead of waiting for
-	 * Gambatte's reconnect throttle. */
-	bool primary_server = NetLink_getRole() == NETLINK_ROLE_HOST;
-	bool primary_ok, shadow_ok;
-	if (primary_server) {
-		primary_ok = core.load_game(game);
-		shadow_ok = shadow_core.load_game(game);
-	} else {
-		shadow_ok = shadow_core.load_game(game);
-		primary_ok = core.load_game(game);
+	/* Remember our own cartridge. If the peer turns out to be running a
+	 * different one that this device also owns, the pair is reloaded as two
+	 * contents and both halves have to be supplied again - the frontend's
+	 * buffer is not ours to keep. Failing to copy it is not fatal here; it
+	 * only costs the different-cartridge case, which then demotes to serial. */
+	if (dual_link_mode) {
+		snprintf(dual_local_rom_path, sizeof(dual_local_rom_path), "%s",
+		         game && game->path ? game->path : "");
+		free(dual_own_rom);
+		dual_own_rom = NULL;
+		dual_own_rom_len = 0;
+		if (game && game->data && game->size) {
+			dual_own_rom = malloc(game->size);
+			if (dual_own_rom) {
+				memcpy(dual_own_rom, game->data, game->size);
+				dual_own_rom_len = game->size;
+			}
+		} else if (dual_local_rom_path[0]) {
+			read_whole_file(dual_local_rom_path, &dual_own_rom, &dual_own_rom_len);
+		}
+		dual_local_rom_size = (uint32_t)dual_own_rom_len;
+		/* What the frontend just loaded: our cartridge in both consoles. */
+		dual_content_rom[0] = '\0';
+		dual_content_built = 1;
+		if (!dual_own_rom_len)
+			shim_log("could not retain the local cartridge; linked cartridges "
+			         "will fall back to network serial\n");
 	}
-	if (!primary_ok || !shadow_ok) {
-		dual_failed = 1;
-		snprintf(dual_error, sizeof(dual_error), "One Gambatte instance could not load the ROM.");
-	}
-	return primary_ok && shadow_ok;
+	return core.load_game(game);
 }
 
 bool retro_load_game_special(unsigned game_type, const struct retro_game_info* info, size_t num_info) {
@@ -3218,8 +3748,6 @@ bool retro_load_game_special(unsigned game_type, const struct retro_game_info* i
 
 void retro_unload_game(void) {
 	if (!core.handle) return;
-	stop_shadow_worker();
-	if (shadow_core.handle) shadow_core.unload_game();
 	core.unload_game();
 }
 

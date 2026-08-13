@@ -38,7 +38,7 @@ out entirely), and its gpsp lacks the original pak's two RFU fixes.
   Heroes all ran with synced inputs. Periodic disagreement now triggers a
   host-authoritative state barrier instead of leaving the screens diverged.
 - **Session app**: host/join, UDP discovery, arming, on both devices.
-- Two independent emulator instances per process - see [Dual instance](#dual-instance).
+- Two independent emulator consoles per process - see [Dual instance](#dual-instance).
 
 ### Verified host-side only
 
@@ -666,21 +666,28 @@ Capacity is not a constraint either:
 | mGBA, A30 | 141 fps (234%) | 142 + 138 fps |
 | gpSP, A30 (reference) | 483 fps (805%) | — |
 
-The first Gambatte implementation uses two physical `.so` copies and runs their
-`retro_run` calls concurrently. The core patch adds internal `Local Server` and
-`Local Client` modes: serial stays on a loopback TCP connection, with a brief
-slave rendezvous to keep both cores on the same emulated transfer. The network
-transport carries only delayed, frame-indexed inputs.
+The first Gambatte implementation used two physical `.so` copies with their
+`retro_run` calls run concurrently and serial on a loopback TCP connection. It
+worked and was too slow: the clock-owning console's synchronous send held an
+A30/Brick pair to 22-23fps whichever device owned the clock. It is retired, and
+retained disabled in `shim/shim.c` — see [Dual instance](multi-instance.md) for
+the measurements that killed it.
 
-Startup is symmetric: each device sends the visible core's serialized state
-plus SRAM/RTC, then loads the peer's bundle into its hidden core. A ready barrier
-prevents either input timeline from beginning before both hidden consoles have
-adopted their state. Video/audio from the hidden core is discarded; its save
-directory is process-local and never persists.
+What ships instead is a paired core, `gambatte_dual_libretro.so`, holding both
+consoles and an in-memory serial coordinator behind a versioned ABI. One core
+call advances the pair per frontend frame; the shim keeps devices, transport,
+identity, input lockstep, and policy.
 
-Current limits: identical ROM and core identity only; no different-cartridge
-pairing, process rejoin, or dual-instance reset policy yet. Device testing is
-still required to establish the real latency win and local serial reliability.
+Startup is symmetric: each device sends its own console's raw SRAM/RTC, the peer
+adopts it into the replica, and the host ships one paired checkpoint. A ready
+barrier prevents either input timeline from beginning before both devices hold
+the same two consoles.
+
+Linked cartridges may differ when both devices own both of them; no ROM crosses
+the network, so a pairing that cannot be hosted locally relaunches once on the
+network-serial core. Still open: process rejoin and periodic paired-state
+agreement checks. Device testing is still required to establish the real latency
+win and local serial reliability.
 
 ## Durability: when does a frozen pak stop working?
 
