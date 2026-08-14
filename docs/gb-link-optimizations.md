@@ -36,16 +36,61 @@ still carry serial traffic over Wi-Fi, not a redesign.
 
 ## Summary
 
-| # | Item | Path affected | Complexity | Expected gain |
-|---|---|---|---|---|
-| 1 | Honour `poll_receive` mid-frame | network serial | Low–Medium | Up to one frame (~16.7 ms) removed per serial exchange |
-| 2 | Pacing telemetry for the link path | network serial | Low | Makes items 1, 3, 4 measurable; currently blind |
-| 3 | Bounded starvation instead of open-ended blocking | network serial | Medium | Turns an indefinite freeze into a reported, recoverable stall |
-| 4 | Negotiated input delay from measured RTT | instanced link, shared screen | Medium | 1–3 frames (17–50 ms) of input lag on ad hoc |
+| # | Item | Path affected | Complexity | Expected gain | Status |
+|---|---|---|---|---|---|
+| 1 | Honour `poll_receive` mid-frame | network serial | Low–Medium | Up to one frame (~16.7 ms) removed per serial exchange | **done** |
+| 2 | Pacing telemetry for the link path | network serial | Low | Makes items 1, 3, 4 measurable; currently blind | **done** |
+| 3 | Bounded starvation instead of open-ended blocking | network serial | Medium | Turns an indefinite freeze into a reported, recoverable stall | **done** |
+| 4 | Negotiated input delay from measured RTT | instanced link, shared screen | Medium | 1–3 frames (17–50 ms) of input lag on ad hoc | **done** |
 
 Do them in that order. Item 2 is the cheapest and makes the rest arguable
 instead of speculative; it is listed second only because item 1 is the one worth
 doing regardless.
+
+## What changed on implementation
+
+Two of this plan's assumptions did not survive contact with the code, and both
+mattered enough to record.
+
+**Item 4's RTT source did not exist.** The plan proposed timing the existing
+`CMD_PING`/`HEARTBEAT_MS` exchange — "recording a timestamp and a subtraction,
+not new traffic". `CMD_PING` is never echoed (`netlink.c`: *"needs no handling
+beyond refreshing last_rx"*), so there was no round trip to time; and it is only
+sent when the link is otherwise idle (`ms_since(&nl.last_tx) > HEARTBEAT_MS`),
+so during a session carrying per-frame input it never fires at all. Implemented
+instead as `CMD_RTT_PROBE`/`CMD_RTT_ECHO`, echoed on the transport thread so the
+figure measures the link rather than either side's frame loop. Nine bytes ten
+times a second, and it runs continuously rather than only when idle.
+
+**Item 4's formula was sized from the wrong statistic.** The plan proposed
+`ceil(rtt_ms / 16.7) + 1` from a smoothed RTT. Checked against the measurements
+already recorded in `app/netsetup.h`, taken on this A30/Brick pair:
+
+| link | RTT min/avg/max | hand-tuned | from median | from max |
+|---|---|---|---|---|
+| ad hoc | 1.7 / 4.3 / 21.5 ms | 3 | 2 | **3** |
+| via AP | 6.2 / 26–43 / 118–300 ms | 10 | 4 | **9–19** |
+
+A median-derived window proposes 4 frames for an access-point link that was
+measured as needing 10, and `netsetup.h` already records what that costs:
+*"Applying that same 3 over the access point gave 33-47fps and 63-74% stalled
+frames, because a 50ms budget cannot absorb a 300ms spike."* The delay is
+therefore derived from the **maximum** observed round trip over a rolling
+window, which reproduces both hand-tuned constants. The median is still
+measured and logged, because it is the honest description of the link.
+
+**`input_delay=N` became a proposal rather than a pin.** The plan wanted the
+session-file value to pin and skip negotiation. A one-sided pin would break the
+exact-agreement invariant, which is a desync rather than an override, so both
+sides still adopt the higher of the two proposals; a value pinned identically on
+both devices — which is what `NS_arm` writes — is unaffected. The app now also
+writes `input_delay_auto=1`, which enables negotiation while keeping its
+transport-aware number as the fallback for a link that never answers a probe.
+An old session file carrying only `input_delay=N` stays pinned.
+
+The test that asserted mismatched delays are *refused* now asserts that they
+*converge*, and additionally that both peers then run an identical input stream
+— which is the property the refusal existed to protect.
 
 ---
 

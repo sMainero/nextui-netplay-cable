@@ -18,8 +18,10 @@
 #define NETLINK_MAGIC    0x4E504C4BU /* 'NPLK' */
 /* 10: CMD_STATE carries a transfer kind and completed transfers are queued
  *     rather than overwritten; CMD_SESSION_IDENTITY carries rom_size;
- *     CMD_LINK_VERDICT added. */
-#define NETLINK_PROTOCOL 10
+ *     CMD_LINK_VERDICT added.
+ * 11: CMD_RTT_PROBE/CMD_RTT_ECHO added; input delay is negotiated from the
+ *     measured round trip rather than fixed by the session file. */
+#define NETLINK_PROTOCOL 12
 
 #define QUEUE_SIZE    512
 /* Inputs are indexed by frame; the ring only has to outlast the input delay
@@ -66,10 +68,23 @@ enum {
 	CMD_RESYNC_BEGIN   = 0x09, /* {epoch, resume_frame, kind}; CMD_STATE follows */
 	CMD_RESYNC_ACK     = 0x0A, /* {epoch, loaded} */
 	CMD_RESYNC_COMMIT  = 0x0B, /* {epoch} */
-	CMD_SESSION_IDENTITY = 0x0C, /* {rom sha256, mode, delay, core/state/save identity} */
+	CMD_SESSION_IDENTITY = 0x0C, /* {rom sha256, mode, delay, core/state/save identity, wall clock} */
 	CMD_CHECKPOINT_ACK = 0x0D, /* {frame, hash, matched} */
 	CMD_LINK_VERDICT   = 0x0E, /* {can_pair, reason} - instanced-link agreement */
+	CMD_RTT_PROBE      = 0x0F, /* {token} - echoed straight back as CMD_RTT_ECHO */
+	CMD_RTT_ECHO       = 0x10, /* {token} */
 };
+
+/* Round-trip probes, for sizing input delay from what the link actually does
+ * rather than from a compile-time guess.
+ *
+ * A separate message rather than timing CMD_PING: that heartbeat is only sent
+ * when the link is otherwise idle (`ms_since(&nl.last_tx) > HEARTBEAT_MS`), so
+ * during a session carrying per-frame input it never fires, and nothing echoes
+ * it in any case. Probes are cheap - 5 header bytes and 4 payload, a few times
+ * a second - and are what the delay negotiation is derived from. */
+#define RTT_PROBE_MS   100
+#define RTT_SAMPLES    16
 
 typedef struct __attribute__((packed)) {
 	uint8_t  cmd;
@@ -148,6 +163,17 @@ static struct {
 	uint32_t resync_commit_epoch;
 	bool     resync_commit_ready;
 
+	/* Smoothed round trip. Kept as a small ring rather than an average so one
+	 * scheduling hiccup on either device cannot pin the estimate high: the
+	 * median of the last few samples is what the delay is derived from. */
+	uint32_t rtt_us[RTT_SAMPLES];
+	unsigned rtt_count, rtt_next;
+	uint32_t rtt_token;
+	struct timeval rtt_sent_at;
+	bool     rtt_outstanding;
+	struct timeval rtt_last_probe;
+
+	struct timeval starved_since; /* core running, queue empty, peer connected */
 	struct timeval last_run;      /* last retro_run, per NetLink_markFrame */
 	struct timeval peer_paused_at;
 	bool           told_peer_paused;
@@ -501,6 +527,9 @@ static void drop_connection(const char* reason) {
 		 * strands us waiting for a CMD_RESUME that can never arrive. */
 		nl.peer_paused = false;
 		nl.told_peer_paused = false;
+		nl.starved_since.tv_sec = nl.starved_since.tv_usec = 0;
+		nl.rtt_count = nl.rtt_next = 0;
+		nl.rtt_outstanding = false;
 		/* Everything the departed peer told us dies with it, so a reconnecting
 		 * process cannot be accepted on the strength of its predecessor's
 		 * handshake. This runs on the worker thread, ahead of any byte of the
@@ -583,6 +612,23 @@ static void* worker(void* arg) {
 			bool sent = send_framed(CMD_PING, NULL, 0, NetLink_localClientId());
 			pthread_mutex_unlock(&nl.lock);
 			if (!sent) { drop_connection("heartbeat send failed"); continue; }
+		}
+
+		/* One probe in flight at a time: a lost echo costs one sample rather
+		 * than corrupting the estimate with a mismatched pair. */
+		if (!nl.rtt_outstanding && ms_since(&nl.rtt_last_probe) > RTT_PROBE_MS) {
+			pthread_mutex_lock(&nl.lock);
+			uint32_t token = ++nl.rtt_token;
+			uint32_t wire = htonl(token);
+			bool sent = send_framed(CMD_RTT_PROBE, &wire, sizeof(wire),
+			                        NetLink_localClientId());
+			if (sent) {
+				nl.rtt_outstanding = true;
+				gettimeofday(&nl.rtt_sent_at, NULL);
+			}
+			gettimeofday(&nl.rtt_last_probe, NULL);
+			pthread_mutex_unlock(&nl.lock);
+			if (!sent) { drop_connection("rtt probe send failed"); continue; }
 		}
 
 		/* Tell the peer when our frontend stalls, and when it comes back. The
@@ -713,6 +759,36 @@ static void* worker(void* arg) {
 			pthread_mutex_unlock(&nl.lock);
 		}
 
+		if (hdr.cmd == CMD_RTT_PROBE && size == 4) {
+			/* Echo verbatim and immediately - this runs on the worker thread, so
+			 * the turnaround does not wait on the frontend and the number stays
+			 * a measure of the link rather than of the peer's frame loop. */
+			pthread_mutex_lock(&nl.lock);
+			bool sent = nl.connected &&
+			            send_framed(CMD_RTT_ECHO, buf, 4, NetLink_localClientId());
+			pthread_mutex_unlock(&nl.lock);
+			if (!sent && nl.connected) drop_connection("rtt echo send failed");
+		}
+
+		if (hdr.cmd == CMD_RTT_ECHO && size == 4) {
+			uint32_t token = ntohl(*(uint32_t*)buf);
+			pthread_mutex_lock(&nl.lock);
+			if (nl.rtt_outstanding && token == nl.rtt_token) {
+				struct timeval now;
+				gettimeofday(&now, NULL);
+				long sec = now.tv_sec - nl.rtt_sent_at.tv_sec;
+				long usec = now.tv_usec - nl.rtt_sent_at.tv_usec;
+				long long total = (long long)sec * 1000000LL + usec;
+				if (total < 0) total = 0;
+				if (total > UINT32_MAX) total = UINT32_MAX;
+				nl.rtt_us[nl.rtt_next] = (uint32_t)total;
+				nl.rtt_next = (nl.rtt_next + 1) % RTT_SAMPLES;
+				if (nl.rtt_count < RTT_SAMPLES) nl.rtt_count++;
+				nl.rtt_outstanding = false;
+			}
+			pthread_mutex_unlock(&nl.lock);
+		}
+
 		if (hdr.cmd == CMD_LINK_VERDICT && size == 8) {
 			pthread_mutex_lock(&nl.lock);
 			nl.link_verdict_can_pair = ntohl(*(uint32_t*)buf) != 0;
@@ -807,7 +883,7 @@ static void* worker(void* arg) {
 			pthread_mutex_unlock(&nl.lock);
 		}
 
-		if (hdr.cmd == CMD_SESSION_IDENTITY && size == 60) {
+		if (hdr.cmd == CMD_SESSION_IDENTITY && size == 68) {
 			pthread_mutex_lock(&nl.lock);
 			memcpy(nl.peer_session_identity.rom_sha256, buf, 32);
 			nl.peer_session_identity.mode = ntohl(*(uint32_t*)(buf + 32));
@@ -817,6 +893,9 @@ static void* worker(void* arg) {
 			nl.peer_session_identity.sram_size = ntohl(*(uint32_t*)(buf + 48));
 			nl.peer_session_identity.rtc_size = ntohl(*(uint32_t*)(buf + 52));
 			nl.peer_session_identity.rom_size = ntohl(*(uint32_t*)(buf + 56));
+			nl.peer_session_identity.wall_clock_utc =
+				((uint64_t)ntohl(*(uint32_t*)(buf + 60)) << 32) |
+				ntohl(*(uint32_t*)(buf + 64));
 			nl.peer_session_identity_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
@@ -879,6 +958,34 @@ void NetLink_markFrame(void) {
 void NetLink_setCoreRunning(bool running) {
 	nl.core_running = running;
 	if (!running) gettimeofday(&nl.last_run, NULL);
+
+	/* A link core may legitimately block in retro_run waiting for a serial byte,
+	 * and NetLink_markFrame deliberately does not count that as a frontend
+	 * stall - saying otherwise would pause the peer and starve the very data the
+	 * core is waiting for. The consequence is that a byte which never arrives
+	 * blocks forever, unobserved.
+	 *
+	 * So observe it, without changing what is reported to the peer: note when
+	 * the core enters a run with nothing queued for it. Any delivery clears it
+	 * (see NetLink_popPacket), which is why "quiet" alone can never trip this. */
+	pthread_mutex_lock(&nl.lock);
+	if (running && nl.connected && nl.q_head == nl.q_tail) {
+		if (!nl.starved_since.tv_sec) gettimeofday(&nl.starved_since, NULL);
+	} else if (!running) {
+		/* Leave the timer running across the frame boundary: a core that blocks
+		 * for several frames is one starvation, not several. */
+	}
+	pthread_mutex_unlock(&nl.lock);
+}
+
+/* Milliseconds the core has been running with an empty queue on a live
+ * connection, or 0 when it is not starved. */
+long NetLink_starvedMs(void) {
+	pthread_mutex_lock(&nl.lock);
+	long ms = 0;
+	if (nl.connected && nl.starved_since.tv_sec) ms = ms_since(&nl.starved_since);
+	pthread_mutex_unlock(&nl.lock);
+	return ms;
 }
 
 bool NetLink_isPeerPaused(void) {
@@ -999,6 +1106,31 @@ bool NetLink_sendState(NetLinkStateKind kind, const void* data, size_t len) {
 	return true;
 }
 
+/* Both figures, because they answer different questions. The median describes
+ * what the link usually does and is the honest thing to log. The maximum is
+ * what an input-delay window has to survive: a budget sized to the median of an
+ * access-point link is blown by every spike, which is measurable as a stall
+ * share rather than as latency. */
+bool NetLink_rttStats(uint32_t* median_us, uint32_t* max_us, unsigned* samples) {
+	uint32_t sorted[RTT_SAMPLES];
+	unsigned n;
+	pthread_mutex_lock(&nl.lock);
+	n = nl.rtt_count;
+	memcpy(sorted, nl.rtt_us, sizeof(sorted));
+	pthread_mutex_unlock(&nl.lock);
+	if (samples) *samples = n;
+	if (!n) return false;
+	for (unsigned i = 1; i < n; i++) {
+		uint32_t v = sorted[i];
+		unsigned j = i;
+		while (j && sorted[j - 1] > v) { sorted[j] = sorted[j - 1]; j--; }
+		sorted[j] = v;
+	}
+	if (median_us) *median_us = sorted[n / 2];
+	if (max_us) *max_us = sorted[n - 1];
+	return true;
+}
+
 bool NetLink_sendLinkVerdict(bool can_pair, uint32_t reason) {
 	uint32_t wire[2] = { htonl(can_pair ? 1u : 0u), htonl(reason) };
 	return send_command(CMD_LINK_VERDICT, wire, sizeof(wire));
@@ -1088,7 +1220,7 @@ bool NetLink_sendHash(uint32_t frame, uint32_t hash) {
 }
 
 bool NetLink_sendSessionIdentity(const NetLinkSessionIdentity* identity) {
-	uint8_t wire[60];
+	uint8_t wire[68];
 	memcpy(wire, identity->rom_sha256, 32);
 	uint32_t v = htonl(identity->mode); memcpy(wire + 32, &v, 4);
 	v = htonl(identity->input_delay); memcpy(wire + 36, &v, 4);
@@ -1097,6 +1229,11 @@ bool NetLink_sendSessionIdentity(const NetLinkSessionIdentity* identity) {
 	v = htonl(identity->sram_size); memcpy(wire + 48, &v, 4);
 	v = htonl(identity->rtc_size); memcpy(wire + 52, &v, 4);
 	v = htonl(identity->rom_size); memcpy(wire + 56, &v, 4);
+	/* Split rather than sent as a 64-bit field: everything else on this wire is
+	 * a pair of 32-bit halves in network order, and a clock is not worth being
+	 * the one place that needs a htonll. */
+	v = htonl((uint32_t)(identity->wall_clock_utc >> 32)); memcpy(wire + 60, &v, 4);
+	v = htonl((uint32_t)identity->wall_clock_utc); memcpy(wire + 64, &v, 4);
 	return send_command(CMD_SESSION_IDENTITY, wire, sizeof(wire));
 }
 
@@ -1223,6 +1360,8 @@ bool NetLink_popPacket(void* out, size_t out_cap, size_t* out_len) {
 	memcpy(out, p->data, n);
 	*out_len = n;
 	nl.q_head = (nl.q_head + 1) % QUEUE_SIZE;
+	/* Serial data reached the core, so whatever it was waiting for arrived. */
+	nl.starved_since.tv_sec = nl.starved_since.tv_usec = 0;
 
 	pthread_mutex_unlock(&nl.lock);
 	return true;

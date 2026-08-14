@@ -50,7 +50,7 @@ GAMBATTE_SRC := $(CORE_SRC_ROOT)/gambatte
 GAMBATTE_DUAL_SRC := $(CORE_SRC_ROOT)/gambatte-dual
 GPSP_SRC     := $(CORE_SRC_ROOT)/gpsp
 GAMBATTE_REPO := https://github.com/bmpriest/gambatte-libretro.git
-GAMBATTE_REV  := 70f86206f3a903f91892fb873220253a1b718d26
+GAMBATTE_REV  := 960de8b40c92c015f93f56979983ce3dcab2ddf8
 GPSP_REPO     := https://github.com/libretro/gpsp.git
 GPSP_REV      := 69e86ebe89f14c3f5f75b809c12c0a953b3d6ce4
 GPSP_PATCHES := cores/patches/gpsp-platforms.patch cores/patches/gpsp-001-rfu-disconnect.patch cores/patches/gpsp-002-rfu-queue-size.patch cores/patches/gpsp-003-netplay-version.patch
@@ -251,6 +251,7 @@ test:
 	@./shim/test/run.sh
 	@./shim/test/link.sh
 	@./shim/test/dual.sh
+	@./cores/tests/run.sh
 	@./launcher/test.sh
 
 ###########################################################
@@ -286,7 +287,7 @@ dist-base: $(BASE_DIST_CHECKS)
 	@cp launcher/pak-launch.sh "$(BASE_STAGE)/$(PAK)/launch.sh"
 	@cp launcher/minarch.elf launcher/launch-stub.sh launcher/adhoc-join.sh launcher/wifi-watchdog.sh \
 	    launcher/install-stubs.sh launcher/wrap-pak.sh launcher/bind-mount.sh launcher/pre-launch.sh \
-	    launcher/mount-common.sh \
+	    launcher/mount-common.sh launcher/gameswitcher.sh launcher/gameswitcher-launch.sh \
 	    "$(BASE_STAGE)/$(PAK)/launcher/"
 	@cp launcher/session.conf.example "$(BASE_STAGE)/$(PAK)/"
 	@mkdir -p "$(BASE_STAGE)/$(PAK)/cores/override"

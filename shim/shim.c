@@ -84,6 +84,17 @@
 #define RECOVERY_TIMEOUT_MS 10000
 #define RECOVERY_FRAME_JUMP 512
 #define PEER_WAIT_TIMEOUT_MS 30000
+/* How long a link core may sit inside retro_run with an empty queue and a live
+ * peer before the session says so. Deliberately generous and deliberately not a
+ * new number: it is netlink's own TIMEOUT_MS, the point at which that layer
+ * already considers a connection unresponsive.
+ *
+ * The trigger is "core blocked AND queue empty AND peer connected", never
+ * "quiet". A Gen 3 trade legitimately goes silent while a player reads a menu
+ * and a turn-based game can go silent for minutes; neither has the core blocked
+ * on a byte. Tunable while the threshold is still a judgement call rather than
+ * a measurement. */
+#define LINK_STARVE_TIMEOUT_MS 5000
 #define MAX_DESYNC_RECOVERIES 3
 #define DESYNC_WINDOW_MS 60000
 
@@ -177,6 +188,7 @@ typedef struct {
 	size_t   (*dual_serialize_size)(void);
 	bool     (*dual_serialize)(void*, size_t);
 	bool     (*dual_unserialize)(const void*, size_t);
+	bool     (*dual_set_clock_epochs)(uint64_t, uint64_t);
 } Core;
 
 static Core core;
@@ -217,6 +229,17 @@ static struct timeval dual_wait_since;
  * nothing to recover from either: an in-process cable has no resync protocol.
  * The value is telling the players immediately instead of leaving them to
  * discover it by watching each other's console do something it never did. */
+/* Taken once and reused, at the same protocol point on both devices.
+ *
+ * The paired state is the only thing the two replicas can be compared by, so
+ * everything here is arranged so both devices perform the same operations in
+ * the same order. That discipline was worth keeping even after the reason for
+ * needing it turned out to be a core bug: gambatte serialized uninitialised
+ * SaveState members for any non-Sachen cartridge, which made saveState() vary
+ * per call and per process. Fixed upstream; this stays because a protocol that
+ * only works when state operations are free is one bad assumption from
+ * silently diverging again. */
+static size_t dual_state_size;
 static void* dual_hash_buf;
 static size_t dual_hash_buf_len;
 static uint32_t dual_hash_skips;
@@ -230,6 +253,10 @@ static uint32_t dual_pair_run_max_us;
  * network serial - see request_serial_fallback(). */
 static char dual_local_rom_path[512];
 static uint32_t dual_local_rom_size;
+/* This device's clock as declared to the peer. Kept rather than re-read, so
+ * that the epochs both devices install are the ones they exchanged and not two
+ * later readings that would no longer be the same pair. */
+static uint64_t dual_local_wall_clock;
 static char dual_peer_rom_path[512];
 static int dual_peer_rom_found;
 static int dual_same_rom;
@@ -361,6 +388,137 @@ static char guest_save_dir[256];
 static char startup_notice[96];
 static struct timeval startup_notice_started;
 static unsigned startup_notice_frame;
+
+//////////////////////////////////////////////////////////////////////////////
+// CPU frequency
+//
+// A paired session emulates two consoles per device, and on the A30 that was
+// being done at 648MHz of an available 1344MHz. NextUI's default CPU Speed is
+// "Auto", which on my282 means the conservative governor with up_threshold=80
+// over a 10ms window - and a frame-paced emulator never looks busy to that. It
+// computes for two or three milliseconds and then waits for the next frame, so
+// measured load sits near 12-20% and the governor stays at its floor
+// indefinitely. Under four full-load spinners the same device ramps to 1344MHz
+// in about two seconds, so the headroom is real; nothing in a well-behaved
+// emulator ever asks for it.
+//
+// So the frequency is pinned here rather than left to a heuristic that is
+// measuring the wrong thing. Doing it through the frontend's own core option
+// would not work: minarch applies minarch_cpu_speed after the core is loaded,
+// so anything set earlier is overwritten. This runs from the frame loop, after
+// that has happened, and re-asserts periodically in case a menu round trip
+// puts it back.
+//
+// Only for an armed session, and restored at teardown - a device left pinned
+// after play would quietly cost battery for the rest of the day.
+//////////////////////////////////////////////////////////////////////////////
+
+#define CPU_MAX_POLICIES 8
+
+static struct {
+	char path[160];
+	char governor[32];
+	char min_freq[32];
+} cpu_saved[CPU_MAX_POLICIES];
+static int cpu_saved_count;
+static int cpu_pin_failed;
+
+static const char* cpufreq_root(void) {
+	const char* root = getenv("NETPLAY_CPUFREQ_ROOT");
+	return root && root[0] ? root : "/sys/devices/system/cpu";
+}
+
+static bool read_line_file(const char* path, char* out, size_t len) {
+	FILE* f = fopen(path, "r");
+	if (!f) return false;
+	bool ok = fgets(out, (int)len, f) != NULL;
+	fclose(f);
+	if (!ok) return false;
+	char* nl = strpbrk(out, "\r\n");
+	if (nl) *nl = '\0';
+	return out[0] != '\0';
+}
+
+static bool write_line_file(const char* path, const char* value) {
+	/* These are commonly 0444 even for root, which is why NextUI's own
+	 * PLAT_setCPUSpeed widens them before writing. */
+	struct stat info;
+	if (stat(path, &info) == 0 && !(info.st_mode & S_IWUSR))
+		chmod(path, (info.st_mode & 0777) | S_IWUSR);
+	FILE* f = fopen(path, "w");
+	if (!f) return false;
+	bool ok = fputs(value, f) >= 0;
+	if (fclose(f) != 0) ok = false;
+	return ok;
+}
+
+/* Pin every policy to its own maximum. Idempotent: safe to call repeatedly,
+ * and only reports once. */
+static void cpu_pin_performance(void) {
+	if (cpu_pin_failed) return;
+
+	const bool first = cpu_saved_count == 0;
+	int pinned = 0;
+	for (int i = 0; i < CPU_MAX_POLICIES; i++) {
+		char dir[128], path[192], value[32], maxfreq[32];
+		snprintf(dir, sizeof(dir), "%s/cpu%d/cpufreq", cpufreq_root(), i);
+		snprintf(path, sizeof(path), "%s/scaling_governor", dir);
+		if (!read_line_file(path, value, sizeof(value))) continue;
+
+		if (first) {
+			snprintf(cpu_saved[cpu_saved_count].path, sizeof(cpu_saved[0].path), "%s", dir);
+			snprintf(cpu_saved[cpu_saved_count].governor,
+			         sizeof(cpu_saved[0].governor), "%s", value);
+			char minpath[192];
+			snprintf(minpath, sizeof(minpath), "%s/scaling_min_freq", dir);
+			if (!read_line_file(minpath, cpu_saved[cpu_saved_count].min_freq,
+			                    sizeof(cpu_saved[0].min_freq)))
+				cpu_saved[cpu_saved_count].min_freq[0] = '\0';
+			cpu_saved_count++;
+		}
+
+		if (!strcmp(value, "performance")) { pinned++; continue; }
+
+		/* Raise the floor as well as the governor. On a kernel that refuses an
+		 * unknown governor the floor alone still buys most of the difference. */
+		char maxpath[192], minpath[192];
+		snprintf(maxpath, sizeof(maxpath), "%s/scaling_max_freq", dir);
+		snprintf(minpath, sizeof(minpath), "%s/scaling_min_freq", dir);
+		if (read_line_file(maxpath, maxfreq, sizeof(maxfreq)))
+			write_line_file(minpath, maxfreq);
+		if (write_line_file(path, "performance")) pinned++;
+	}
+
+	if (first) {
+		if (!cpu_saved_count) {
+			cpu_pin_failed = 1;
+			shim_log("no cpufreq policies under %s; leaving CPU scaling alone\n",
+			         cpufreq_root());
+			return;
+		}
+		char now[32] = "?";
+		char path[192];
+		snprintf(path, sizeof(path), "%s/scaling_governor", cpu_saved[0].path);
+		read_line_file(path, now, sizeof(now));
+		shim_log("pinned %d of %d CPU policies to performance (was '%s', now '%s')\n",
+		         pinned, cpu_saved_count, cpu_saved[0].governor, now);
+	}
+}
+
+static void cpu_restore(void) {
+	for (int i = 0; i < cpu_saved_count; i++) {
+		char path[192];
+		snprintf(path, sizeof(path), "%s/scaling_governor", cpu_saved[i].path);
+		write_line_file(path, cpu_saved[i].governor);
+		if (cpu_saved[i].min_freq[0]) {
+			snprintf(path, sizeof(path), "%s/scaling_min_freq", cpu_saved[i].path);
+			write_line_file(path, cpu_saved[i].min_freq);
+		}
+	}
+	if (cpu_saved_count)
+		shim_log("restored CPU scaling to '%s'\n", cpu_saved[0].governor);
+	cpu_saved_count = 0;
+}
 
 static void show_runtime_notice(const char* message) {
 	snprintf(startup_notice, sizeof(startup_notice), "%s", message ? message : "");
@@ -562,12 +720,13 @@ static bool core_has_dual_contract(void) {
 	const uint64_t required = GAMBATTE_DUAL_CAP_TWO_CONTENTS |
 	                          GAMBATTE_DUAL_CAP_CONSOLE_MEMORY |
 	                          GAMBATTE_DUAL_CAP_VISIBLE_CONSOLE |
-	                          GAMBATTE_DUAL_CAP_PAIRED_CHECKPOINT;
+	                          GAMBATTE_DUAL_CAP_PAIRED_CHECKPOINT |
+	                          GAMBATTE_DUAL_CAP_CLOCK_EPOCHS;
 	if (!core.dual_get_abi_version || !core.dual_get_capabilities ||
 	    !core.dual_set_visible_console || !core.dual_get_memory_data ||
 	    !core.dual_get_memory_size || !core.dual_is_checkpoint_safe ||
 	    !core.dual_serialize_size || !core.dual_serialize ||
-	    !core.dual_unserialize)
+	    !core.dual_unserialize || !core.dual_set_clock_epochs)
 		return false;
 	return core.dual_get_abi_version() == GAMBATTE_DUAL_ABI_VERSION &&
 	       (core.dual_get_capabilities() & required) == required;
@@ -647,6 +806,14 @@ static void apply_required_options(void) {
 
 // Both peers must agree on the delay, so it is written by the app into both
 // session files rather than negotiated.
+/* input_delay=N pins the value; input_delay=auto (or an absent line) leaves it
+ * to be derived from the measured round trip during the handshake. A pinned
+ * value is still only this device's proposal - see delay negotiation below,
+ * where both sides adopt the higher of the two. Agreement matters more than
+ * either side's preference, and a pin that could break agreement would be a
+ * desync rather than an override. */
+static int input_delay_pinned;
+
 static int session_input_delay(const char* path) {
 	FILE* f = fopen(path, "r");
 	if (!f) return INPUT_DELAY_DEFAULT;
@@ -654,10 +821,63 @@ static int session_input_delay(const char* path) {
 	int v = INPUT_DELAY_DEFAULT;
 	while (fgets(line, sizeof(line), f)) {
 		int n;
-		if (sscanf(line, "input_delay=%d", &n) == 1 && n >= 1 && n <= 20) v = n;
+		if (sscanf(line, "input_delay=%d", &n) == 1 && n >= 1 && n <= 20) {
+			v = n;
+			input_delay_pinned = 1;
+		} else if (!strncmp(line, "input_delay_auto=1", 18)) {
+			/* Negotiate, but keep the number above as the fallback for a link
+			 * that never answers a probe - the app picks it from the transport
+			 * actually in use, which is better than any constant here. */
+			input_delay_pinned = 0;
+		}
 	}
 	fclose(f);
 	return v;
+}
+
+/* Frames of delay the measured link actually needs: one frame per frame of the
+ * worst observed round trip, plus one for jitter.
+ *
+ * From the maximum rather than the median, because the window has to survive
+ * the spikes. Checked against the measurements in app/netsetup.h, which were
+ * taken on these two devices and hand-tuned into NS_INPUT_DELAY_ADHOC/WIFI:
+ *
+ *   ad hoc, max 21.5ms   -> 3 frames   (hand-tuned value: 3)
+ *   via AP,  max 118ms   -> 9 frames   (hand-tuned value: 10)
+ *   via AP,  max 300ms   -> 19 frames
+ *
+ * Sizing from the median would have proposed 2 and 4 for those same links, and
+ * the 3-over-AP case is already recorded there as 33-47fps with 63-74% of
+ * frames stalled. Returns 0 when nothing has been measured yet. */
+static int rtt_proposed_delay(void) {
+	uint32_t max_us = 0, median_us = 0;
+	unsigned samples = 0;
+	if (!NetLink_rttStats(&median_us, &max_us, &samples)) return 0;
+	long frames = ((long)max_us + 16700 - 1) / 16700;
+	long delay = frames + 1;
+	if (delay < 2) delay = 2;
+	if (delay > 20) delay = 20;
+	shim_log("link rtt over %u samples: median %u.%ums, max %u.%ums -> delay %ld\n",
+	         samples, median_us / 1000, (median_us % 1000) / 100,
+	         max_us / 1000, (max_us % 1000) / 100, delay);
+	return (int)delay;
+}
+
+/* How long to let probes accumulate before proposing. At one probe per 100ms
+ * this is around ten samples, which is enough for a maximum to have seen a
+ * spike, and short enough to disappear behind the bootstrap overlay. */
+#define RTT_SETTLE_MS 1000
+
+/* Both sides adopt the higher proposal. Order-independent and needs no extra
+ * round trip, which is what preserves the exact-agreement invariant the
+ * timeline priming depends on: whatever order the two identities cross in, both
+ * arrive at the same number. */
+static void adopt_peer_delay(uint32_t peer_delay, const char* who) {
+	if (peer_delay < 1 || peer_delay > 20) return;
+	if ((uint32_t)input_delay >= peer_delay) return;
+	shim_log("%s proposed input delay %u; adopting it over our %d\n",
+	         who, peer_delay, input_delay);
+	input_delay = (int)peer_delay;
 }
 
 static const char* find_option_override(const char* key) {
@@ -714,6 +934,7 @@ static const char* resolve_core(Core* target) {
 	target->dual_serialize_size = dlsym(target->handle, "retro_dual_serialize_size");
 	target->dual_serialize = dlsym(target->handle, "retro_dual_serialize");
 	target->dual_unserialize = dlsym(target->handle, "retro_dual_unserialize");
+	target->dual_set_clock_epochs = dlsym(target->handle, "retro_dual_set_clock_epochs");
 #undef RESOLVE_TO
 	return missing;
 }
@@ -1175,10 +1396,42 @@ static void shim_netpacket_send(int flags, const void* buf, size_t len, uint16_t
 	NetLink_send(flags, buf, len, client_id);
 }
 
-// The core may call this to read mid-frame rather than waiting for the next
-// poll. Receiving happens on the netlink thread, so there is nothing to pump
-// here - packets are already queued and will be delivered by deliver_packets().
+/* Packets are read off the socket by the netlink worker the moment they land,
+ * but they only reach the core through here. Delivering them once per frame is
+ * the wrong clock for a serial exchange: a byte that arrived 1ms into a frame
+ * waits out the remaining 15ms before the core can see it, and a Gen 1 party
+ * trade is hundreds of sequential transactions each paying that toll.
+ *
+ * The budget is per frame rather than per call, and shared with the frame-top
+ * drain, so a core that polls in a tight loop cannot spend the frame delivering
+ * packets and never return to the frontend. */
+static int netpacket_budget;
+static void link_note_delivery(void);
+
+static void deliver_packets(void) {
+	uint8_t buf[NETLINK_MAX_PACKET];
+	size_t len;
+	while (netpacket_budget > 0 && NetLink_popPacket(buf, sizeof(buf), &len)) {
+		netpacket_budget--;
+		link_note_delivery();
+		core_netpacket.receive(buf, len, NetLink_remoteClientId());
+	}
+}
+
+/* The core asking to read mid-frame, which is the entire point of the libretro
+ * netpacket poll_receive callback.
+ *
+ * Re-entrancy: a core is permitted to call this from inside its own receive
+ * handler, and delivering from there would recurse through the same handler
+ * with the next packet. One depth counter makes the nested call a no-op, which
+ * is correct rather than merely safe - the outer loop delivers that packet as
+ * soon as the handler returns. */
 static void shim_netpacket_poll_receive(void) {
+	static int in_delivery;
+	if (!netpacket_started || in_delivery) return;
+	in_delivery = 1;
+	deliver_packets();
+	in_delivery = 0;
 }
 
 static const char* dual_core_option(const char* key);
@@ -1824,11 +2077,11 @@ static bool identity_matches(const NetLinkSessionIdentity* peer) {
 		shim_log("refusing peer: ROM content hashes differ\n");
 		return false;
 	}
-	if (peer->mode != 1 || peer->input_delay != (uint32_t)input_delay) {
-		shim_log("refusing peer: mode/input delay differs (peer %u/%u, ours 1/%d)\n",
-		         peer->mode, peer->input_delay, input_delay);
+	if (peer->mode != 1) {
+		shim_log("refusing peer: mode differs (peer %u, ours 1)\n", peer->mode);
 		return false;
 	}
+	adopt_peer_delay(peer->input_delay, "peer");
 	if (peer->core_identity != mine || peer->state_size != state_size ||
 	    peer->sram_size != sram_size || peer->rtc_size != rtc_size) {
 		shim_log("refusing peer: core/state/persistent-memory identity differs "
@@ -1872,6 +2125,17 @@ static void netplay_handshake(void) {
 	}
 
 	if (!connection_identity_sent) {
+		/* Same settle-then-propose as the instanced path; recovery_started is
+		 * set at the generation change, so it dates the connection. */
+		if (!input_delay_pinned) {
+			int proposed = rtt_proposed_delay();
+			if (!proposed && elapsed_ms(&recovery_started) < RTT_SETTLE_MS) return;
+			if (proposed && proposed != input_delay) {
+				shim_log("measured link proposes input delay %d (was %d)\n",
+				         proposed, input_delay);
+				input_delay = proposed;
+			}
+		}
 		NetLinkSessionIdentity mine;
 		memset(&mine, 0, sizeof(mine));
 		memcpy(mine.rom_sha256, rom_sha256, 32);
@@ -1879,6 +2143,7 @@ static void netplay_handshake(void) {
 		mine.input_delay = (uint32_t)input_delay;
 		mine.core_identity = core_identity();
 		mine.state_size = (uint32_t)core.serialize_size();
+		mine.wall_clock_utc = (uint64_t)time(NULL);
 		if (!persistent_memory_sizes(&mine.sram_size, &mine.rtc_size)) {
 			recovery_fail("Could not inspect local save memory. Exit the game.");
 			return;
@@ -1894,7 +2159,8 @@ static void netplay_handshake(void) {
 			return;
 		}
 		connection_identity_checked = 1;
-		shim_log("ROM and core identity match peer\n");
+		shim_log("ROM and core identity match peer; agreed input delay %d\n",
+		         input_delay);
 	}
 
 	if (!connection_sync_pending || NetLink_getRole() != NETLINK_ROLE_HOST ||
@@ -2282,6 +2548,75 @@ static void netplay_reportPacing(void) {
 	stat_since = now;
 }
 
+/* The link path carries real GB/GBA serial traffic over Wi-Fi and, alone of the
+ * three session paths, reported nothing at all about how it was pacing. It is
+ * the one whose timing is most fragile, so it was also the one we could not see
+ * into: "trading feels slow" had no number attached to it.
+ *
+ * The histogram is the useful part. Attribution here is not fps - the cores
+ * keep their own timing on this path - it is whether serial data is flowing
+ * between frames or arriving frame-locked, which is exactly the before/after
+ * signal for delivering packets mid-frame. */
+static int link_starved_reported;
+
+/* Tunable so the threshold can be chosen from the telemetry above rather than
+ * from taste, and so a device test can force it without a rebuild. */
+static long link_starve_timeout_ms(void) {
+	static long timeout = -1;
+	if (timeout >= 0) return timeout;
+	timeout = LINK_STARVE_TIMEOUT_MS;
+	const char* value = getenv("NETPLAY_LINK_STARVE_MS");
+	if (value) {
+		long requested = strtol(value, NULL, 10);
+		if (requested >= 500 && requested <= 300000) timeout = requested;
+	}
+	return timeout;
+}
+
+static uint32_t link_frames;
+static uint32_t link_delivered;
+static uint32_t link_paused_frames;
+static uint32_t link_gap_buckets[4];   /* <1 frame, 1-2, 2-4, >4 */
+static struct timeval link_last_delivery;
+static struct timeval link_since;
+
+static void link_note_delivery(void) {
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	link_delivered++;
+	if (link_last_delivery.tv_sec) {
+		uint32_t us = timeval_delta_us(&link_last_delivery, &now);
+		unsigned frames16 = us / 16700;
+		unsigned bucket = frames16 == 0 ? 0 : frames16 == 1 ? 1 : frames16 < 4 ? 2 : 3;
+		link_gap_buckets[bucket]++;
+	}
+	link_last_delivery = now;
+}
+
+static void link_report_pacing(void) {
+	if (!link_since.tv_sec) { gettimeofday(&link_since, NULL); return; }
+	if (link_frames % PACING_INTERVAL) return;
+
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	long ms = (now.tv_sec - link_since.tv_sec) * 1000L
+	        + (now.tv_usec - link_since.tv_usec) / 1000L;
+	if (ms <= 0) return;
+
+	unsigned fps10 = (unsigned)((link_frames * 10000UL) / (unsigned long)ms);
+	shim_log("link pacing: %u frames in %ldms (%u.%u fps), %u packets, "
+	         "%u dropped, %u frames peer-paused\n",
+	         link_frames, ms, fps10 / 10, fps10 % 10, link_delivered,
+	         NetLink_droppedPackets(), link_paused_frames);
+	shim_log("link delivery gaps: sub-frame %u, 1-2 frames %u, 2-4 %u, over 4 %u\n",
+	         link_gap_buckets[0], link_gap_buckets[1],
+	         link_gap_buckets[2], link_gap_buckets[3]);
+
+	link_frames = link_delivered = link_paused_frames = 0;
+	memset(link_gap_buckets, 0, sizeof(link_gap_buckets));
+	link_since = now;
+}
+
 // Cheap rolling checksum; we only need to notice divergence, not locate it.
 static bool capture_state(void** out, size_t* out_len, uint32_t* out_hash) {
 	return capture_authoritative_state(out, out_len, out_hash);
@@ -2410,13 +2745,10 @@ static void pump_netpacket(void) {
 
 	if (!netpacket_started) return;
 
-	uint8_t buf[NETLINK_MAX_PACKET];
-	size_t len;
-	int delivered = 0;
-	while (delivered < MAX_PACKETS_PER_FRAME && NetLink_popPacket(buf, sizeof(buf), &len)) {
-		core_netpacket.receive(buf, len, NetLink_remoteClientId());
-		delivered++;
-	}
+	/* One budget per frontend frame, refilled here and spent by both this drain
+	 * and any poll_receive the core makes before the frame ends. */
+	netpacket_budget = MAX_PACKETS_PER_FRAME;
+	deliver_packets();
 
 	if (core_netpacket.poll) core_netpacket.poll();
 }
@@ -2693,6 +3025,7 @@ void retro_deinit(void) {
 	free(dual_hash_buf);
 	dual_hash_buf = NULL;
 	dual_hash_buf_len = 0;
+	cpu_restore();
 	core.deinit();
 }
 
@@ -2790,6 +3123,7 @@ static void dual_reset_bootstrap(void) {
 	memset(own_hashes, 0, sizeof(own_hashes));
 	memset(pending_peer_hashes, 0, sizeof(pending_peer_hashes));
 	dual_hash_skips = 0;
+	dual_state_size = 0;
 	NetLink_resetSync();
 }
 
@@ -3035,6 +3369,18 @@ static bool dual_bootstrap_tick(void) {
 			dual_fail("Could not identify the local cartridge.");
 			return false;
 		}
+		/* Let the probes settle before proposing, but never wait on them: a link
+		 * that has not answered one probe in RTT_SETTLE_MS is not one whose
+		 * measurement we would trust anyway, and the configured value stands. */
+		if (!input_delay_pinned) {
+			int proposed = rtt_proposed_delay();
+			if (!proposed && elapsed_ms(&dual_wait_since) < RTT_SETTLE_MS) return false;
+			if (proposed && proposed != input_delay) {
+				shim_log("measured link proposes input delay %d (was %d)\n",
+				         proposed, input_delay);
+				input_delay = proposed;
+			}
+		}
 		NetLinkSessionIdentity mine;
 		memset(&mine, 0, sizeof(mine));
 		memcpy(mine.rom_sha256, rom_sha256, sizeof(mine.rom_sha256));
@@ -3042,6 +3388,8 @@ static bool dual_bootstrap_tick(void) {
 		mine.input_delay = (uint32_t)input_delay;
 		mine.core_identity = core_identity();
 		mine.rom_size = dual_local_rom_size;
+		mine.wall_clock_utc = (uint64_t)time(NULL);
+		dual_local_wall_clock = mine.wall_clock_utc;
 		/* state_size and the save-memory sizes describe the *pair*, and the pair
 		 * is not final until linked content is loaded below. They are checked
 		 * where they are used: apply_dual_memory compares sizes against the
@@ -3055,10 +3403,11 @@ static bool dual_bootstrap_tick(void) {
 	if (!dual_identity_checked) {
 		NetLinkSessionIdentity peer;
 		if (!NetLink_takeSessionIdentity(&peer)) return false;
-		if (peer.mode != 2 || peer.input_delay != (uint32_t)input_delay) {
+		if (peer.mode != 2) {
 			dual_fail("Peer is not set up for instanced link play.");
 			return false;
 		}
+		adopt_peer_delay(peer.input_delay, "peer");
 		if (peer.core_identity != core_identity()) {
 			request_serial_fallback(NETLINK_LINK_CORE_MISMATCH);
 			return false;
@@ -3075,7 +3424,27 @@ static bool dual_bootstrap_tick(void) {
 			dual_peer_rom_found = 0;
 			shim_log("peer declared an implausible cartridge size %u\n", peer.rom_size);
 		}
+		/* Each cartridge should show its own owner's time of day, and both
+		 * devices have to install the same pair for the two replicas to agree.
+		 * Console A is the host's, console B the client's, so both sides can
+		 * work out the same two numbers from the two identities. */
+		{
+			const uint64_t host_clock = NetLink_getRole() == NETLINK_ROLE_HOST
+			                          ? dual_local_wall_clock : peer.wall_clock_utc;
+			const uint64_t client_clock = NetLink_getRole() == NETLINK_ROLE_HOST
+			                            ? peer.wall_clock_utc : dual_local_wall_clock;
+			if (!core.dual_set_clock_epochs(host_clock, client_clock)) {
+				dual_fail("Could not set the linked cartridge clocks.");
+				return false;
+			}
+			shim_log("cartridge clocks set: A=%llu B=%llu (peer is %+lld s from us)\n",
+			         (unsigned long long)host_clock,
+			         (unsigned long long)client_clock,
+			         (long long)((int64_t)peer.wall_clock_utc -
+			                     (int64_t)dual_local_wall_clock));
+		}
 		dual_identity_checked = 1;
+		shim_log("peer identity accepted; agreed input delay %d\n", input_delay);
 	}
 
 	if (!dual_verdict_sent) {
@@ -3153,26 +3522,43 @@ static bool dual_bootstrap_tick(void) {
 	 * timing difference before the first synchronized input frame. */
 	if (NetLink_getRole() == NETLINK_ROLE_HOST && !dual_checkpoint_sent) {
 		if (!core.dual_is_checkpoint_safe()) return false;
-		size_t len = core.dual_serialize_size();
+		dual_state_size = core.dual_serialize_size();
+		size_t len = dual_state_size;
 		void* state = len ? malloc(len) : NULL;
+		/* Zero first: the shared-screen capture does the same, and a buffer the
+		 * core does not completely fill would otherwise put this device's heap
+		 * into a payload both devices hash. */
+		if (state) memset(state, 0, len);
 		if (!state || !core.dual_serialize(state, len)) {
 			free(state);
 			dual_fail("Could not capture paired Gambatte checkpoint.");
 			return false;
 		}
 		bool sent = NetLink_sendState(NETLINK_STATE_PAIRED_CHECKPOINT, state, len);
+		/* Adopt our own checkpoint, so the last state-affecting operation is
+		 * the identical unserialize on both devices rather than a capture here
+		 * and a restore there. Costs one load at bootstrap and removes a whole
+		 * class of asymmetry between the two replicas. */
+		bool adopted = sent && core.dual_unserialize(state, len);
 		free(state);
 		if (!sent) return false;
+		if (!adopted) {
+			dual_fail("Host could not adopt its own paired checkpoint.");
+			return false;
+		}
 		dual_checkpoint_sent = dual_checkpoint_loaded = 1;
-		shim_log("sent authoritative paired checkpoint (%zu bytes)\n", len);
+		shim_log("sent authoritative paired checkpoint (%zu bytes) and adopted it\n", len);
 	}
 	if (NetLink_getRole() == NETLINK_ROLE_CLIENT && !dual_checkpoint_loaded) {
 		void* state = NULL;
 		size_t len = 0;
 		if (!NetLink_takeState(NETLINK_STATE_PAIRED_CHECKPOINT, &state, &len))
 			return false;
+		/* Same point in the exchange as the host's, so both devices have called
+		 * the mutating size query exactly once by the time play starts. */
+		dual_state_size = core.dual_serialize_size();
 		bool loaded = core.dual_is_checkpoint_safe() &&
-		              len == core.dual_serialize_size() &&
+		              len == dual_state_size &&
 		              core.dual_unserialize(state, len);
 		free(state);
 		if (!loaded) {
@@ -3276,18 +3662,28 @@ static bool dual_check_agreement(void) {
 	if (!core.dual_serialize_size || !core.dual_serialize) return false;
 
 	if (dual_frame % HASH_INTERVAL == 0) {
+		/* Not a skippable condition. A device that skipped a round would be
+		 * comparing states reached by different routes from then on, and a
+		 * failure there would say nothing about the emulation. The bus is idle
+		 * at a frame boundary
+		 * by construction - both consoles have finished and their service loops
+		 * drained before core.run() returns - so this should not fire; if it
+		 * does, the assumption is wrong and saying so beats poisoning the run. */
 		if (!core.dual_is_checkpoint_safe()) {
-			/* A transfer is mid-flight. Skipping keeps both sides' hashing
-			 * symmetric in content; it costs this round's comparison. */
 			dual_hash_skips++;
-		} else {
-			size_t len = core.dual_serialize_size();
-			if (len && len != dual_hash_buf_len) {
-				free(dual_hash_buf);
-				dual_hash_buf = malloc(len);
-				dual_hash_buf_len = dual_hash_buf ? len : 0;
-			}
-			if (dual_hash_buf && core.dual_serialize(dual_hash_buf, dual_hash_buf_len)) {
+			shim_log("paired state not capturable at frame %u; the serial bus was "
+			         "not idle at a frame boundary\n", dual_frame);
+			dual_recoverable_fail("Could not verify the linked consoles.");
+			return true;
+		}
+		if (dual_state_size && dual_state_size != dual_hash_buf_len) {
+			free(dual_hash_buf);
+			dual_hash_buf = malloc(dual_state_size);
+			dual_hash_buf_len = dual_hash_buf ? dual_state_size : 0;
+		}
+		if (dual_hash_buf) {
+			memset(dual_hash_buf, 0, dual_hash_buf_len);
+			if (core.dual_serialize(dual_hash_buf, dual_hash_buf_len)) {
 				uint32_t mine = hash_bytes(dual_hash_buf, dual_hash_buf_len);
 				unsigned slot = (dual_frame / HASH_INTERVAL) % HASH_HISTORY;
 				own_hashes[slot] = (StateHash){ dual_frame, mine, 1 };
@@ -3452,6 +3848,17 @@ static bool dual_link_tick(void) {
 void retro_run(void) {
 	if (!core.handle) return;
 
+	/* From the frame loop, so it lands after minarch has applied its own CPU
+	 * Speed option, and re-asserted occasionally so a menu round trip cannot
+	 * quietly hand the device back to the conservative governor mid-session. */
+	if (session_active) {
+		static unsigned cpu_pin_countdown;
+		if (!cpu_pin_countdown--) {
+			cpu_pin_performance();
+			cpu_pin_countdown = PACING_INTERVAL;
+		}
+	}
+
 	// Netpacket state and inbound packets are settled before the core runs, so
 	// a frame sees everything that arrived since the last one.
 	pump_netpacket();
@@ -3564,11 +3971,40 @@ void retro_run(void) {
 	}
 	else if (session_active && !netplay_mode) {
 		NetLink_markFrame();
+		link_frames++;
+		link_report_pacing();
+
+		/* The core is blocked on serial data that is not coming. Nothing can be
+		 * injected from here - the shim moves opaque netpacket payloads and has
+		 * no idea what a valid idle word looks like for GameLink or RFU, and a
+		 * filler that collided with a real protocol value would corrupt a trade
+		 * silently. What it can do is stop the freeze being anonymous. */
+		if (!link_starved_reported) {
+			long starved = NetLink_starvedMs();
+			if (starved > link_starve_timeout_ms()) {
+				link_starved_reported = 1;
+				shim_log("link starved: core blocked %ldms with an empty queue "
+				         "and the peer connected\n", starved);
+				recovery_fail("Other player's game stopped sending link data.");
+			}
+		} else if (!NetLink_starvedMs()) {
+			link_starved_reported = 0;
+		}
+		if (recovery_failed) {
+			if (fe_input_poll) fe_input_poll();
+			failure_input_tick();
+			char failure_message[224];
+			failure_overlay_message(failure_message, sizeof(failure_message));
+			present_paused_frame(link_frames, failure_message);
+			present_paused_audio();
+			return;
+		}
 
 		// Peer's frontend is blocked - a menu, a sleep. Running ahead would only
 		// fill a queue it is not draining, so skip the frame. This is a legal
 		// dupe frame; the frontend loop keeps polling input and stays responsive.
 		if (NetLink_isPeerPaused()) {
+			link_paused_frames++;
 			// Input is polled only from inside core.run(). Skip that without
 			// doing this and PAD_poll never runs, so no button - including
 			// MENU - is ever seen and the frontend is frozen, not merely

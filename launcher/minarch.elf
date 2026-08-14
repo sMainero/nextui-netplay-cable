@@ -45,6 +45,67 @@ if [ -z "$NETPLAY_SESSION" ] && [ -f "$NP/state/session" ]; then
 	export NETPLAY_SESSION
 fi
 
+# When the optional Game Switcher integration is enabled this shell must
+# outlive MinArch. Stock MinArch attempts a quicksave before returning to the
+# switcher; the shim correctly rejects that save, but MinArch has already
+# written preview/slot metadata. Snapshot that small metadata set and restore
+# it only when game_switcher.txt proves this was that exit path.
+GS_WRAP=0
+GS_META=
+GS_UI_DIR=
+GS_GAME_NAME=
+GS_MARKER="$SDCARD_PATH/.userdata/shared/.minui/game_switcher.txt"
+
+gameswitcher_prepare() {
+	[ -n "$NETPLAY_SESSION" ] || return 0
+	grep -q '^add_gameswitcher=1$' "$NP/state/settings" 2>/dev/null || return 0
+	ROM_PATH=$1
+	case "$ROM_PATH" in "$SDCARD_PATH/Roms/"*) ;; *) return 0 ;; esac
+
+	_rel=${ROM_PATH#"$SDCARD_PATH/Roms/"}
+	_folder=${_rel%%/*}
+	_tag=$(printf '%s\n' "$_folder" | sed -n 's/.*(\([^()]*\))[^()]*$/\1/p')
+	[ -n "$_tag" ] || return 0
+
+	GS_GAME_NAME=$(basename "$ROM_PATH")
+	_rom_dir=$(dirname "$ROM_PATH")
+	_dir_name=$(basename "$_rom_dir")
+	if [ -f "$_rom_dir/$_dir_name.m3u" ]; then
+		GS_GAME_NAME="$_dir_name.m3u"
+	fi
+
+	GS_UI_DIR="$SDCARD_PATH/.userdata/shared/.minui/$_tag"
+	GS_META="/tmp/netplay-gameswitcher-$$"
+	mkdir -p "$GS_META/original"
+	for _f in "$GS_UI_DIR/$GS_GAME_NAME.txt" \
+	          "$GS_UI_DIR/$GS_GAME_NAME".[0-7].bmp \
+	          "$GS_UI_DIR/$GS_GAME_NAME".[0-7].txt; do
+		[ -f "$_f" ] && cp -p "$_f" "$GS_META/original/"
+	done
+	GS_WRAP=1
+}
+
+gameswitcher_cleanup() {
+	[ "$GS_WRAP" = "1" ] || return 0
+	if [ -f "$GS_MARKER" ]; then
+		# Remove everything the failed quicksave could have created, then put
+		# legitimate pre-session metadata back byte for byte.
+		rm -f "$GS_UI_DIR/$GS_GAME_NAME.txt" \
+		      "$GS_UI_DIR/$GS_GAME_NAME".[0-7].bmp \
+		      "$GS_UI_DIR/$GS_GAME_NAME".[0-7].txt
+		if [ -d "$GS_META/original" ]; then
+			for _f in "$GS_META/original"/*; do
+				[ -f "$_f" ] && cp -p "$_f" "$GS_UI_DIR/"
+			done
+		fi
+		SDCARD_PATH="$SDCARD_PATH" PLATFORM="$PLATFORM" NETPLAY_PAK="$NP" \
+			sh "$NP/launcher/gameswitcher.sh" active "$1" >/dev/null 2>&1
+	fi
+	rm -rf "$GS_META"
+}
+
+gameswitcher_prepare "$1"
+
 # The force flag routes through the shim with no session, which is how
 # passthrough gets verified on device.
 if [ -z "$NETPLAY_SESSION" ] &&
@@ -238,12 +299,14 @@ run_minarch() {
 
 # Nothing to demote from and nothing to capture: hand the process straight over,
 # exactly as before. Anything else needs this shell to outlive minarch.
-if [ "$NETPLAY_DUAL_CORE" != "1" ] && [ "$VERBOSE_LOGS" != "1" ]; then
+if [ "$NETPLAY_DUAL_CORE" != "1" ] && [ "$VERBOSE_LOGS" != "1" ] && [ "$GS_WRAP" != "1" ]; then
 	exec "$REAL_MINARCH" "$SHIM_AS" "$@"
 fi
 if [ "$NETPLAY_DUAL_CORE" != "1" ]; then
 	run_minarch "$@"
-	exit $?
+	rc=$?
+	gameswitcher_cleanup "$1"
+	exit "$rc"
 fi
 
 # Instanced link needs both devices to own both cartridges, and neither device
@@ -272,4 +335,5 @@ if [ -f "$SERIAL_FALLBACK_MARKER" ]; then
 	run_minarch "$@"
 	rc=$?
 fi
+gameswitcher_cleanup "$1"
 exit "$rc"

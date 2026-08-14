@@ -94,6 +94,30 @@ Delete previous Netplay.pak folder. Extract new one.
 4. After both devices are connected, exit the .pak and navigate to the game you want to play together
 5. When you are done playing, go back to the .pak and press X to end the session. Previous wifi networks should be re-established.
 
+### Game Switcher shortcut
+
+`Tools > Settings > Add Netplay to Game Switcher` is off by default. When it is
+enabled, Netplay appears at the top of NextUI's Game Switcher. Opening it starts
+the Netplay Quick app, where you can host, join, or press X to end an armed
+session.
+
+While a session is armed, the Game Switcher intentionally contains only the
+Netplay shortcut. Your normal history is backed up and restored, with Netplay
+kept at the top, when the session ends. NextUI uses the same `recent.txt` data
+for both the Game Switcher and its in-menu Recents folder, so those two views
+cannot have different contents while the session is armed without modifying
+NextUI itself.
+
+From a running netplay game, use NextUI's configured Game Switcher shortcut
+(`MENU+SELECT` on the stock mapping). Netplay's MinArch shell wrapper removes
+the false slot marker/preview produced by MinArch's rejected quicksave and
+restores any metadata that existed before the session. The shipped MinArch
+binary is not modified or replaced.
+
+Controller ports remain fixed at host/player 1 and guest/player 2. Swapping
+ports requires synchronized transport support and is not exposed as a setting
+yet.
+
 ### Saving and save states:
 
 Save states are disabled while in netplay. 

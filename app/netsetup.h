@@ -122,6 +122,7 @@ typedef struct {
 	bool        force_compatibility; /* testing: choose packaged builds even if installed match */
 	bool        verbose_logs; /* retain a complete immutable log for each game launch */
 	bool        simple_client;  /* planned: accept an invitation for a matching local game */
+	bool        add_gameswitcher; /* expose the Netplay quick app in NextUI recents/switcher */
 	NS_InstMode instanced;
 	bool        inst_core[NS_INST_CORES];
 } NS_Settings;

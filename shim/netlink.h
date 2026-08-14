@@ -82,6 +82,24 @@ void NetLink_markFrame(void);
  * removes the very data the blocked core is waiting for - a deadlock. */
 void NetLink_setCoreRunning(bool running);
 
+/* How long the core has been running with nothing queued for it on a live
+ * connection, in milliseconds; 0 when it is not starved.
+ *
+ * Deliberately not a pause signal. A core blocked inside retro_run is working,
+ * and telling the peer otherwise would stop it sending the data being waited
+ * for. This exists so an indefinite freeze can be named and bounded rather than
+ * simply endured. */
+long NetLink_starvedMs(void);
+
+/* Round-trip time over the last few seconds, in microseconds; false until a
+ * probe has completed. Measured continuously on the transport thread, so it
+ * reflects the link rather than either side's frame loop.
+ *
+ * Size an input-delay window from the maximum, not the median: the median says
+ * what the link usually does, and it is the spikes that a lockstep timeline
+ * actually has to survive. */
+bool NetLink_rttStats(uint32_t* median_us, uint32_t* max_us, unsigned* samples);
+
 /* Why we are asking the peer to hold. Only a frontend that has stopped calling
  * retro_run counts: a core blocked *inside* retro_run is working, not absent,
  * and pausing its peer would starve it of what it is waiting for. */
@@ -158,6 +176,13 @@ typedef struct {
 	 * Seasons/Ages), so the peer's ROM has to be findable locally rather than
 	 * merely equal to ours - and a size narrows that search to a hash or two. */
 	uint32_t rom_size;
+	/* This device's time of day, seconds since the Unix epoch. Two handhelds
+	 * are rarely set to the same second - nine seconds apart on the pair this
+	 * was found on - and a cartridge with an RTC turns that difference into
+	 * emulated state as soon as a game latches it. Exchanging both clocks lets
+	 * each device hand the paired core the same pair of epochs, so each
+	 * cartridge shows its own owner's time while both replicas agree. */
+	uint64_t wall_clock_utc;
 } NetLinkSessionIdentity;
 
 /* Sent afresh on each TCP connection, before any serialized state is accepted. */

@@ -20,6 +20,22 @@ share_cores=0       # frozen; no executable core files cross the network
 verbose_logs=1      # retain one full diagnostic log per game process
 #compat_core.gpsp=1
 
+# --- input delay -----------------------------------------------------------
+# Frames of lag traded for tolerance of a late peer. Both devices must end on
+# the same number - each primes its own first input_delay frames with neutral
+# input, so a mismatch diverges during priming and never recovers.
+#
+# With input_delay_auto=1 the shim measures the round trip during the handshake
+# and both peers adopt the higher of their two proposals, which is
+# order-independent and keeps that invariant. The number below is then only the
+# fallback for a link that never answers a probe. The setup app writes both.
+#
+# Drop input_delay_auto to pin a value for testing; pin it on *both* devices,
+# since a one-sided pin is still only a proposal and the peer's higher value
+# wins.
+input_delay=3
+input_delay_auto=1
+
 # --- mode ------------------------------------------------------------------
 # Normally omitted. One armed session covers every system, so the shim decides
 # per launch from the core it wraps: gambatte and gpSP emulate a real cable and

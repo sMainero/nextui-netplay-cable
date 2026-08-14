@@ -43,10 +43,14 @@ static uint16_t                       np_local_id;
 static int                            np_started;
 static unsigned                       np_seq;
 
+static retro_netpacket_poll_receive_t np_poll_receive;
+static int np_in_receive;
+
 static void np_start(uint16_t client_id, retro_netpacket_send_t send_fn,
                      retro_netpacket_poll_receive_t poll_fn) {
 	printf("core:np_start id=%u\n", client_id);
 	np_send = send_fn;
+	np_poll_receive = poll_fn;
 	np_local_id = client_id;
 	np_started = 1;
 }
@@ -54,6 +58,15 @@ static void np_start(uint16_t client_id, retro_netpacket_send_t send_fn,
 static void np_receive(const void* buf, size_t len, uint16_t client_id) {
 	printf("core:np_recv from=%u len=%zu data=%.*s\n",
 	       client_id, len, (int)len, (const char*)buf);
+	/* A core is allowed to poll from inside its own receive handler. The shim
+	 * must make that a no-op rather than recursing through this function with
+	 * the next packet. */
+	if (getenv("FAKE_CORE_POLL_IN_RECEIVE") && np_poll_receive && !np_in_receive) {
+		np_in_receive = 1;
+		np_poll_receive();
+		np_in_receive = 0;
+		printf("core:np_reentrant_poll_returned\n");
+	}
 }
 
 static void np_stop(void) { printf("core:np_stop\n"); np_started = 0; np_send = NULL; }
@@ -205,6 +218,19 @@ void retro_run(void) {
 
 	// Once linked, emit one identifiable packet per frame so the peer's log
 	// proves data crossed the wire.
+	/* FAKE_CORE_MIDFRAME_POLL models a link core doing a serial exchange inside
+	 * one retro_run: put a byte on the wire, then ask to read rather than
+	 * returning to the frontend and waiting out the rest of the frame. */
+	if (np_started && np_send && getenv("FAKE_CORE_MIDFRAME_POLL")) {
+		char msg[32];
+		int n = snprintf(msg, sizeof(msg), "mid%u", np_seq++);
+		np_send(RETRO_NETPACKET_RELIABLE, msg, (size_t)n, 0xFFFF);
+		if (np_poll_receive) {
+			printf("core:midframe_poll seq=%u\n", np_seq);
+			np_poll_receive();
+		}
+	}
+
 	// FAKE_CORE_QUIET simulates a core that has registered the interface but is
 	// not transmitting - a game sitting in a menu, or waiting on the other
 	// player. The peer must keep it alive with heartbeats regardless.
@@ -295,7 +321,18 @@ unsigned retro_dual_get_abi_version(void) { return GAMBATTE_DUAL_ABI_VERSION; }
 uint64_t retro_dual_get_capabilities(void) {
 	return GAMBATTE_DUAL_CAP_TWO_CONTENTS | GAMBATTE_DUAL_CAP_CONSOLE_MEMORY |
 	       GAMBATTE_DUAL_CAP_VISIBLE_CONSOLE | GAMBATTE_DUAL_CAP_PAIRED_CHECKPOINT |
-	       GAMBATTE_DUAL_CAP_TARGETED_RESET;
+	       GAMBATTE_DUAL_CAP_TARGETED_RESET | GAMBATTE_DUAL_CAP_CLOCK_EPOCHS;
+}
+/* Folded into the paired state, exactly as the real core folds the epochs into
+ * its checkpoint header. The two devices' clocks differ, so if the shim ever
+ * handed each side its own reading instead of the agreed pair, the states would
+ * no longer hash equal and the link test would say so. */
+bool retro_dual_set_clock_epochs(uint64_t console_a, uint64_t console_b) {
+	for (unsigned i = 0; i < 8; i++) {
+		dual_state[0][i] = (unsigned char)(console_a >> (i * 8));
+		dual_state[1][i] = (unsigned char)(console_b >> (i * 8));
+	}
+	return true;
 }
 bool retro_dual_set_visible_console(unsigned console) {
 	if (console > GAMBATTE_DUAL_CONSOLE_B) return false;
@@ -321,10 +358,27 @@ bool retro_dual_reset_console(unsigned console) {
 	return true;
 }
 bool retro_dual_is_checkpoint_safe(void) { return true; }
-size_t retro_dual_serialize_size(void) { return sizeof(dual_state); }
+/* Real gambatte's saveState is not a pure read - CPU::saveState rebases the
+ * cycle counter, so serializing changes what the next serialize produces, and
+ * stateSize() runs the same path. A fake core that reads cleanly cannot catch a
+ * protocol which serializes a different number of times on each device, which
+ * is precisely the bug that shipped: the host serialized twice (checkpoint,
+ * then hash) and the guest once, so the two replicas differed at frame 0 with
+ * nothing emulated. Model the mutation. */
+size_t retro_dual_serialize_size(void) {
+	dual_state[0][15]++;   /* the size query runs the same path, so it mutates too */
+	return sizeof(dual_state);
+}
+
+/* Write the bytes, *then* move on. That ordering is the whole hazard: the
+ * payload describes the state the device was in, while the device is left
+ * somewhere else. A peer that adopts the payload therefore lands where the
+ * sender no longer is, and the two disagree from that moment - which is only
+ * visible to a protocol that performs the same operations on both sides. */
 bool retro_dual_serialize(void* data, size_t size) {
 	if (size != sizeof(dual_state)) return false;
 	memcpy(data, dual_state, size);
+	dual_state[0][14]++;
 	return true;
 }
 bool retro_dual_unserialize(const void* data, size_t size) {

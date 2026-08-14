@@ -17,7 +17,7 @@ CC="${CC:-cc}"
 OUT=$(mktemp -d)
 PORT=${PORT:-$((40000 + ($$ % 20000)))}
 cleanup() {
-	kill $HOST_PID $CLIENT_PID 2>/dev/null || true
+	kill $HOST_PID $CLIENT_PID $MFH_PID $MFC_PID 2>/dev/null || true
 	if [ -n "$KEEP_TEST_OUTPUT" ]; then echo "test logs kept at $OUT"; else rm -rf "$OUT"; fi
 }
 trap cleanup EXIT
@@ -608,26 +608,39 @@ retry_runs=$(grep -c "core:run" "$OUT/retry.log" || true)
 	|| { echo "  MISS retry advanced $retry_runs game frames without a peer"; fail=1; }
 
 echo
-echo "== mismatched input delay fails before either core advances"
+# Two differently configured peers must still end on one number, because each
+# side primes its own first input_delay frames with neutral input and a mismatch
+# diverges during priming and never recovers. Refusing the pair enforced that by
+# refusing to play; adopting the higher of the two proposals enforces it while
+# still playing, and is order-independent so it needs no extra round trip.
+echo "== differently configured peers converge on one input delay"
 PORT15=$((PORT + 14))
 printf 'role=host\nport=%s\nmode=netplay\ninput_delay=3\n' "$PORT15" > "$OUT/h15.session"
 printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=netplay\ninput_delay=10\n' "$PORT15" > "$OUT/c15.session"
 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h15.session" \
-	"$OUT/harness" "$SHIM" 120 5 > "$OUT/h15.log" 2>&1 &
+	"$OUT/harness" "$SHIM" 400 5 > "$OUT/h15.log" 2>&1 &
 H15=$!
 sleep 0.2
 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c15.session" \
-	"$OUT/harness" "$SHIM" 120 5 > "$OUT/c15.log" 2>&1 &
+	"$OUT/harness" "$SHIM" 400 5 > "$OUT/c15.log" 2>&1 &
 C15=$!
 wait $H15 2>/dev/null || true
 wait $C15 2>/dev/null || true
-expect "$OUT/h15.log" "mode/input delay differs" "host rejected mismatched delay"
-expect "$OUT/c15.log" "mode/input delay differs" "client rejected mismatched delay"
-h15_runs=$(grep -c "core:run" "$OUT/h15.log" || true)
-c15_runs=$(grep -c "core:run" "$OUT/c15.log" || true)
-[ "$h15_runs" -eq 0 ] && [ "$c15_runs" -eq 0 ] \
-	&& echo "  ok   neither core advanced with incompatible timing" \
-	|| { echo "  MISS mismatched peers advanced (host=$h15_runs client=$c15_runs)"; fail=1; }
+expect "$OUT/h15.log" "adopting it over our 3" "host raised its delay to meet the peer"
+h15_delay=$(sed -n 's/.*agreed input delay \([0-9]*\).*/\1/p' "$OUT/h15.log" | tail -1)
+c15_delay=$(sed -n 's/.*agreed input delay \([0-9]*\).*/\1/p' "$OUT/c15.log" | tail -1)
+[ -n "$h15_delay" ] && [ "$h15_delay" = "$c15_delay" ] \
+	&& echo "  ok   both settled on the same delay ($h15_delay)" \
+	|| { echo "  MISS delays disagree (host=$h15_delay client=$c15_delay)"; fail=1; }
+[ "$h15_delay" = "10" ] \
+	&& echo "  ok   the higher proposal won" \
+	|| { echo "  MISS expected the higher proposal (got $h15_delay)"; fail=1; }
+expect "$OUT/h15.log" "inputsum" "host advanced on the agreed timeline"
+h15_sum=$(sed -n 's/.*core:inputsum frames=\([0-9]*\) sum=\(.*\)/\1 \2/p' "$OUT/h15.log" | tail -1)
+c15_sum=$(sed -n 's/.*core:inputsum frames=\([0-9]*\) sum=\(.*\)/\1 \2/p' "$OUT/c15.log" | tail -1)
+[ -n "$h15_sum" ] && [ "$h15_sum" = "$c15_sum" ] \
+	&& echo "  ok   converged peers ran identical inputs ($h15_sum)" \
+	|| { echo "  MISS input streams differ (host='$h15_sum' client='$c15_sum')"; fail=1; }
 
 echo
 echo "== mode comes from the core, not the session"
@@ -652,6 +665,40 @@ mode_case m2 Gambatte ''            link-cable    "from core"
 mode_case m3 gpSP     ''            link-cable    "from core"
 mode_case m4 FakeCore 'mode=link'   link-cable    "from session"
 mode_case m5 Gambatte 'mode=netplay' shared-screen "from session"
+
+# A serial exchange that fits inside one retro_run only works if a packet that
+# arrived mid-frame is delivered mid-frame. Before deliver_packets existed the
+# core's poll_receive was an empty function and the byte waited out the frame.
+echo
+echo "== a core reading mid-frame gets its packet without a frame boundary"
+MFPORT=$((PORT + 3))
+printf 'role=host\nport=%s\nmode=link\n' "$MFPORT" > "$OUT/mfh.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\n' "$MFPORT" > "$OUT/mfc.session"
+
+FAKE_CORE_NAME=Gambatte FAKE_CORE_MIDFRAME_POLL=1 FAKE_CORE_POLL_IN_RECEIVE=1 \
+	NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/mfh.session" \
+	"$OUT/harness" "$SHIM" 200 15 > "$OUT/mfh.log" 2>&1 &
+MFH_PID=$!
+sleep 0.5
+FAKE_CORE_NAME=Gambatte FAKE_CORE_MIDFRAME_POLL=1 FAKE_CORE_POLL_IN_RECEIVE=1 \
+	NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/mfc.session" \
+	"$OUT/harness" "$SHIM" 200 15 > "$OUT/mfc.log" 2>&1 &
+MFC_PID=$!
+wait $MFH_PID 2>/dev/null || true
+wait $MFC_PID 2>/dev/null || true
+
+expect "$OUT/mfh.log" "core:np_recv" "host core received link packets"
+expect "$OUT/mfh.log" "core:np_reentrant_poll_returned" "a poll from inside receive returned without recursing"
+
+# The assertion that matters: a receive landing between a midframe_poll and the
+# next run is one the frontend frame boundary did not gate.
+if awk '/core:midframe_poll/{p=1;next} /^core:run$/{p=0} /core:np_recv/{if(p){print;exit}}' \
+     "$OUT/mfh.log" | grep -q np_recv; then
+	echo "  ok   packet delivered inside retro_run, before the next frame"
+else
+	echo "  MISS no packet was delivered mid-frame"
+	fail=1
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then

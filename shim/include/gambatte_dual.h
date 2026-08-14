@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define GAMBATTE_DUAL_ABI_VERSION 1u
+#define GAMBATTE_DUAL_ABI_VERSION 2u
 #define GAMBATTE_DUAL_SUBSYSTEM_ID 0x47424c43u
 
 enum gambatte_dual_capability {
@@ -14,6 +14,7 @@ enum gambatte_dual_capability {
 	GAMBATTE_DUAL_CAP_VISIBLE_CONSOLE   = 1u << 2,
 	GAMBATTE_DUAL_CAP_PAIRED_CHECKPOINT = 1u << 3,
 	GAMBATTE_DUAL_CAP_TARGETED_RESET    = 1u << 4,
+	GAMBATTE_DUAL_CAP_CLOCK_EPOCHS      = 1u << 5,
 };
 
 enum gambatte_dual_console {

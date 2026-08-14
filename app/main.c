@@ -34,6 +34,7 @@ typedef enum {
 } Screen;
 
 static int quit = 0;
+static bool quick_mode = false;
 static void on_signal(int s) { (void)s; quit = 1; }
 
 static Screen screen = SCREEN_MENU;
@@ -149,7 +150,7 @@ static int draw_row(SDL_Surface* screen_s, const char* text, int y, bool selecte
 enum { MENU_HOST, MENU_JOIN, MENU_TOOLS, MENU_COUNT };
 enum { HOST_ADHOC, HOST_WIFI, HOST_COUNT };
 enum { TOOL_SETTINGS, TOOL_CHECKS, TOOL_FIXWIFI, TOOL_OFF, TOOL_COUNT };
-enum { SET_SHARE, SET_COMPAT, SET_FORCE_COMPAT, SET_VERBOSE_LOGS, SET_SIMPLE, SET_INSTANCED, SET_COUNT };
+enum { SET_SHARE, SET_COMPAT, SET_FORCE_COMPAT, SET_VERBOSE_LOGS, SET_SIMPLE, SET_GAMESWITCHER, SET_INSTANCED, SET_COUNT };
 
 static const char* menu_label(int item) {
 	switch (item) {
@@ -208,6 +209,9 @@ static void setting_row(char* out, int len, int item) {
 		break;
 	case SET_SIMPLE:
 		snprintf(out, len, "Simple client (planned):  %s", c->simple_client ? "Yes" : "No");
+		break;
+	case SET_GAMESWITCHER:
+		snprintf(out, len, "Add Netplay to Game Switcher:  %s", c->add_gameswitcher ? "Yes" : "No");
 		break;
 	case SET_INSTANCED:
 		switch (c->instanced) {
@@ -311,7 +315,9 @@ static void render(SDL_Surface* s) {
 
 	switch (screen) {
 	case SCREEN_MENU: {
-		draw_title(s, NS_isArmed() ? "Netplay - armed" : "Netplay");
+		draw_title(s, quick_mode
+		           ? (NS_isArmed() ? "Netplay Quick - armed" : "Netplay Quick")
+		           : (NS_isArmed() ? "Netplay - armed" : "Netplay"));
 		int y = SCALE1(PADDING + 44);
 		for (int i = 0; i < MENU_COUNT; i++)
 			y = draw_row(s, menu_label(i), y, i == menu_sel);
@@ -364,6 +370,8 @@ static void render(SDL_Surface* s) {
 			hint = "Testing: use pak cores even when builds match."; break;
 		case SET_SIMPLE:
 			hint = "Planned: accept invitations for matching local games."; break;
+		case SET_GAMESWITCHER:
+			hint = "While armed, the switcher contains only Netplay."; break;
 		case SET_INSTANCED:
 			hint = "Both devices, and both carts on each. Else link cable."; break;
 		}
@@ -581,7 +589,9 @@ static void do_arm(NS_Role role, const char* peer) {
 }
 
 int main(int argc, char* argv[]) {
-	(void)argc; (void)argv;
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--quick")) quick_mode = true;
+	}
 
 	SDL_Surface* s = GFX_init(MODE_MAIN);
 	PAD_init();
@@ -783,6 +793,7 @@ int main(int argc, char* argv[]) {
 					break;
 				case SET_VERBOSE_LOGS: c->verbose_logs = !c->verbose_logs; break;
 				case SET_SIMPLE: c->simple_client = !c->simple_client; break;
+				case SET_GAMESWITCHER: c->add_gameswitcher = !c->add_gameswitcher; break;
 				case SET_INSTANCED:
 					/* Cycles No -> Yes (all) -> pick, and the third state opens
 					 * the picker rather than being a dead label. */

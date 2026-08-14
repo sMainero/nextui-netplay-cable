@@ -18,6 +18,11 @@ trap cleanup EXIT
 (cd .. && make native >/dev/null)
 $CC fake_core.c -o "$OUT/gambatte_libretro.so" -shared -fPIC -I../include -O0 -std=gnu99 -DFAKE_DUAL
 $CC harness.c -o "$OUT/harness" -I../include -O0 -std=gnu99 -ldl
+# Give the client a clock nine seconds off the host's, which is what the real
+# pair measured. Without it both roles read the same machine clock and the
+# cartridge-clock comparison below could not fail.
+$CC skewclock.c -o "$OUT/skewclock.so" -shared -fPIC -O0 -std=gnu99 -ldl
+CLIENT_CLOCK_SKEW=9
 SHIM=../../bin/native/netplay_shim.so
 
 printf 'role=host\nport=%s\nmode=link\ninput_delay=3\ninstanced_gambatte=1\n' "$PORT" > "$OUT/host.session"
@@ -31,6 +36,7 @@ HOST_PID=$!
 sleep 0.3
 FAKE_CORE_NAME=Gambatte FAKE_CORE_NO_NETPACKET=1 HARNESS_EXPECT_CORE_NAME=Gambatte \
 	FAKE_SRAM_BYTE=34 HARNESS_BUTTONS=22 NETPLAY_REAL_CORE="$OUT/gambatte_libretro.so" \
+	LD_PRELOAD="$OUT/skewclock.so" SKEW_CLOCK_SECONDS="$CLIENT_CLOCK_SKEW" \
 	NETPLAY_SESSION="$OUT/client.session" "$OUT/harness" "$SHIM" 180 5 > "$OUT/client.log" 2>&1 &
 CLIENT_PID=$!
 
@@ -42,8 +48,11 @@ expect() {
 }
 
 echo "== dual-instance Gambatte"
-expect "$OUT/host.log"   "dual ABI v1 enabled (console A visible)" "host selected ABI console A"
-expect "$OUT/client.log" "dual ABI v1 enabled (console B visible)" "client selected ABI console B"
+# The version is deliberately not pinned here: the shim only accepts a core whose
+# ABI equals the header it was built against, so a mismatch fails at the
+# capability check with its own message rather than silently here.
+expect "$OUT/host.log"   "dual ABI v. enabled (console A visible)" "host selected ABI console A"
+expect "$OUT/client.log" "dual ABI v. enabled (console B visible)" "client selected ABI console B"
 expect "$OUT/host.log"   "sent console A save memory to peer" "host exported its local save memory"
 expect "$OUT/client.log" "sent console B save memory to peer" "client exported its local save memory"
 expect "$OUT/host.log"   "console B save memory adopted" "host adopted client save memory"
@@ -61,6 +70,30 @@ expect "$OUT/host.log"   "paired consoles agree at frame" "host confirmed paired
 expect "$OUT/client.log" "paired consoles agree at frame" "client confirmed paired-state agreement"
 expect "$OUT/host.log"   "core:ports p0=11 p1=22" "host mapped A/B inputs into the paired core"
 expect "$OUT/client.log" "core:ports p0=11 p1=22" "client mapped the same A/B inputs into its replica"
+# Both devices must install the *same* pair of cartridge-clock epochs, or an RTC
+# game diverges the first time it latches. The client's clock is skewed above,
+# so the two sides can only agree by using the readings they exchanged; each
+# taking its own would leave the pairs nine seconds apart. A comparison rather
+# than a fixed expectation, because the values are two real clocks.
+host_clocks=$(sed -n 's/.*cartridge clocks set: \(A=[0-9]* B=[0-9]*\).*/\1/p' "$OUT/host.log" | head -1)
+client_clocks=$(sed -n 's/.*cartridge clocks set: \(A=[0-9]* B=[0-9]*\).*/\1/p' "$OUT/client.log" | head -1)
+if [ -n "$host_clocks" ] && [ "$host_clocks" = "$client_clocks" ]; then
+	echo "  ok   both devices installed the same cartridge clocks ($host_clocks)"
+else
+	echo "  MISS cartridge clocks differ: host '$host_clocks' client '$client_clocks'"
+	fail=1
+fi
+# ...and the pair has to reflect both players, not one clock used twice: console
+# A is the host's and console B the client's, which the skew makes visible.
+host_a=${host_clocks%% *}; host_a=${host_a#A=}
+host_b=${host_clocks##* }; host_b=${host_b#B=}
+if [ -n "$host_a" ] && [ "$((host_b - host_a))" = "$CLIENT_CLOCK_SKEW" ]; then
+	echo "  ok   console B carries the client's own clock (+${CLIENT_CLOCK_SKEW}s)"
+else
+	echo "  MISS console B clock is $((host_b - host_a))s from console A, expected $CLIENT_CLOCK_SKEW"
+	fail=1
+fi
+
 host_runs=$(grep -c '^core:run$' "$OUT/host.log" || true)
 client_runs=$(grep -c '^core:run$' "$OUT/client.log" || true)
 [ "$host_runs" -ge 90 ] && [ "$host_runs" -lt 180 ] && echo "  ok   host advanced one paired core ($host_runs calls)" \

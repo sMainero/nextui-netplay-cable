@@ -262,6 +262,7 @@ static NS_Settings ns_set = {
 	.force_compatibility = false,
 	.verbose_logs = true,
 	.simple_client = false,
+	.add_gameswitcher = false,
 	.instanced     = NS_INST_OFF,
 	.inst_core     = { false, false, false },
 };
@@ -312,6 +313,7 @@ void NS_settingsLoad(void) {
 		else if (!strcmp(k, "force_compatibility")) ns_set.force_compatibility = v != 0;
 		else if (!strcmp(k, "verbose_logs")) ns_set.verbose_logs = v != 0;
 		else if (!strcmp(k, "simple_client")) ns_set.simple_client = v != 0;
+		else if (!strcmp(k, "add_gameswitcher")) ns_set.add_gameswitcher = v != 0;
 		else if (!strcmp(k, "instanced"))
 			ns_set.instanced = (v < 0 || v > NS_INST_SELECTED) ? NS_INST_OFF : (NS_InstMode)v;
 		else {
@@ -344,11 +346,22 @@ void NS_settingsSave(void) {
 	fprintf(f, "force_compatibility=%d\n", ns_set.force_compatibility ? 1 : 0);
 	fprintf(f, "verbose_logs=%d\n", ns_set.verbose_logs ? 1 : 0);
 	fprintf(f, "simple_client=%d\n", ns_set.simple_client ? 1 : 0);
+	fprintf(f, "add_gameswitcher=%d\n", ns_set.add_gameswitcher ? 1 : 0);
 	fprintf(f, "instanced=%d\n",     (int)ns_set.instanced);
 	for (int i = 0; i < NS_INST_CORES; i++)
 		fprintf(f, "inst_%s=%d\n", NS_INST_CORE[i], ns_set.inst_core[i] ? 1 : 0);
 	fclose(f);
 	if (rename(tmp, path) != 0) remove(tmp);
+
+	/* The redirect and recents view are derived state. Keep them synchronized
+	 * immediately so toggling the option never requires a reboot or re-arm. */
+	char cmd[1200];
+	snprintf(cmd, sizeof(cmd),
+	         "SDCARD_PATH='%s' PLATFORM='%s' NETPLAY_PAK='%s' "
+	         "sh '%s/launcher/gameswitcher.sh' %s >/dev/null 2>&1",
+	         ns_sd, ns_platform, ns_pak, ns_pak,
+	         ns_set.add_gameswitcher ? (NS_isArmed() ? "active" : "enable") : "disable");
+	system(cmd);
 }
 
 /* Three places a core can legitimately live: the platform's own directory, the
@@ -1193,9 +1206,17 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 
 	/* Sized for the transport actually in use. Both sides reach the same answer
 	 * because a client only holds an ad hoc address when it joined this host's
-	 * network, and the host only serves one when it is hosting ad hoc. */
+	 * network, and the host only serves one when it is hosting ad hoc.
+	 *
+	 * This is now the fallback rather than the verdict: the shim measures the
+	 * round trip during the handshake and both peers adopt the higher of their
+	 * two proposals, so a good ad hoc link can settle below this and a poor one
+	 * above it. The number still matters - it is what a link that never answers
+	 * a probe uses, and it is picked from the transport actually in use, which
+	 * is more than the shim can know on its own. */
 	bool adhoc = hotspot_running || joined_hotspot;
 	fprintf(f, "input_delay=%d\n", adhoc ? NS_INPUT_DELAY_ADHOC : NS_INPUT_DELAY_WIFI);
+	fprintf(f, "input_delay_auto=1\n");
 
 	/* Kept in the session format while peer executable sharing is frozen. */
 	fprintf(f, "share_cores=%d\n", NS_settings()->share_cores ? 1 : 0);
@@ -1285,6 +1306,13 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	 * interface reassociates - but doing it here means discovery and the
 	 * handshake are not fighting the radio either. */
 	NS_wifiPowerSaveDisable();
+	if (NS_settings()->add_gameswitcher) {
+		snprintf(cmd, sizeof(cmd),
+		         "SDCARD_PATH='%s' PLATFORM='%s' NETPLAY_PAK='%s' "
+		         "sh '%s/launcher/gameswitcher.sh' active >/dev/null 2>&1",
+		         ns_sd, ns_platform, ns_pak, ns_pak);
+		system(cmd);
+	}
 	return true;
 }
 
@@ -1304,6 +1332,11 @@ void NS_disarm(void) {
 	snprintf(cmd, sizeof(cmd), "rm -f '%s/state/session' '%s/state/force-shim'",
 	         ns_pak, ns_pak);
 	system(cmd);
+	snprintf(cmd, sizeof(cmd),
+	         "SDCARD_PATH='%s' PLATFORM='%s' NETPLAY_PAK='%s' "
+	         "sh '%s/launcher/gameswitcher.sh' idle >/dev/null 2>&1",
+	         ns_sd, ns_platform, ns_pak, ns_pak);
+	system(cmd);
 
 	NS_hotspotStop();
 	NS_wifiPowerSaveRestore();
@@ -1320,6 +1353,11 @@ void NS_endSession(void) {
 	NS_announceStop();
 	NS_compatServeStop();
 	snprintf(cmd, sizeof(cmd), "rm -f '%s/state/session'", ns_pak);
+	system(cmd);
+	snprintf(cmd, sizeof(cmd),
+	         "SDCARD_PATH='%s' PLATFORM='%s' NETPLAY_PAK='%s' "
+	         "sh '%s/launcher/gameswitcher.sh' idle >/dev/null 2>&1",
+	         ns_sd, ns_platform, ns_pak, ns_pak);
 	system(cmd);
 
 	/* A session is a network arrangement as much as a file. Ending one has to

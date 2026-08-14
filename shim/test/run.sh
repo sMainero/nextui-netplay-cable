@@ -105,6 +105,39 @@ else
 fi
 
 echo
+# An armed session pins CPU scaling, because the frame-paced workload never
+# looks busy enough for a conservative governor to leave its floor. The sysfs
+# root is overridable so this is testable without touching the real one.
+echo
+echo "== an armed session pins CPU scaling and puts it back"
+say() { # <condition-result> <description>
+	if [ "$1" -eq 0 ]; then echo "  ok   $2"; else echo "  MISS $2"; fail=1; fi
+}
+CPUROOT="$OUT/cpufreq"
+for n in 0 1; do
+	mkdir -p "$CPUROOT/cpu$n/cpufreq"
+	echo conservative > "$CPUROOT/cpu$n/cpufreq/scaling_governor"
+	echo 648000       > "$CPUROOT/cpu$n/cpufreq/scaling_min_freq"
+	echo 1344000      > "$CPUROOT/cpu$n/cpufreq/scaling_max_freq"
+done
+printf 'role=host\nport=55999\nmode=link\n' > "$OUT/cpu.session"
+NETPLAY_CPUFREQ_ROOT="$CPUROOT" NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
+	NETPLAY_SESSION="$OUT/cpu.session" "$OUT/harness" "$SHIM" 5 > "$OUT/cpu.log" 2>&1 || true
+
+grep -q "pinned 2 of 2 CPU policies to performance" "$OUT/cpu.log"; say $? "both policies pinned"
+grep -q "restored CPU scaling to 'conservative'" "$OUT/cpu.log"; say $? "scaling restored at teardown"
+[ "$(cat "$CPUROOT/cpu0/cpufreq/scaling_governor")" = "conservative" ]
+say $? "governor put back the way it was"
+[ "$(cat "$CPUROOT/cpu0/cpufreq/scaling_min_freq")" = "648000" ]
+say $? "frequency floor put back the way it was"
+
+# A launch with no session must not touch the governor at all.
+for n in 0 1; do echo conservative > "$CPUROOT/cpu$n/cpufreq/scaling_governor"; done
+NETPLAY_CPUFREQ_ROOT="$CPUROOT" NETPLAY_REAL_CORE="$OUT/fake_libretro.so" \
+	"$OUT/harness" "$SHIM" 5 > "$OUT/nocpu.log" 2>&1 || true
+! grep -q "pinned .* CPU policies" "$OUT/nocpu.log"
+say $? "a disarmed launch leaves CPU scaling alone"
+
 if [ "$fail" -eq 0 ]; then
 	echo "PASS"
 else

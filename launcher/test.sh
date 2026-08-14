@@ -23,7 +23,8 @@ check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; 
 # --- fake SD card ---------------------------------------------------------
 mkdir -p "$USERDATA_PATH" "$SYSTEM_PATH/bin" "$SYSTEM_PATH/cores" "$NP/launcher" "$NP/bin/$PLATFORM" "$NP/state"
 cp "$HERE/launch-stub.sh" "$HERE/install-stubs.sh" "$HERE/minarch.elf" "$HERE/wrap-pak.sh" \
-   "$HERE/bind-mount.sh" "$HERE/mount-common.sh" "$HERE/pre-launch.sh" "$NP/launcher/"
+   "$HERE/bind-mount.sh" "$HERE/mount-common.sh" "$HERE/pre-launch.sh" \
+   "$HERE/gameswitcher.sh" "$HERE/gameswitcher-launch.sh" "$NP/launcher/"
 chmod 755 "$NP/launcher"/*
 : > "$NP/bin/$PLATFORM/netplay_shim.so"
 
@@ -34,6 +35,18 @@ cat > "$SYSTEM_PATH/bin/minarch.elf" <<'EOF'
 [ "$NETPLAY_DUAL_CORE" = "1" ] && echo "dual=1"
 [ -n "$NETPLAY_CORE_NOTICE" ] && echo "notice=$NETPLAY_CORE_NOTICE"
 echo "minarch core=$1 rom=$2 real=$NETPLAY_REAL_CORE session=$NETPLAY_SESSION"
+# Model stock MinArch's MENU+SELECT side effects. The shim rejects the actual
+# state, but the frontend has already written its slot marker and preview.
+if [ "$FAKE_GAMESWITCHER" = "1" ]; then
+	ui="$SDCARD_PATH/.userdata/shared/.minui/GBA"
+	name=$(basename "$2")
+	mkdir -p "$ui"
+	echo 0 > "$ui/$name.txt"
+	echo generated > "$ui/$name.0.bmp"
+	echo generated-disc > "$ui/$name.0.txt"
+	mkdir -p "$SDCARD_PATH/.userdata/shared/.minui"
+	echo "$2" > "$SDCARD_PATH/.userdata/shared/.minui/game_switcher.txt"
+fi
 # Stand in for the shim deciding this pairing cannot run instanced here.
 if [ "$FAKE_WRITE_FALLBACK" = "1" ] && [ -n "$NETPLAY_SERIAL_FALLBACK" ]; then
 	echo 1 > "$NETPLAY_SERIAL_FALLBACK"
@@ -412,6 +425,61 @@ echo "== bind-mount: boot never fails, however broken the staging"
 rm -rf "$NP/mounts"
 "$NP/launcher/bind-mount.sh" boot; rc=$?
 [ "$rc" = "0" ] && ok "boot exits 0 with no staging at all" || bad "boot exited $rc - would break a boot"
+
+echo
+echo "== Game Switcher integration"
+SHARED="$ROOT/.userdata/shared"
+RECENTS="$SHARED/.minui/recent.txt"
+mkdir -p "$(dirname "$RECENTS")" "$ROOT/Roms/Game Boy Advance (GBA)"
+touch "$ROOT/Roms/Game Boy Advance (GBA)/old.gba" "$ROOT/Roms/Game Boy Advance (GBA)/game.gba"
+printf '/Roms/Game Boy Advance (GBA)/old.gba\tOld Game\n' > "$RECENTS"
+printf 'add_gameswitcher=1\n' > "$NP/state/settings"
+"$NP/launcher/gameswitcher.sh" enable
+head -n 1 "$RECENTS" | grep -q '^/Roms/.Netplay (NETPLAY)/Netplay' \
+	&& ok "inactive shortcut is promoted" || bad "inactive shortcut missing"
+[ -x "$ROOT/Emus/$PLATFORM/NETPLAY.pak/launch.sh" ] \
+	&& ok "hidden emulator redirect installed" || bad "emulator redirect missing"
+[ -f "$ROOT/Roms/.Netplay (NETPLAY)/Netplay" ] \
+	&& ok "hidden redirect ROM installed" || bad "redirect ROM missing"
+
+: > "$NP/state/session"
+"$NP/launcher/gameswitcher.sh" active
+[ "$(wc -l < "$RECENTS")" = "1" ] \
+	&& ok "armed switcher contains one row" || bad "armed switcher leaked normal recents"
+grep -q 'old.gba' "$NP/state/gameswitcher-recents.txt" \
+	&& ok "normal recents backed up" || bad "normal recents not backed up"
+
+# NextUI promotes the launched game before handing control to MinArch.
+{ printf '/Roms/Game Boy Advance (GBA)/game.gba\tCurrent Game\n'; cat "$RECENTS"; } > "$RECENTS.new"
+mv "$RECENTS.new" "$RECENTS"
+UI="$SHARED/.minui/GBA"
+mkdir -p "$UI"
+printf '3\n' > "$UI/game.gba.txt"
+printf 'original-preview\n' > "$UI/game.gba.3.bmp"
+OUT=$(NETPLAY_SESSION="$NP/state/session" FAKE_GAMESWITCHER=1 \
+	"$NP/launcher/minarch.elf" "$SYSTEM_PATH/cores/gpsp_libretro.so" \
+	"$ROOT/Roms/Game Boy Advance (GBA)/game.gba" 2>&1)
+check "pre-existing slot marker restored" "$(cat "$UI/game.gba.txt")" "3"
+check "pre-existing preview restored" "$(cat "$UI/game.gba.3.bmp")" "original-preview"
+[ ! -e "$UI/game.gba.0.bmp" ] && ok "false preview removed" || bad "false preview survived"
+[ ! -e "$UI/game.gba.0.txt" ] && ok "false disc metadata removed" || bad "false disc metadata survived"
+[ "$(wc -l < "$RECENTS")" = "1" ] && ok "return-to-switcher view remains isolated" \
+	|| bad "game leaked into armed switcher"
+grep -q 'game.gba' "$NP/state/gameswitcher-recents.txt" \
+	&& ok "netplay game retained in normal history" || bad "netplay game lost from normal history"
+
+rm -f "$NP/state/session"
+"$NP/launcher/gameswitcher.sh" idle
+head -n 1 "$RECENTS" | grep -q '^/Roms/.Netplay (NETPLAY)/Netplay' \
+	&& ok "inactive shortcut restored above history" || bad "inactive shortcut not restored"
+grep -q 'game.gba' "$RECENTS" && ok "normal history restored" || bad "normal history missing"
+
+printf 'add_gameswitcher=0\n' > "$NP/state/settings"
+"$NP/launcher/gameswitcher.sh" disable
+grep -q '^/Roms/.Netplay (NETPLAY)/Netplay' "$RECENTS" \
+	&& bad "disabled shortcut remains in recents" || ok "disabled shortcut removed"
+[ ! -e "$ROOT/Emus/$PLATFORM/NETPLAY.pak/launch.sh" ] \
+	&& ok "disabled redirect removed" || bad "disabled redirect remains"
 
 echo
 [ "$fail" -eq 0 ] && echo "PASS" || echo "FAIL"

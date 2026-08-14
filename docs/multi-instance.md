@@ -309,18 +309,22 @@ cycle-aware yield/resume design.
 
 ## Production frontend contract (`netdual7`)
 
-The maintained core is pinned from `bmpriest/gambatte-libretro` at commit
-`70f86206f3a903f91892fb873220253a1b718d26`. Its versioned extension ABI keeps
+The maintained core is pinned from `bmpriest/gambatte-libretro`; the pin lives
+in one place, `GAMBATTE_REV` in the Makefile, rather than being restated here
+where it goes stale. Its versioned extension ABI keeps
 the core responsible for two emulators and the local serial coordinator while
 the Netplay shim owns devices, transport, identity, input lockstep, and policy.
 
 The Netplay integration now:
 
-- detects ABI v1 and its required capabilities at runtime;
+- detects ABI v2 and its required capabilities at runtime;
 - selects console A on the host and console B on the guest;
 - loads the selected cartridge into both local consoles, or one cartridge per
   console when the two devices launched different linked games;
 - exchanges each device's raw SRAM/RTC into the peer-owned logical console;
+- exchanges both devices' wall clocks and gives each console the same pair of
+  cartridge-clock epochs, so an RTC game shows each player their own time
+  without the two replicas disagreeing about it;
 - has the host establish one authoritative paired checkpoint before play;
 - maps host input to logical A and guest input to logical B on both replicas;
 - advances one paired core call per frontend frame, with no second DSO or
@@ -386,28 +390,247 @@ Wait / Continue solo / Exit overlay. That is worth having even though it cannot
 repair anything: before it existed a divergence was silent, and both players
 simply watched the other's console do things it had never done.
 
-## Known broken: the coordinator is not deterministic
+## Fixed: the first serial byte aborted the host
 
-Mirrored replicas require the paired core to be a pure function of (initial
-state, input sequence). `NetplayLocalSerialBus` is not, in four places:
+A paired build crashed the moment the two consoles actually linked - not on
+startup, not under load, but on the first byte that crossed the in-process
+cable, which is why it survived every single-device test:
 
-| Where | Why it diverges |
-| --- | --- |
-| `waitForService(ep, 250)` | a timed wait; whether a service slice runs at all is thread scheduling |
-| the service-slice loop | runs `runFor(..., 32)` a wall-clock-dependent number of times, so consoles advance different cycle counts for the same frame |
-| `send()` 50ms timeout | fabricates an `0xFF` into the emulated serial stream on one device only |
-| simultaneous-clock arbitration | "first claimant" is whoever wins the mutex |
+```
+[Gambatte] GBLC serial exchanges=1 wait_avg=42us ... idle_polls=54109
+realloc(): invalid old size
+Aborted
+```
 
-A fifth sits in the wrapper: `retro_run`'s frame-dupe gate returns without
-advancing either console, and `libretro_samples_count` is fed only by the
-*visible* console - console A on the host, console B on the guest - so the two
-devices skip on different frames while the shim advances `dual_frame` on both.
+`blipper_push_delta()` writes `taps` entries at `output_buffer[phase/decimation]`
+without a bounds check, so a caller must drain before pushing a bufferful. The
+frame loop does. The serial service slices - which only run when there *is*
+serial traffic - accumulated a whole frame of audio and pushed it in one go.
+Fixed in the fork (`693068a`, merged `533aab3`) by chunking and draining both
+service paths the way the frame loop does; see
+`cores/patches/superseded/gambatte-serial-audio-overflow.patch` for the ASan
+trace and the arithmetic.
 
-This is fine for the single-device GBLC feasibility pak, where there is one
-simulation and nondeterminism is invisible. It cannot work for two devices, and
-it is why Tetris DX desynced immediately on an A30/Brick pair: the two SoCs
-never make the same scheduling choices. Fixing it is the phase-two
-cycle-aware yield/resume design, not a patch.
+## Fixed: the core serialized uninitialised memory
+
+The two replicas disagreed on the *first* comparison of every session - frame 0,
+before a single frame had been emulated - with the transfer provably intact:
+
+```
+Brick (host):  PAIRED DESYNC at frame 0 (ours 442bc3cb, peer 60e19e23)
+A30  (guest):  PAIRED DESYNC at frame 0 (ours 60e19e23, peer 442bc3cb)
+```
+
+Each side received the other's hash correctly, so the states really did differ.
+Exactly **4 bytes** of the 119316-byte payload were responsible, at the same two
+relative offsets inside each console's state: `sachenLockCount` and
+`sachenOuterMask`.
+
+gambatte declares `SaveState` on the stack and only default-initialises it.
+Nearly every member is then written by the save path, but those two are written
+only by the Sachen mapper, so for any other cartridge the serialized bytes
+carried stack residue - `0x00/0x82` in one capture, `0x91/0x2f` and `0x8a/0x3f`
+in the next two. `savestate.h` already called them "Unused (and zero) for every
+non-Sachen cartridge"; nothing made them zero.
+
+Invisible locally, because the loading mapper ignores those fields. Fatal here,
+because it made `saveState()` not a function of emulator state: the same machine
+serialized differently on consecutive calls, and two devices always differed.
+Fixed upstream by value-initialising at the declaration sites.
+
+**A correction worth recording.** This was first diagnosed as `saveState`
+deliberately mutating - `CPU::saveState` does rebase `cycleCounter_` and fold
+`hf1` into `hf2` - and the measured "ten serializes give a period-3 cycle" was
+read as proof. That mutation is real but benign; the cycling was stack reuse.
+The wrong diagnosis produced a real fix (the host now adopts its own checkpoint,
+so both devices end on the same operation) which did not solve the problem,
+because the problem was never the sequence. What exposed it was replaying each
+device's bootstrap in *separate processes* and diffing the payloads byte for
+byte, rather than simulating both roles in one process where the stack made them
+agree by luck.
+
+The shim keeps its symmetry discipline anyway: the state size is queried once at
+the same protocol point on both sides, the host adopts its own checkpoint, and a
+hash round is never skipped on one device only.
+
+## CPU scaling is pinned for the duration of a session
+
+A paired session emulates two consoles per device, and on the A30 that was being
+done at 648MHz of an available 1344MHz.
+
+NextUI's default CPU Speed is "Auto", which on my282 means the conservative
+governor between 648 and 1344MHz with `up_threshold=80` over a 10ms window. A
+frame-paced emulator never looks busy to that: it computes for two or three
+milliseconds and waits for the next frame, so measured load sits around 12-20%
+and the governor stays at its floor indefinitely. Under four full-load spinners
+the same device ramps to 1344MHz in about two seconds and drops straight back,
+so the headroom is real - nothing in a well-behaved emulator ever asks for it.
+
+That also made every cross-device measurement misleading. The Brick runs pinned
+at 2GHz on the performance governor, so "the A30 is the slower device" was
+measured with one device at full clock and the other at 48% of its own ceiling.
+
+The shim now pins every cpufreq policy to performance while a session is armed
+and restores the previous governor and floor at teardown. It is done from the
+frame loop rather than at startup because minarch applies its own
+`minarch_cpu_speed` option *after* the core is loaded, so anything set earlier is
+overwritten; and it is re-asserted every `PACING_INTERVAL` frames so a menu round
+trip cannot hand the device back to the conservative governor mid-session. A
+launch with no session armed is left alone entirely.
+
+`NETPLAY_CPUFREQ_ROOT` overrides the sysfs root, which is what lets
+`shim/test/run.sh` assert the pin, the restore, and the disarmed case against a
+temporary tree instead of the real one.
+
+## Fixed: the cable is resolved by emulated cycles
+
+`NetplayLocalSerialBus` decided everything on wall-clock terms - `check()` was a
+true poll answering from the peer's live state, `send()` gave up after 50ms of
+real time and fabricated an `0xFF`, and two consoles clocking at once were
+resolved by whichever won the mutex. On device the two handhelds did not even
+agree on how many exchanges had happened: 385 on one and 0 on the other over the
+same window, with a `send_timeouts=1` on one side only.
+
+Decisions are now made on emulated cycles. `SerialIO` gained `advance(cc)`,
+called from the CPU loop on every pass so a busy console still reports progress;
+each endpoint has its own cycle-stamped request slot, so two consoles clocking
+at the same cycle is a symmetric exchange rather than an arbitration and
+requests at different cycles never pair; the 50ms deadline became four transfer
+periods of cycles; and the 250us service poll became a blocking wait.
+
+Three things had to be right beyond the design, each found by a reproduction
+rather than by reading:
+
+- **"Running" and "active" are different states.** A console that has finished
+  its frame stops running but stays available to answer. Conflating them
+  deadlocks: both finish, both wait for the other to go inactive, and neither
+  can, because that happens after the wait.
+- **Equal positions need a defined order.** Both consoles start a frame at
+  position 0, and "wait until the peer is strictly ahead" made each wait for the
+  other to move first. Endpoint 0 now acts first at any given cycle; the order
+  is arbitrary, that it is fixed is the point.
+- **Permitting an order is not enforcing it.** With the wait corrected the
+  totals matched across runs while *which* check consumed a request still varied
+  by arrival - the same rule had to govern what a check may take.
+
+`cores/tests/run.sh` drives the bus directly with a fixed script under hostile
+timing and asserts the answers are reproducible: 7 of 8 runs disagreed before,
+40 of 40 identical after, with all 200 transfers completing every run where the
+old bus completed 139-144 and a different set each time. It needs no ROM, no
+device and no frontend, which matters because every failure here was otherwise
+only reachable by getting two handhelds into a linking game.
+
+`NETPLAY_BUS_STALL_MS` makes a stuck wait describe the whole bus state once.
+Two threads asleep on a condition variable leave nothing to interrogate, and it
+is what found the deadlock above.
+
+On device this held for Tetris DX: 11,400 paired frames, 42,929 exchanges, no
+send timeouts, 60.0 fps, no stalls. Super Mario Bros. Deluxe still desynced
+almost immediately - see the frame barrier below.
+
+## Fixed: a frame ends when the emulation says so, not when a thread exits
+
+Tetris DX and SMB Deluxe fail differently, and the difference is the diagnosis.
+Tetris DX answers every clock it is sent. SMB Deluxe clocks into a partner that
+is often not listening - eleven unanswered sends in three hundred frames - and
+an unanswered send was the one outcome the bus still decided by wall clock.
+
+`send()` ended when the peer went inactive, and a console went inactive when its
+thread finished its frame. So whether a transfer read the peer's byte or a
+fabricated `0xFF` came down to which of the two threads reached the end of the
+frame first. On top of that, `beginFrame()` rebases both consoles' positions,
+so a request still outstanding across the boundary was suddenly being compared
+against a position measured from a new origin.
+
+Three changes, each with the same shape - replace a wall-clock question with an
+emulated-state one:
+
+- **A frame barrier.** `leaveFrame()` holds a console at the end of a paired
+  frame until the peer is also ready to leave and nothing is left on the cable.
+  It returns `false` when the peer has a request to service, so the caller
+  emulates a slice and comes back; the wrapper does that on both sides before
+  dropping activity.
+- **A response is collected before anything else.** `send()` tested the peer's
+  request slot before its own response slot, so a peer that answered and then
+  immediately clocked a transfer of its own left the response stranded - and
+  with it, a frame barrier that never opened. A delivered response is
+  unconditionally ours.
+- **`check()` honours the sender's deadline.** It would take a request its
+  sender had already given up on, or was about to; which of the two happened was
+  a thread race. `liveRequest()` is now the single definition of a request worth
+  answering, shared by `check()`, `waitForService()` and `leaveFrame()`.
+
+The test grew a second scenario for this - one console clocking into a peer that
+never listens, across four frame boundaries - because the cooperative script
+cannot reach the bug. Neither can an unloaded machine: both scenarios passed 20
+of 20 runs before the fix and failed 34 of 60 under eight competing spinners,
+which is now how the test is run.
+
+On device this held. Two sessions run back to back on the A30/Brick pair, with
+every state hash compared between the two handhelds:
+
+| | SMB Deluxe | Tetris DX |
+| --- | ---: | ---: |
+| paired frames | 8,700 | 5,700 |
+| agreement checkpoints | 30 of 30 | 20 of 20 |
+| exchanges | 46,616 | 21,153 |
+| send timeouts | 64 | 0 |
+| frame rate | 60.0 fps | 60.0 fps |
+
+The counters are the clearest evidence. `exchanges`, `send_timeouts` and
+`idle_polls` were bit-identical on the two devices; `wait_avg`, `wait_max` and
+claimed capacity were not, and the A30's worst wait was seven times the Brick's.
+Every emulated-state quantity agreed and every wall-clock quantity differed,
+which is the separation the whole rewrite was for. The 64 send timeouts are SMB
+Deluxe clocking into a partner that is not listening - the case that used to be
+decided by whichever thread exited first, now abandoned at the same emulated
+cycles on both devices.
+
+## Fixed: each cartridge keeps its owner's clock
+
+A cartridge with an RTC - Pokémon Gold/Silver/Crystal, the Zelda Oracle pair,
+Harvest Moon - asks the host what time it is, and the answer becomes emulated
+state the moment the game latches it. Two handhelds are rarely set to the same
+second; this pair was nine seconds apart, which is a different day counter and a
+different savestate.
+
+An earlier fix started a paired build from a fixed epoch, which covered power-on
+only: `rtc.cpp` and `huc3.cpp` still called `std::time(0)` on every latch.
+
+The clock is now injected rather than read. `gambatte::TimeSource` is a
+per-console interface plumbed the same way `SerialIO` already was, and left
+unset - every ordinary build, every ordinary session - the cartridge reads
+`std::time(0)` exactly as before.
+
+For a paired session:
+
+- Each device declares its own wall clock in the session identity it already
+  exchanges, so both sides learn both clocks.
+- Both compute the same pair - console A the host's clock, console B the
+  client's - and hand it to the core through `retro_dual_set_clock_epochs`.
+  Each cartridge therefore shows its own owner's time of day.
+- Time advances from those epochs by *emulated frames*, not by either device's
+  clock, so both replicas compute the same second.
+- The frame count and both epochs ride in the paired checkpoint header, which
+  grows from 16 to 40 bytes. Without them a resync would leave the two devices
+  agreeing on console state while disagreeing about what time it is - hidden
+  until the next latch.
+
+Setting the epochs is allowed with content already loaded, which is the normal
+case: the peer's clock only arrives once the handshake has run. Each console's
+cartridge clock is rebased by the amount its epoch moved, so elapsed time is
+untouched - at power-on that turns the fixed epoch into the player's real clock
+and changes nothing else, and a cartridge whose save carries a base time is
+about to have it overwritten by that save anyway.
+
+A paused game now has a stopped clock, which real hardware would not do. That is
+the price of an answer two devices can both reach, and it is a much smaller
+oddity than the two of them disagreeing about the date.
+
+The fake core in the shim tests folds the epochs into its paired state the same
+way the real core folds them into its checkpoint, so a shim that handed each
+device its own reading instead of the agreed pair would fail the link test on a
+state hash.
 
 ### Measured: the CPU was never the problem
 

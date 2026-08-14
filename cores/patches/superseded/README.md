@@ -16,11 +16,31 @@ distinctive symbols in the pinned tree:
 | `gambatte-dual-diagnostics.patch` | fork `libretro.cpp` — `dual_diag`, `GBLC perf`, `GBLC serial` |
 | `local_serial.{h,cpp}` | fork `libgambatte/libretro/` — the tracked copies here predate `isIdle()`, which `retro_dual_is_checkpoint_safe()` needs |
 | `test_local_serial.cpp` | fork `tests/dual_contract.c`, run by `make test-gambatte-dual` |
+| `gambatte-serial-audio-overflow.patch` | fork `693068a`, merged as `533aab3` |
 
 Only `gambatte-platforms.patch` still reverse-applies cleanly against the pinned
 commit; the rest were subsumed by later fork commits and no longer match their
 original context. They are kept because they are the readable form of what
 changed and why, and because the fork's history compresses several of them into
 single commits.
+
+`gambatte-serial-audio-overflow.patch` is here for a different reason: it landed
+upstream rather than being subsumed. It fixed the heap overflow that aborted the
+host process the first time two paired consoles exchanged a serial byte
+(`realloc(): invalid old size`), was reproduced under ASan, and is carried by
+every core built from `GAMBATTE_REV` onwards. It is kept because the reasoning
+and the on-device evidence are worth having next to each other, and the fork
+commit message alone does not preserve the ASan trace.
+
+## Also landed upstream, no patch kept here
+
+`cf8b662` (merged `c161224`) — **zero `SaveState` before use.** gambatte declared
+it on the stack and only default-initialised it, and `sachenOuterMask` /
+`sachenLockCount` are written only by the Sachen mapper, so every other
+cartridge serialized stack residue. Four bytes of a 119316-byte paired state,
+different per call and per device, which made `saveState()` not a function of
+emulator state and desynced instanced link at frame 0 on every session. See the
+correction note in `docs/multi-instance.md`: the first diagnosis of this blamed
+a deliberate mutation in `CPU::saveState` and was wrong.
 
 Do not add to this directory. Gambatte changes belong in the fork.

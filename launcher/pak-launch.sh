@@ -16,4 +16,4 @@ export LD_LIBRARY_PATH="$DIR:$DIR/bin:$DIR/bin/$PLATFORM:$LD_LIBRARY_PATH"
 export HOME="$SDCARD_PATH/.userdata/$PLATFORM"
 
 mkdir -p "$LOGS_PATH"
-"$DIR/bin/$PLATFORM/netplay.elf" > "$LOGS_PATH/netplay.txt" 2>&1
+"$DIR/bin/$PLATFORM/netplay.elf" "$@" > "$LOGS_PATH/netplay.txt" 2>&1
