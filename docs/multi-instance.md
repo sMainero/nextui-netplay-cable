@@ -8,8 +8,15 @@ them, and one `retro_run` advances the pair. Wi-Fi carries only delayed,
 frame-indexed controller inputs.
 
 It is selected only when both devices agree at arm time and both can host both
-cartridges at launch; otherwise the session runs ordinary network serial. It has
-not yet had the device testing listed at the end of this document.
+cartridges at launch; otherwise the session runs ordinary network serial.
+
+It works on hardware. On 2026-08-14 an A30 and a Brick completed a Pokemon trade
+between *different* cartridges - Silver against Crystal - over 13,500 paired
+frames, agreeing at all 46 state checkpoints with no desync, no recovery and no
+divergence, at 59 fps. That session exercised every mechanism in this document
+at once: two different cartridges found inside a zipped library, two real-time
+clocks kept on two devices whose own clocks are six hours apart, and a link the
+game polls continuously.
 
 The earlier implementation - two copies of the core linked over localhost TCP -
 is retired. Its measurements are below because they are the argument for the
@@ -586,6 +593,82 @@ Deluxe clocking into a partner that is not listening - the case that used to be
 decided by whichever thread exited first, now abandoned at the same emulated
 cycles on both devices.
 
+## Fixed: the peer's cartridge is found inside a zipped library
+
+Linked but different cartridges - Seasons against Ages, Gold against Silver -
+need each device to load the other's ROM locally, because the pair is mirrored
+on both devices and neither ships a ROM over the wire. Each side therefore has
+to find, among its own files, the one the peer described.
+
+The peer describes it by the SHA-256 of the *uncompressed* ROM, because that is
+what the frontend hands the core and so the only thing both sides can agree on.
+The search compared that against the size and bytes of files on disk, and only
+considered `.gb`, `.gbc` and `.dmg`. A library is normally zipped, so the file on
+disk is neither that size nor those bytes and the extension is `.zip`: the search
+matched nothing, ever, and both games fell back to the link cable with nothing in
+the log to say why. One device's library was 8,489 archives and 0 bare ROMs.
+
+Decompressing candidates to check is not affordable. Game Boy ROM sizes are
+powers of two, so hundreds of cartridges share an uncompressed size; on a real
+library that would mean inflating well over a hundred 2MB ROMs per session.
+
+A zip's central directory already records the uncompressed size *and* a CRC32 of
+the uncompressed data, and reading it decompresses nothing. The session identity
+gained `rom_crc32` (protocol 12 -> 13) and the scan filters on both. Across 2,078
+Game Boy and Game Boy Color cartridges on one device, no two shared a
+`(size, CRC32)` pair - so exactly one candidate is inflated, and it is the one
+about to be loaded. SHA-256 still confirms it; the CRC32 is a filter and never
+the decision.
+
+Three things make it fast enough to sit inside a handshake the peer is waiting
+on:
+
+- **A 4KB tail read.** A zip with no archive comment puts its end-of-central-
+  directory record in the last 22 bytes. Reading 4KB and falling back to the
+  64KB a comment could need took a cold scan of 2,078 archives from 4.5s to
+  1.6s, and the bytes read from 122MB to 8MB.
+- **A cache**, keyed by path, size and mtime, so a replaced file is re-read
+  rather than trusted. A second session reads no central directories at all: the
+  trade session found its cartridge in 131ms with 665 archives examined and zero
+  newly read.
+- **Game Boy folders first**, then the whole tree. 1.6s against 6.9s cold, and a
+  linked Game Boy cartridge is essentially always in one of them.
+
+The scan is bounded at 12 seconds. It has to be: it runs inside a bootstrap step
+the peer is blocked on with the stall report suppressed, so an unbounded search
+on a slow or damaged card would hang *both* devices with nothing on screen to
+distinguish it from a crash. Running out of budget is reported distinctly from
+"not installed", because the two mean different things to a player.
+
+`libzip` was the obvious dependency and is not used. The scan needs no library at
+all - a central directory is about sixty lines - and only the single matched
+cartridge needs inflating, which is zlib. That mattered because the two
+toolchains disagree: tg5040 ships libzip 1.11.4 and my282 ships 1.10.1, and
+vendoring one header against the other library is an ABI hazard for no benefit.
+zlib's API has been stable for two decades; `zlib.h` and `zconf.h` are vendored
+in `shim/include/` because the my282 sysroot has the library but not the headers.
+
+`shim/test/romscan.sh` builds a library where every decoy shares the target's
+uncompressed size, and asserts that exactly one candidate is inflated, that a
+matching CRC32 with the wrong contents is rejected, that the second run reads no
+central directories, and that a search out of budget is not reported as missing.
+
+## Fixed: a clean card could not arm
+
+A freshly formatted NextUI card ships `Bios`, `Roms`, `Saves`, `Tools` and
+`miyoo`. There is no `Emus/`.
+
+The "SD pak override" readiness check tested that `Emus/<platform>` was writable
+by calling `mkdir` on it - which is not recursive, so with the parent missing it
+failed, and the check reports a hard failure. A hard failure refuses to arm.
+The pak was therefore unusable on any clean install, and the symptom was a
+session that joined the host's ad hoc network, ran its checks and backed out
+again a third of a second later.
+
+It only surfaced after a card was reformatted, because any device that had ever
+had an emulator pak already had the directory. The stub installer creates it
+correctly with `mkdir -p`; only the check could not.
+
 ## Fixed: each cartridge keeps its owner's clock
 
 A cartridge with an RTC - Pokémon Gold/Silver/Crystal, the Zelda Oracle pair,
@@ -623,14 +706,87 @@ untouched - at power-on that turns the fixed epoch into the player's real clock
 and changes nothing else, and a cartridge whose save carries a base time is
 about to have it overwritten by that save anyway.
 
-A paused game now has a stopped clock, which real hardware would not do. That is
-the price of an answer two devices can both reach, and it is a much smaller
-oddity than the two of them disagreeing about the date.
+### What a paused session does to the clock
 
-The fake core in the shim tests folds the epochs into its paired state the same
-way the real core folds them into its checkpoint, so a shim that handed each
-device its own reading instead of the agreed pair would fail the link test on a
-state hash.
+Emulation paused - the minarch menu, not an in-game pause - stops the cartridge
+clock, which real hardware would not do.
+
+It does not drift the two devices apart. The frame counter is emulated state, it
+only advances when a paired frame is actually emulated, and it rides in the
+hashed checkpoint; if the two ever disagreed the next agreement check would
+report a desync rather than let an RTC quietly diverge. Opening the menu on one
+device stalls the other in any case.
+
+Within a session the cartridge falls behind the wall clock by however long the
+pair was paused, identically on both devices, and does not catch up. A reconnect
+does not catch it up either - the epoch shift cancels exactly against the base
+shift, by design.
+
+Across sessions it does not accumulate. The cartridge's base time is written to
+the `.rtc` save in real-clock terms, so the next launch measures elapsed time
+against freshly negotiated real epochs and only that session's own pause time is
+lost. Against day/night cycles and berry timers measured in hours, minutes of
+menu time are nothing.
+
+### Measured on hardware
+
+Pokemon Silver against Pokemon Crystal, a real trade completed, host log:
+
+| | |
+| --- | ---: |
+| paired frames | 13,500 |
+| agreement checkpoints | 46 of 46 |
+| desyncs, recoveries, divergences | 0 |
+| serial exchanges | 4,135 |
+| send timeouts | 386 |
+| frame rate | 58.9-59.3 fps |
+| input stalls | 1-2% |
+| peer cartridge lookup | 131ms, 665 examined, 0 newly read |
+| cartridge clocks | A=1786743393 B=1786721829 (-21,564s) |
+
+Both cartridges are MBC3+TIMER, so both have real-time clocks - the
+configuration that used to hang both devices on the first latch. The two
+consoles held clocks 6 hours apart, from two devices whose own clocks disagree
+by that much, and the replicas still matched at every checkpoint.
+
+The 386 send timeouts are not a fault. Pokemon polls the link continuously while
+a trade menu is open, so most clocks go unanswered; what matters is that both
+devices abandon the same transfers at the same emulated cycles, which is what
+the frame barrier is for. For comparison: SMB Deluxe recorded 64 over 8,700
+frames and Tetris DX zero over 5,700.
+
+One cosmetic wart: the core logs `cartridge clocks not set by the frontend` at
+content load, because the handshake supplies the epochs about 100ms later. It
+reads like a fault and is not one.
+
+### Testing the clock
+
+Two levels, because the failure modes are different.
+
+`cores/tests/clocktest.cpp` drives the real `Rtc` against a real `TimeSource` on
+the host, with no ROM and no device: power-on reads zero elapsed, adopting a real
+epoch leaves it at zero, an emulated hour is an hour, two devices with clocks
+nine seconds apart agree about both consoles while each still shows its owner's
+time, a reconnect neither gains nor loses cartridge time, and a pair rebuilt
+mid-handshake keeps the agreed clock.
+
+That test exists because this arithmetic was wrong and nothing would have caught
+it. The wrapper's clock started at 0 while `setInitState` seeds cartridges at
+`DUAL_POWER_ON_EPOCH`, so the first `now() - baseTime_` underflowed. The
+consequence is not a wrong date: `Rtc::doLatch` normalises by subtracting 0x1FF
+days per iteration, so a value near 2^64 needs about 4e11 of them and the game
+freezes on its first latch - on both devices at once, since both compute the same
+wrong number. The runner therefore bounds the test with a timeout and reports a
+hang as its own failure.
+
+At the shim level, the fake core folds the epochs into its paired state the same
+way the real core folds them into its checkpoint, and `shim/test/skewclock.c`
+preloads a nine-second offset into the client so the two roles have genuinely
+different clocks. `dual.sh` then asserts both that the two devices install an
+identical pair and that console B carries the client's own clock. Either "each
+device read its own clock" or "the A/B mapping is backwards" fails it; without
+the skew both would pass trivially, since host and client share one machine
+clock.
 
 ### Measured: the CPU was never the problem
 
@@ -653,10 +809,21 @@ So both handhelds have six to ten times the headroom two consoles need, and the
 CPU limits. They are the wrapper scheduler polling. The performance gate and the
 determinism requirement have the same fix.
 
-Still required before treating the path as complete:
+The deterministic serial coordinator that followed is described above, and the
+performance gate is met: the trade session ran at 59fps with 1-2% input stalls.
 
-- a deterministic serial coordinator (the above);
-- checkpoint persistence and correct host/guest process-crash rejoin;
-- device testing of menu pause, reset, disconnect, repeated launch, SRAM
-  ownership, linked-cartridge pairs, and thermal/power behavior on ARMv7 and
-  AArch64.
+Still untested, and worth being explicit that these are untested rather than
+known-good:
+
+- checkpoint persistence and host/guest rejoin after a process crash;
+- menu pause, reset and disconnect during a paired session;
+- repeated launches without a reboot;
+- SRAM ownership across a long session - trades write to both cartridges, and
+  only the visible console's save is persisted;
+- thermal and power behaviour over a long session on both architectures;
+- Oracle of Seasons/Ages actually linking. The pair loads and pairs, but neither
+  save had progressed far enough to reach the in-game link, so the game's own
+  protocol has never been exercised.
+
+Sessions so far have been minutes, not hours. Nothing here has been run long
+enough to say anything about drift, leaks or heat.

@@ -127,7 +127,9 @@ CLIENT2_PID=$!
 wait "$HOST2_PID" 2>/dev/null || true
 wait "$CLIENT2_PID" 2>/dev/null || true
 
-expect "$OUT/host2.log"   "is not installed under" "host searched for the peer cartridge"
+# Also pins that the search ran the CRC32 filter rather than the old size-only
+# one: the message carries the crc32 the peer declared.
+expect "$OUT/host2.log"   "crc32 .* is not installed" "host searched for the peer cartridge"
 expect "$OUT/host2.log"   "instanced link declined" "host declined the pairing"
 expect "$OUT/client2.log" "instanced link declined" "client declined the pairing"
 [ -f "$OUT/host.fallback" ] && echo "  ok   host asked the launcher for network serial" \

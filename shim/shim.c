@@ -42,6 +42,8 @@
 
 #include "libretro.h"
 #include "gambatte_dual.h"
+#include "romscan.h"
+#include <zlib.h>
 #include "netlink.h"
 #include "overlay.h"
 #include "sha256.h"
@@ -253,11 +255,19 @@ static uint32_t dual_pair_run_max_us;
  * network serial - see request_serial_fallback(). */
 static char dual_local_rom_path[512];
 static uint32_t dual_local_rom_size;
+/* CRC32 of the same bytes, so a peer with a zipped library can find this
+ * cartridge without decompressing every candidate it holds. */
+static uint32_t dual_local_rom_crc32;
 /* This device's clock as declared to the peer. Kept rather than re-read, so
  * that the epochs both devices install are the ones they exchanged and not two
  * later readings that would no longer be the same pair. */
 static uint64_t dual_local_wall_clock;
 static char dual_peer_rom_path[512];
+/* Set when the peer's cartridge was found inside an archive: the reload has to
+ * inflate it rather than read the file, and the frontend must not be handed the
+ * .zip path as if it were a ROM. */
+static RomScanEntry dual_peer_rom_zip;
+static int dual_peer_rom_zipped;
 static int dual_peer_rom_found;
 static int dual_same_rom;
 static int dual_demoted;
@@ -3118,6 +3128,7 @@ static void dual_reset_bootstrap(void) {
 	dual_ready_sent = 0;
 	dual_bootstrapped = 0;
 	dual_peer_rom_found = dual_same_rom = 0;
+	dual_peer_rom_zipped = 0;
 	dual_peer_rom_path[0] = '\0';
 	dual_wait_since.tv_sec = dual_wait_since.tv_usec = 0;
 	memset(own_hashes, 0, sizeof(own_hashes));
@@ -3175,65 +3186,107 @@ static void request_serial_fallback(uint32_t reason) {
  * Archives are deliberately not opened. minarch hands us extracted content, so
  * a zipped copy of the peer's ROM cannot be size-matched from the outside and
  * that pairing falls back to network serial. */
-static bool rom_extension(const char* name) {
-	const char* dot = strrchr(name, '.');
-	return dot && (!strcasecmp(dot, ".gb") || !strcasecmp(dot, ".gbc") ||
-	               !strcasecmp(dot, ".dmg"));
+static bool romscan_sha256(const void* data, size_t len, uint8_t out[32]) {
+	Sha256 hash;
+	sha256_init(&hash);
+	sha256_update(&hash, data, len);
+	sha256_final(&hash, out);
+	return true;
 }
 
-static bool find_rom_by_hash(const char* dir, const uint8_t want[32], uint32_t size,
-                             unsigned depth, char* out, size_t out_len) {
-	if (depth > 4) return false;
-	DIR* d = opendir(dir);
-	if (!d) return false;
-	struct dirent* e;
-	bool found = false;
-	while (!found && (e = readdir(d))) {
-		if (e->d_name[0] == '.') continue;
-		char path[512];
-		if ((size_t)snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= sizeof(path))
-			continue;
-		struct stat st;
-		if (stat(path, &st) != 0) continue;
-		if (S_ISDIR(st.st_mode)) {
-			found = find_rom_by_hash(path, want, size, depth + 1, out, out_len);
-			continue;
-		}
-		if (!S_ISREG(st.st_mode) || (uint32_t)st.st_size != size || !rom_extension(e->d_name))
-			continue;
-		uint8_t have[32];
-		Sha256 hash;
-		sha256_init(&hash);
-		if (!hash_content_path(&hash, path, 0)) continue;
-		sha256_final(&hash, have);
-		if (memcmp(have, want, 32)) continue;
-		snprintf(out, out_len, "%s", path);
-		found = true;
-	}
-	closedir(d);
-	return found;
-}
-
-static bool locate_peer_rom(const uint8_t sha256[32], uint32_t size) {
+/* Where the peer's cartridge might be, best bet first.
+ *
+ * A linked Game Boy cartridge lives in a Game Boy folder, so searching those
+ * before the rest of the library is worth doing: on one device that is 2078
+ * archives instead of 8489, and 1.6s instead of 6.9s on a cold cache. The whole
+ * tree is still searched if that misses, because nothing enforces where a
+ * player keeps a file. */
+static void peer_rom_dirs(char roots[3][512], const char* dirs[4]) {
 	const char* sd = getenv("SDCARD_PATH");
-	char roms[512];
-	snprintf(roms, sizeof(roms), "%s/Roms", sd && sd[0] ? sd : "/mnt/SDCARD");
+	if (!sd || !sd[0]) sd = "/mnt/SDCARD";
+	snprintf(roots[0], 512, "%s/Roms/Game Boy Color (GBC)", sd);
+	snprintf(roots[1], 512, "%s/Roms/Game Boy (GB)", sd);
+	snprintf(roots[2], 512, "%s/Roms", sd);
+	dirs[0] = roots[0];
+	dirs[1] = roots[1];
+	dirs[2] = roots[2];
+	dirs[3] = NULL;
+}
+
+/* Long enough for a cold walk of a large library - a measured 2078-archive
+ * Game Boy folder takes 1.6s, and the whole tree about 7s - and short enough
+ * that a card which has stopped answering does not take the session with it. */
+#define PEER_ROM_SEARCH_BUDGET_MS 12000
+
+static bool locate_peer_rom(const uint8_t sha256[32], uint32_t size, uint32_t crc32) {
+	char roots[3][512];
+	const char* dirs[4];
+	peer_rom_dirs(roots, dirs);
+
+	/* The cache belongs beside the pak that produced it, and the pak's location
+	 * is only known here through the core we were asked to wrap:
+	 * <pak>/cores/override/<platform>/<core>.so. Deriving it from that beats
+	 * an environment variable nothing in this process actually sets. */
+	char cache_path[512];
+	const char* core_path = getenv(SHIM_ENV_REAL_CORE);
+	cache_path[0] = '\0';
+	if (core_path && core_path[0]) {
+		char pak[400];
+		snprintf(pak, sizeof(pak), "%s", core_path);
+		int trimmed = 0;
+		for (; trimmed < 4; trimmed++) {
+			char* slash = strrchr(pak, '/');
+			if (!slash) break;
+			*slash = '\0';
+		}
+		if (trimmed == 4 && pak[0])
+			snprintf(cache_path, sizeof(cache_path), "%s/state/romscan.cache", pak);
+	}
+	/* Without a usable pak directory the cache simply does not persist; the
+	 * search still works, it is only slower. */
+	RomScanCache* cache = cache_path[0] ? romscan_cache_open(cache_path) : NULL;
+
 	struct timeval started, finished;
 	gettimeofday(&started, NULL);
 	/* A large library can take this well past a frame. That is work, not a
 	 * frontend that has gone away, and telling the peer we are stalled would
 	 * only make it stop sending us the thing we are about to need. */
 	NetLink_setCoreRunning(true);
-	bool found = find_rom_by_hash(roms, sha256, size, 0,
-	                              dual_peer_rom_path, sizeof(dual_peer_rom_path));
+	bool zipped = false;
+	size_t examined = 0;
+	/* Bounded, because the peer is blocked on this. A library on a slow or
+	 * damaged card can take arbitrarily long to walk, and an unbounded search
+	 * here freezes both devices with nothing on screen to distinguish it from a
+	 * crash - which is exactly what happened. Giving up early costs a serial
+	 * fallback; not giving up costs the session. */
+	const RomScanResult result =
+		romscan_find(cache, dirs, sha256, size, crc32,
+		             dual_peer_rom_path, sizeof(dual_peer_rom_path),
+		             &dual_peer_rom_zip, &zipped, PEER_ROM_SEARCH_BUDGET_MS,
+		             &examined, romscan_sha256);
+	const bool found = result == ROMSCAN_FOUND;
 	NetLink_setCoreRunning(false);
 	gettimeofday(&finished, NULL);
+	dual_peer_rom_zipped = found && zipped;
+
+	const size_t known = romscan_cache_count(cache);
+	const size_t added = romscan_cache_added(cache);
+	romscan_cache_close(cache);
+
+	const unsigned took_ms = timeval_delta_us(&started, &finished) / 1000;
 	if (found)
-		shim_log("peer cartridge found at %s (%ums)\n", dual_peer_rom_path,
-		         timeval_delta_us(&started, &finished) / 1000);
+		shim_log("peer cartridge found %s%s (%ums, %zu examined, %zu archives "
+		         "known, %zu newly read)\n",
+		         dual_peer_rom_path, dual_peer_rom_zipped ? " (in archive)" : "",
+		         took_ms, examined, known, added);
+	else if (result == ROMSCAN_TIMED_OUT)
+		shim_log("gave up looking for the peer cartridge (%u bytes, crc32 %08x) "
+		         "after %ums and %zu entries; %zu archives known, %zu newly read\n",
+		         size, crc32, took_ms, examined, known, added);
 	else
-		shim_log("peer cartridge (%u bytes) is not installed under %s (%ums)\n",
-		         size, roms, timeval_delta_us(&started, &finished) / 1000);
+		shim_log("peer cartridge (%u bytes, crc32 %08x) is not installed (%ums, "
+		         "%zu examined, %zu archives known, %zu newly read)\n",
+		         size, crc32, took_ms, examined, known, added);
 	return found;
 }
 
@@ -3269,7 +3322,11 @@ static bool dual_rebuild_content(const char* peer_rom) {
 
 	void* peer_data = NULL;
 	size_t peer_len = 0;
-	if (ok && linked) ok = read_whole_file(peer_rom, &peer_data, &peer_len);
+	if (ok && linked) {
+		ok = dual_peer_rom_zipped
+		   ? romscan_zip_extract(peer_rom, &dual_peer_rom_zip, &peer_data, &peer_len)
+		   : read_whole_file(peer_rom, &peer_data, &peer_len);
+	}
 
 	struct retro_game_info own;
 	memset(&own, 0, sizeof(own));
@@ -3388,6 +3445,11 @@ static bool dual_bootstrap_tick(void) {
 		mine.input_delay = (uint32_t)input_delay;
 		mine.core_identity = core_identity();
 		mine.rom_size = dual_local_rom_size;
+		/* CRC32 of the same bytes rom_sha256 covers. A zip records this for its
+		 * contents, so the peer can reject almost every candidate in a library
+		 * without decompressing any of it. It is a filter only - the SHA-256
+		 * still decides. */
+		mine.rom_crc32 = dual_local_rom_crc32;
 		mine.wall_clock_utc = (uint64_t)time(NULL);
 		dual_local_wall_clock = mine.wall_clock_utc;
 		/* state_size and the save-memory sizes describe the *pair*, and the pair
@@ -3419,7 +3481,8 @@ static bool dual_bootstrap_tick(void) {
 			dual_peer_rom_found = 1;
 			shim_log("both consoles run the same cartridge\n");
 		} else if (peer.rom_size && peer.rom_size <= 8u * 1024u * 1024u) {
-			dual_peer_rom_found = locate_peer_rom(peer.rom_sha256, peer.rom_size);
+			dual_peer_rom_found = locate_peer_rom(peer.rom_sha256, peer.rom_size,
+			                                      peer.rom_crc32);
 		} else {
 			dual_peer_rom_found = 0;
 			shim_log("peer declared an implausible cartridge size %u\n", peer.rom_size);
@@ -4163,6 +4226,9 @@ bool retro_load_game(const struct retro_game_info* game) {
 			read_whole_file(dual_local_rom_path, &dual_own_rom, &dual_own_rom_len);
 		}
 		dual_local_rom_size = (uint32_t)dual_own_rom_len;
+		dual_local_rom_crc32 = dual_own_rom_len
+			? (uint32_t)crc32(0L, (const Bytef*)dual_own_rom, (uInt)dual_own_rom_len)
+			: 0;
 		/* What the frontend just loaded: our cartridge in both consoles. */
 		dual_content_rom[0] = '\0';
 		dual_content_built = 1;

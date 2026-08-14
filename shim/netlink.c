@@ -21,7 +21,7 @@
  *     CMD_LINK_VERDICT added.
  * 11: CMD_RTT_PROBE/CMD_RTT_ECHO added; input delay is negotiated from the
  *     measured round trip rather than fixed by the session file. */
-#define NETLINK_PROTOCOL 12
+#define NETLINK_PROTOCOL 13
 
 #define QUEUE_SIZE    512
 /* Inputs are indexed by frame; the ring only has to outlast the input delay
@@ -883,7 +883,7 @@ static void* worker(void* arg) {
 			pthread_mutex_unlock(&nl.lock);
 		}
 
-		if (hdr.cmd == CMD_SESSION_IDENTITY && size == 68) {
+		if (hdr.cmd == CMD_SESSION_IDENTITY && size == 72) {
 			pthread_mutex_lock(&nl.lock);
 			memcpy(nl.peer_session_identity.rom_sha256, buf, 32);
 			nl.peer_session_identity.mode = ntohl(*(uint32_t*)(buf + 32));
@@ -896,6 +896,7 @@ static void* worker(void* arg) {
 			nl.peer_session_identity.wall_clock_utc =
 				((uint64_t)ntohl(*(uint32_t*)(buf + 60)) << 32) |
 				ntohl(*(uint32_t*)(buf + 64));
+			nl.peer_session_identity.rom_crc32 = ntohl(*(uint32_t*)(buf + 68));
 			nl.peer_session_identity_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
@@ -1220,7 +1221,7 @@ bool NetLink_sendHash(uint32_t frame, uint32_t hash) {
 }
 
 bool NetLink_sendSessionIdentity(const NetLinkSessionIdentity* identity) {
-	uint8_t wire[68];
+	uint8_t wire[72];
 	memcpy(wire, identity->rom_sha256, 32);
 	uint32_t v = htonl(identity->mode); memcpy(wire + 32, &v, 4);
 	v = htonl(identity->input_delay); memcpy(wire + 36, &v, 4);
@@ -1234,6 +1235,7 @@ bool NetLink_sendSessionIdentity(const NetLinkSessionIdentity* identity) {
 	 * the one place that needs a htonll. */
 	v = htonl((uint32_t)(identity->wall_clock_utc >> 32)); memcpy(wire + 60, &v, 4);
 	v = htonl((uint32_t)identity->wall_clock_utc); memcpy(wire + 64, &v, 4);
+	v = htonl(identity->rom_crc32); memcpy(wire + 68, &v, 4);
 	return send_command(CMD_SESSION_IDENTITY, wire, sizeof(wire));
 }
 

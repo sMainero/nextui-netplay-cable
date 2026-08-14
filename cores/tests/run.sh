@@ -20,7 +20,7 @@ cd "$(dirname "$0")/../.."
 
 CORE=.cache/cores/gambatte
 if [ ! -f "$CORE/libgambatte/libretro/local_serial.cpp" ]; then
-	echo "== paired serial bus"
+	echo "== paired serial bus and cartridge clocks"
 	echo "  SKIP core sources not fetched (run 'make core-sources')"
 	exit 0
 fi
@@ -29,7 +29,7 @@ CXX="${CXX:-c++}"
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
-echo "== paired serial bus"
+echo "== paired serial bus and cartridge clocks"
 $CXX -g -O1 -pthread cores/tests/bustest.cpp \
 	"$CORE/libgambatte/libretro/local_serial.cpp" \
 	-I"$CORE/libgambatte/libretro" -I"$CORE/libgambatte/src" \
@@ -54,9 +54,37 @@ RUNS="${BUSTEST_RUNS:-12}"
 if "$OUT/bustest" "$RUNS" > "$OUT/log" 2>&1; then
 	echo "  ok   $RUNS runs of each scenario answered identically, under $LOAD-way load"
 	grep "exchanges=" "$OUT/log" | sed 's/^  run *[0-9]*: /  ok   /' | sort -u
+else
+	echo "  MISS the bus answered differently across runs"
+	tail -20 "$OUT/log"
+	exit 1
+fi
+
+# Cartridge clocks. A paired RTC game turns "what time is it" into emulated
+# state, so the arithmetic has to be a function of emulated progress. It is
+# small, it is easy to get wrong, and getting it wrong is not subtle: an
+# underflowed elapsed time sends Rtc::doLatch into a loop that normalises in
+# 44-day steps, which freezes the game on the first latch rather than merely
+# showing it the wrong date. Hence the timeout - a regression here hangs.
+$CXX -g -O1 cores/tests/clocktest.cpp \
+	"$CORE/libgambatte/src/mem/rtc.cpp" \
+	-I"$CORE/libgambatte/src" -I"$CORE/libgambatte/include" \
+	-o "$OUT/clocktest"
+
+set +e
+timeout 60 "$OUT/clocktest" > "$OUT/clocklog" 2>&1
+clock_rc=$?
+set -e
+
+if [ "$clock_rc" -eq 0 ]; then
+	grep '^  ok' "$OUT/clocklog"
 	exit 0
 fi
 
-echo "  MISS the bus answered differently across runs"
-tail -20 "$OUT/log"
+if [ "$clock_rc" -eq 124 ]; then
+	echo "  MISS the cartridge clock hung - elapsed time has probably underflowed"
+else
+	echo "  MISS the cartridge clock is not a function of emulated progress"
+fi
+cat "$OUT/clocklog"
 exit 1

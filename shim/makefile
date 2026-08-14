@@ -12,7 +12,7 @@
 SUPPORTED_PLATFORMS = tg5040 tg5050 my282 my355 h700
 
 TARGET  = netplay_shim.so
-SOURCES = shim.c netlink.c overlay.c sha256.c
+SOURCES = shim.c netlink.c overlay.c sha256.c romscan.c
 INCDIR  = -Iinclude
 WARN    = -Wall -Wextra -Wno-unused-parameter
 
@@ -63,7 +63,11 @@ CFLAGS += $(INCDIR) $(WARN) -std=gnu99
 # --no-undefined: a symbol declared and called but never defined otherwise
 # links cleanly and dies at dlopen time on the device, which is a very
 # expensive way to find a typo.
-LDFLAGS = -shared -Wl,--no-undefined -ldl -lpthread
+# -lz: the peer's cartridge has to be found inside a zipped library, and the
+# one archive that turns out to hold it has to be inflated. Both sysroots ship
+# libz and both devices have libz.so.1; include/zlib.h is vendored because the
+# my282 sysroot has the library but not the header.
+LDFLAGS = -shared -Wl,--no-undefined -ldl -lpthread -lz
 
 PRODUCT = ../bin/$(PLATFORM)/$(TARGET)
 
@@ -79,7 +83,7 @@ all:
 native:
 	@mkdir -p ../bin/native
 	$(CC) $(SOURCES) -o ../bin/native/$(TARGET) \
-		-shared -Wl,--no-undefined -fPIC $(INCDIR) $(WARN) -O2 -std=gnu99 -ldl -lpthread
+		-shared -Wl,--no-undefined -fPIC $(INCDIR) $(WARN) -O2 -std=gnu99 -ldl -lpthread -lz
 
 clean:
 	rm -f $(foreach p,$(SUPPORTED_PLATFORMS),../bin/$(p)/$(TARGET)) ../bin/native/$(TARGET)

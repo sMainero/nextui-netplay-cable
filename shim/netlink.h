@@ -176,6 +176,11 @@ typedef struct {
 	 * Seasons/Ages), so the peer's ROM has to be findable locally rather than
 	 * merely equal to ours - and a size narrows that search to a hash or two. */
 	uint32_t rom_size;
+	/* CRC32 of the same uncompressed bytes rom_sha256 covers. A zipped library
+	 * records this for its contents, so a peer can reject nearly every
+	 * cartridge it holds without decompressing any of them; only a candidate
+	 * matching both size and CRC32 is inflated, and rom_sha256 still decides. */
+	uint32_t rom_crc32;
 	/* This device's time of day, seconds since the Unix epoch. Two handhelds
 	 * are rarely set to the same second - nine seconds apart on the pair this
 	 * was found on - and a cartridge with an RTC turns that difference into

@@ -1117,6 +1117,14 @@ int NS_runChecks(NS_Check* out, int max, NS_CheckResult* worst) {
 	{
 		char probe[512];
 		snprintf(probe, sizeof(probe), "%s/Emus/%s", ns_sd, ns_platform);
+		/* Both levels: a freshly formatted card ships Bios, Roms, Saves, Tools
+		 * and nothing else, so Emus/ does not exist yet and a single mkdir fails
+		 * on the missing parent. The check then reported a hard failure - which
+		 * refuses to arm - for a directory the installer creates for itself
+		 * without difficulty. */
+		char parent[512];
+		snprintf(parent, sizeof(parent), "%s/Emus", ns_sd);
+		mkdir(parent, 0755);
 		mkdir(probe, 0755);
 		bool writable = access(probe, W_OK) == 0;
 		add(out, &n, max,
