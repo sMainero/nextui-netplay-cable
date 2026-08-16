@@ -1,20 +1,19 @@
 {
   "name": "Netplay",
-  "version": "v1.3.4",
+  "version": "v2.1.0-test",
   "type": "TOOL",
-  "description": "Enable/disable netplay for multiplayer gaming over WiFi.",
-  "author": "mohammadsyuhada",
-  "repo_url": "https://github.com/mohammadsyuhada/nextui-netplay",
+  "description": "Shared-screen netplay and link-cable play between two handhelds, over an ad hoc network the devices create themselves.",
+  "author": "bmpriest",
   "release_filename": "Netplay.pak.zip",
   "changelog": {
-    "v1.3.4": "Add NextUI v6.11.2 support",
-    "v1.3.3": "Add NextUI v6.9.3 support",
-    "v1.3.2": "Add NextUI v6.9.0 support",
-    "v1.3.1": "Add NextUI v6.8.0 support",
-    "v1.3.0": "Add NextUI v6.7.7 support"
+    "v2.1.0-test": "Instanced link play for Game Boy: both devices emulate both consoles and WiFi carries only controller inputs. Works with two different linked cartridges - Gold/Silver, Seasons/Ages - found inside a zipped library without transferring any game file. Cartridge real-time clocks are negotiated so each console keeps its own owner's time. Verified with a completed Pokemon trade across 13,500 frames with no desync.",
+    "v2.0.0-test": "Libretro shim, ad hoc networking, local compatibility-core fallback, bind-mounted pak wrapping, and WiFi recovery. Adds my282, my355 and h700."
   },
   "platforms": [
-    "tg5040", 
-    "tg5050"
+    "tg5040",
+    "tg5050",
+    "my282",
+    "my355",
+    "h700"
   ]
 }

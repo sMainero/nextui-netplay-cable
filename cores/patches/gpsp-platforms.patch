@@ -1,0 +1,60 @@
+Add explicit NextUI targets. Unknown platform names otherwise silently select
+the Windows/x86 fallback, which can make a cross-build fail far from the actual
+configuration error. h700 uses tg5040; my355 uses tg5050.
+
+--- a/Makefile
++++ b/Makefile
+@@ -536,6 +536,53 @@ else ifeq ($(platform), miyoomini)
+ 	ARCH = arm
+ 	BUILTIN_GPU = neon
+ 
++# NextUI aarch64, Cortex-A53 (tg5040 and h700)
++else ifeq ($(platform), tg5040)
++	TARGET := $(TARGET_NAME)_libretro.so
++	CC = $(CROSS_COMPILE)gcc
++	CXX = $(CROSS_COMPILE)g++
++	AR = $(CROSS_COMPILE)ar
++	SHARED := -shared -Wl,--version-script=link.T
++	fpic := -fPIC -DPIC
++	LDFLAGS += -fPIC
++	CFLAGS += -mcpu=cortex-a53 -fomit-frame-pointer -ffast-math -fPIC
++	HAVE_DYNAREC := 1
++	MMAP_JIT_CACHE = 1
++	CPU_ARCH := arm64
++
++# NextUI aarch64, Cortex-A55 (tg5050 and my355)
++else ifeq ($(platform), tg5050)
++	TARGET := $(TARGET_NAME)_libretro.so
++	CC = $(CROSS_COMPILE)gcc
++	CXX = $(CROSS_COMPILE)g++
++	AR = $(CROSS_COMPILE)ar
++	SHARED := -shared -Wl,--version-script=link.T
++	fpic := -fPIC -DPIC
++	LDFLAGS += -fPIC
++	CFLAGS += -fomit-frame-pointer -ffast-math -fPIC
++	HAVE_DYNAREC := 1
++	MMAP_JIT_CACHE = 1
++	CPU_ARCH := arm64
++
++# NextUI armv7 hard-float (my282)
++else ifeq ($(platform), my282)
++	TARGET := $(TARGET_NAME)_libretro.so
++	CC = $(CROSS_COMPILE)gcc
++	CXX = $(CROSS_COMPILE)g++
++	AR = $(CROSS_COMPILE)ar
++	SHARED := -shared -Wl,--version-script=link.T
++	fpic := -fPIC -DPIC
++	LDFLAGS += -fPIC -flto
++	CFLAGS += -marm -mcpu=cortex-a7 -mtune=cortex-a7 -march=armv7-a
++	CFLAGS += -mfpu=neon-vfpv4 -mfloat-abi=hard
++	CFLAGS += -fomit-frame-pointer -ffast-math -fPIC -flto
++	HAVE_NEON = 1
++	ARCH = arm
++	BUILTIN_GPU = neon
++	CPU_ARCH := arm
++	MMAP_JIT_CACHE = 1
++	HAVE_DYNAREC := 1
++
+ # Windows
+ else
+ 	TARGET := $(TARGET_NAME)_libretro.dll

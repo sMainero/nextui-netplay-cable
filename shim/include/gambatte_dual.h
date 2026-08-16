@@ -1,0 +1,26 @@
+#ifndef NETPLAY_GAMBATTE_DUAL_H
+#define NETPLAY_GAMBATTE_DUAL_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define GAMBATTE_DUAL_ABI_VERSION 2u
+#define GAMBATTE_DUAL_SUBSYSTEM_ID 0x47424c43u
+
+enum gambatte_dual_capability {
+	GAMBATTE_DUAL_CAP_TWO_CONTENTS      = 1u << 0,
+	GAMBATTE_DUAL_CAP_CONSOLE_MEMORY    = 1u << 1,
+	GAMBATTE_DUAL_CAP_VISIBLE_CONSOLE   = 1u << 2,
+	GAMBATTE_DUAL_CAP_PAIRED_CHECKPOINT = 1u << 3,
+	GAMBATTE_DUAL_CAP_TARGETED_RESET    = 1u << 4,
+	GAMBATTE_DUAL_CAP_CLOCK_EPOCHS      = 1u << 5,
+};
+
+enum gambatte_dual_console {
+	GAMBATTE_DUAL_CONSOLE_A = 0,
+	GAMBATTE_DUAL_CONSOLE_B = 1,
+	GAMBATTE_DUAL_CONSOLE_BOTH = 2,
+};
+
+#endif

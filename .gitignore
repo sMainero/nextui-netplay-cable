@@ -4,3 +4,19 @@ DEBUGGING.md
 
 state/installed_version.txt
 state/netplay.state
+bin/native/
+bin/*/netplay_shim.so
+cores/*
+!cores/patches/
+!cores/patches/*.patch
+!cores/gambatte-dual/
+!cores/gambatte-dual/*.cpp
+!cores/gambatte-dual/*.h
+!cores/tests/
+!cores/tests/*.cpp
+!cores/tests/*.sh
+wrapped/
+dist/
+logs/
+docs/evals
+.cache/

@@ -1,0 +1,90 @@
+diff --git a/libgambatte/libretro/libretro.cpp b/libgambatte/libretro/libretro.cpp
+index b5a594e..52b822d 100644
+--- a/libgambatte/libretro/libretro.cpp
++++ b/libgambatte/libretro/libretro.cpp
+@@ -392,6 +392,48 @@ static void blipper_renderaudio(const int16_t *samples, unsigned frames)
+    blipper_push_samples(resampler_r, samples + 1, frames, 2);
+ }
+ 
++#ifdef NETPLAY_DUAL_INSTANCE
++/* Render an arbitrarily long run of samples without overrunning the resampler.
++ *
++ * blipper_push_delta() writes `taps` entries at output_buffer[phase/decimation]
++ * and never bounds-checks; the buffer holds BLIP_BUFFER_SIZE + taps entries, so
++ * roughly BLIP_BUFFER_SIZE * decimation input samples may be pushed before it
++ * runs off the end. The ordinary frame loop never gets near that because it
++ * drains every time it is half full.
++ *
++ * The paired build's serial service slices do not have that property. They
++ * accumulate a whole frame of audio - one runFor asked for 32 samples may
++ * return two thousand, and a frame can contain many slices - and used to be
++ * pushed in a single call with the drain only afterwards. On the visible-A side
++ * that is an unbounded push, and it corrupted the heap the first time two
++ * consoles actually exchanged a serial byte.
++ *
++ * Chunk, and drain between chunks, exactly like the frame loop. */
++static void audio_render_bounded(const gambatte::uint_least32_t *audio, size_t count)
++{
++   size_t offset = 0;
++   while (offset < count)
++   {
++      const size_t left  = count - offset;
++      const unsigned chunk = (unsigned)(left < (size_t)SOUND_BUFF_SIZE
++            ? left : (size_t)SOUND_BUFF_SIZE);
++      gambatte::uint_least32_t *block =
++            const_cast<gambatte::uint_least32_t*>(audio + offset);
++
++      if (use_cc_resampler)
++         CC_renderaudio((audio_frame_t*)block, chunk);
++      else
++      {
++         blipper_renderaudio((int16_t*)block, chunk);
++         const unsigned read_avail = blipper_read_avail(resampler_l);
++         if (read_avail >= (BLIP_BUFFER_SIZE >> 1))
++            audio_out_buffer_read_blipper(read_avail);
++      }
++      offset += chunk;
++   }
++}
++#endif
++
+ static void audio_resampler_deinit(void)
+ {
+    if (resampler_l)
+@@ -3502,18 +3544,8 @@ void retro_run()
+       dual_now_us() - pair_started);
+    if (dual_visible_console == GAMBATTE_DUAL_CONSOLE_B)
+    {
+-      size_t offset = 0;
+-      while (offset < secondary.audio.size())
+-      {
+-         const unsigned chunk = (unsigned)std::min(
+-               secondary.audio.size() - offset, (size_t)SOUND_BUFF_SIZE);
+-         gambatte::uint_least32_t *audio = &secondary.audio[offset];
+-         if (use_cc_resampler)
+-            CC_renderaudio((audio_frame_t*)audio, chunk);
+-         else
+-            blipper_renderaudio((int16_t*)audio, chunk);
+-         offset += chunk;
+-      }
++      if (!secondary.audio.empty())
++         audio_render_bounded(&secondary.audio[0], secondary.audio.size());
+       if (!use_cc_resampler)
+       {
+          const unsigned read_avail = blipper_read_avail(resampler_l);
+@@ -3560,13 +3592,10 @@ void retro_run()
+    if (dual_visible_console != GAMBATTE_DUAL_CONSOLE_B &&
+        !primary_service_audio.empty())
+    {
+-      gambatte::uint_least32_t *service_audio = &primary_service_audio[0];
+       const unsigned service_count = (unsigned)primary_service_audio.size();
+-      if (use_cc_resampler)
+-         CC_renderaudio((audio_frame_t*)service_audio, service_count);
+-      else
++      audio_render_bounded(&primary_service_audio[0], service_count);
++      if (!use_cc_resampler)
+       {
+-         blipper_renderaudio((int16_t*)service_audio, service_count);
+          const unsigned read_avail = blipper_read_avail(resampler_l);
+          audio_out_buffer_read_blipper(read_avail);
+       }

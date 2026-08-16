@@ -1,0 +1,236 @@
+Turn Gambatte's dormant DUAL_MODE demo into a separately-built link prototype.
+
+The prototype deliberately keeps the existing synchronous SerialIO contract so
+we can measure the value of removing localhost TCP before changing emulator
+timing. Both GBs receive separate libretro ports and run concurrently; only the
+primary console is presented. Paired serialization and persistent workers are
+follow-up work and this build is not yet shipped.
+
+--- a/Makefile.common
++++ b/Makefile.common
+@@ -42,6 +42,10 @@ SOURCES_CXX := \
+ 	$(CORE_DIR)/video/sprite_mapper.cpp \
+ 	$(CORE_DIR)/../libretro/libretro.cpp
+ 
++ifeq ($(NETPLAY_DUAL_INSTANCE),1)
++SOURCES_CXX += $(CORE_DIR)/../libretro/local_serial.cpp
++endif
++
+ ifeq ($(HAVE_NETWORK),1)
+ 	SOURCES_CXX += \
+ 		$(CORE_DIR)/../libretro/net_serial.cpp
+--- a/Makefile.libretro
++++ b/Makefile.libretro
+@@ -731,6 +731,12 @@ ifeq ($(HAVE_NETWORK), 1)
+    DEFINES += -DHAVE_NETWORK
+ endif
+ 
++ifeq ($(NETPLAY_DUAL_INSTANCE),1)
++   DEFINES += -DNETPLAY_DUAL_INSTANCE -DDUAL_MODE
++   CXXFLAGS += -pthread
++   LDFLAGS += -pthread
++endif
++
+ CFLAGS   += $(fpic) $(DEFINES)
+ CXXFLAGS += $(fpic) $(DEFINES)
+ 
+--- a/libgambatte/libretro/libretro.cpp
++++ b/libgambatte/libretro/libretro.cpp
+@@ -9,6 +9,10 @@
+ #ifdef HAVE_NETWORK
+ #include "net_serial.h"
+ #endif
++#ifdef NETPLAY_DUAL_INSTANCE
++#include "local_serial.h"
++#include <pthread.h>
++#endif
+ 
+ #if defined(__DJGPP__) && defined(__STRICT_ANSI__)
+ /* keep this above libretro-common includes */
+@@ -74,6 +77,9 @@ static bool useBitmasks = true;
+ static bool envVarsUpdated;
+ 
+ static unsigned libretro_input_state = 0;
++#ifdef NETPLAY_DUAL_INSTANCE
++static unsigned libretro_input_state2 = 0;
++#endif
+ static bool up_down_allowed          = false;
+ static unsigned turbo_period         = TURBO_PERIOD_MIN;
+ static unsigned turbo_pulse_width    = TURBO_PULSE_WIDTH_MIN;
+@@ -107,7 +113,12 @@ static INLINE void frame_pacing_reset(void)
+ 
+ #ifdef DUAL_MODE
+ static gambatte::GB gb2;
++#ifdef NETPLAY_DUAL_INSTANCE
++static NetplayLocalSerialBus local_serial_bus;
++static NetplayLocalSerialEndpoint local_serial_a(local_serial_bus, 0);
++static NetplayLocalSerialEndpoint local_serial_b(local_serial_bus, 1);
++#endif
+ #define NUM_GAMEBOYS 2
+ #else
+ #define NUM_GAMEBOYS 1
+ #endif
+@@ -1624,18 +1639,52 @@ static void update_input_state(void)
+    libretro_input_state = res;
+ }
+ 
++#ifdef NETPLAY_DUAL_INSTANCE
++static unsigned read_basic_input(unsigned port)
++{
++   unsigned res = 0;
++   if (libretro_supports_bitmasks)
++   {
++      int16_t ret = input_state_cb(port, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_MASK);
++      for (unsigned i = 0; i < sizeof(input::btn_map) / sizeof(input::map); ++i)
++         res |= (ret & (1 << input::btn_map[i].snes)) ? input::btn_map[i].gb : 0;
++   }
++   else
++   {
++      for (unsigned i = 0; i < sizeof(input::btn_map) / sizeof(input::map); ++i)
++         res |= input_state_cb(port, RETRO_DEVICE_JOYPAD, 0, input::btn_map[i].snes)
++            ? input::btn_map[i].gb : 0;
++   }
++   if (!up_down_allowed)
++   {
++      if ((res & gambatte::InputGetter::UP) && (res & gambatte::InputGetter::DOWN))
++         res &= ~(gambatte::InputGetter::UP | gambatte::InputGetter::DOWN);
++      if ((res & gambatte::InputGetter::LEFT) && (res & gambatte::InputGetter::RIGHT))
++         res &= ~(gambatte::InputGetter::LEFT | gambatte::InputGetter::RIGHT);
++   }
++   return res;
++}
++#endif
++
+ /* gb_input is called multiple times per frame.
+  * Determine input state once per frame using
+  * update_input_state(), and simply return
+  * cached value here */
+ class SNESInput : public gambatte::InputGetter
+ {
+    public:
++      explicit SNESInput(unsigned* state) : state_(state) {}
+       unsigned operator()()
+       {
+-         return libretro_input_state;
++         return *state_;
+       }
+-} static gb_input;
++   private:
++      unsigned* state_;
++};
++static SNESInput gb_input(&libretro_input_state);
++#ifdef NETPLAY_DUAL_INSTANCE
++static SNESInput gb_input2(&libretro_input_state2);
++#endif
+ 
+ #ifdef HAVE_NETWORK
+ enum SerialMode {
+@@ -1660,10 +1705,18 @@ void retro_get_system_info(struct retro_system_info *info)
+ {
++#ifdef NETPLAY_DUAL_INSTANCE
++   info->library_name = "Gambatte Dual";
++#else
+    info->library_name = "Gambatte";
++#endif
+ #ifndef GIT_VERSION
+ #define GIT_VERSION ""
+ #endif
++#ifdef NETPLAY_DUAL_INSTANCE
++   info->library_version = "v0.5.0-netdual6" GIT_VERSION;
++#else
+ #ifdef HAVE_NETWORK
+    info->library_version = "v0.5.0-netlink3" GIT_VERSION;
+ #else
+    info->library_version = "v0.5.0" GIT_VERSION;
+ #endif
++#endif
+@@ -1701,4 +1751,10 @@ void retro_init(void)
+    gb.setInputGetter(&gb_input);
+ #ifdef DUAL_MODE
++#ifdef NETPLAY_DUAL_INSTANCE
++   gb2.setInputGetter(&gb_input2);
++   gb.setSerialIO(&local_serial_a);
++   gb2.setSerialIO(&local_serial_b);
++#else
+    gb2.setInputGetter(&gb_input);
++#endif
+ #endif
+@@ -1780,3 +1835,6 @@ void retro_deinit(void)
+ 
+    libretro_input_state = 0;
++#ifdef NETPLAY_DUAL_INSTANCE
++   libretro_input_state2 = 0;
++#endif
+    up_down_allowed      = false;
+@@ -1857,3 +1915,6 @@ void retro_reset()
+ #ifdef DUAL_MODE
+    gb2.reset();
++#ifdef NETPLAY_DUAL_INSTANCE
++   local_serial_bus.reset();
++#endif
+ #endif
+@@ -2811,3 +2872,10 @@ bool retro_load_game(const struct retro_game_info *info)
+ 
+    check_variables(true);
++#ifdef NETPLAY_DUAL_INSTANCE
++   /* check_variables configures the ordinary network transport. The dual
++    * prototype always owns an in-memory pair instead. */
++   local_serial_bus.reset();
++   gb.setSerialIO(&local_serial_a);
++   gb2.setSerialIO(&local_serial_b);
++#endif
+    audio_resampler_init(true);
+@@ -2881,2 +2948,5 @@ void retro_unload_game()
+    frame_pacing_reset();
++#ifdef NETPLAY_DUAL_INSTANCE
++   local_serial_bus.reset();
++#endif
+    invalidate_serialize_size();
+@@ -2929,4 +2999,24 @@ void *retro_get_memory_data(unsigned id)
+    return 0;
+ }
+ 
++#ifdef NETPLAY_DUAL_INSTANCE
++struct DualRunContext {
++   union {
++      gambatte::uint_least32_t u32[SOUND_BUFF_SIZE];
++      int16_t i16[2 * SOUND_BUFF_SIZE];
++   } sound;
++   unsigned samples;
++};
++
++static void* run_secondary_frame(void* opaque)
++{
++   DualRunContext* context = static_cast<DualRunContext*>(opaque);
++   context->samples = SOUND_SAMPLES_PER_RUN;
++   while (gb2.runFor(video_buf + GB_SCREEN_WIDTH, VIDEO_PITCH,
++          context->sound.u32, SOUND_BUFF_SIZE, context->samples) == -1)
++      context->samples = SOUND_SAMPLES_PER_RUN;
++   return NULL;
++}
++#endif
++
+ void retro_run()
+@@ -2950,3 +3040,10 @@ void retro_run()
+       int16_t i16[2 * SOUND_BUFF_SIZE];
+    } static sound_buf;
++#ifdef NETPLAY_DUAL_INSTANCE
++   libretro_input_state2 = read_basic_input(1);
++   static DualRunContext secondary;
++   pthread_t secondary_thread;
++   bool secondary_started = pthread_create(&secondary_thread, NULL,
++         run_secondary_frame, &secondary) == 0;
++#endif
+    unsigned samples = SOUND_SAMPLES_PER_RUN;
+@@ -2969,4 +3088,11 @@ void retro_run()
+    }
+ #ifdef DUAL_MODE
++#ifdef NETPLAY_DUAL_INSTANCE
++   if (secondary_started)
++      pthread_join(secondary_thread, NULL);
++   else
++      run_secondary_frame(&secondary);
++#else
+    while (gb2.runFor(video_buf + GB_SCREEN_WIDTH, VIDEO_PITCH, sound_buf.u32, samples) == -1) {}
++#endif
+ #endif

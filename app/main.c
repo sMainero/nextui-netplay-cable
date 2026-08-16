@@ -1,0 +1,954 @@
+/*
+ * Netplay.pak - session setup.
+ *
+ * Replaces hand-edited config files: pick host or join, discover the other
+ * device, arm. Session setup lives here rather than in the shim because
+ * minarch's GFX_/PAD_ are compiled into the executable and unreachable from a
+ * loaded core (see docs/shim-architecture.md).
+ */
+
+#include <signal.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <msettings.h>
+#include "defines.h"
+#include "api.h"
+#include "utils.h"
+
+#include "netsetup.h"
+
+typedef enum {
+	SCREEN_MENU,
+	SCREEN_HOST_MENU,
+	SCREEN_TOOLS,
+	SCREEN_SETTINGS,
+	SCREEN_INSTANCED,
+	SCREEN_CHECKS,
+	SCREEN_HOSTING,
+	SCREEN_JOINING,
+	SCREEN_ARMED,
+} Screen;
+
+static int quit = 0;
+static bool quick_mode = false;
+static void on_signal(int s) { (void)s; quit = 1; }
+
+static Screen screen = SCREEN_MENU;
+static int    menu_sel = 0;
+static int    sub_sel = 0;
+static char   status[128] = "";
+/* Appended to the armed line: whether local compatibility cores were selected
+ * is exactly the kind of thing that is otherwise invisible until a desync. */
+static char   core_note[64] = "";
+
+static NS_Check checks[8];
+static int      check_count = 0;
+static NS_CheckResult check_worst = NS_CHECK_OK;
+
+static NS_Peer peers[NS_MAX_PEERS];
+static int     peer_count = 0;
+static int     peer_sel = 0;
+
+/* Two ways to find a host, shown as one list: announcements heard on the
+ * network we are already on, and ad hoc networks found by scanning for our SSID
+ * prefix. A host that has already moved to its own network can only be found
+ * the second way, so neither source alone is sufficient. */
+static NS_Peer adhoc[NS_MAX_PEERS];
+static int     adhoc_count = 0;
+static int     join_total = 0;      /* peer_count + adhoc_count */
+static NS_Peer* join_at(int i) { return i < peer_count ? &peers[i] : &adhoc[i - peer_count]; }
+
+/* A hotspot can be visible both through its last broadcast announcement and
+ * through the WiFi scan. They are two sightings of one host, not two choices.
+ * Prefer the announcement: it carries platform metadata and credentials. Mark
+ * that row as scanned, though, so the UI presents the SSID the user just found
+ * instead of making the ad-hoc result appear to have vanished into an IP. */
+static void dedupe_adhoc(void) {
+	int kept = 0;
+	for (int i = 0; i < adhoc_count; i++) {
+		bool duplicate = false;
+		for (int j = 0; j < peer_count; j++) {
+			if (peers[j].hotspot && peers[j].ssid[0] &&
+			    !strcmp(peers[j].ssid, adhoc[i].ssid)) {
+				peers[j].scanned = true;
+				duplicate = true;
+				break;
+			}
+		}
+		if (!duplicate) {
+			if (kept != i) adhoc[kept] = adhoc[i];
+			kept++;
+		}
+	}
+	adhoc_count = kept;
+}
+
+static char local_ip[NS_IP_LEN] = "?";
+static char hs_ssid[NS_SSID_LEN];
+static char hs_psk[NS_PSK_LEN];
+static int  hosting_hotspot;
+
+//////////////////////////////////////////////////////////////////////////////
+// drawing helpers
+//////////////////////////////////////////////////////////////////////////////
+
+static void draw_title(SDL_Surface* screen_s, const char* title) {
+	SDL_Surface* t = TTF_RenderUTF8_Blended(font.large, title, COLOR_WHITE);
+	if (t) {
+		SDL_BlitSurface(t, NULL, screen_s,
+		                &(SDL_Rect){SCALE1(PADDING + BUTTON_PADDING), SCALE1(PADDING + 4)});
+		SDL_FreeSurface(t);
+	}
+}
+
+static int draw_line(SDL_Surface* screen_s, const char* text, int y, SDL_Color color, bool small) {
+	SDL_Surface* t = TTF_RenderUTF8_Blended(small ? font.small : font.large, text, color);
+	if (t) {
+		SDL_BlitSurface(t, NULL, screen_s,
+		                &(SDL_Rect){SCALE1(PADDING + BUTTON_PADDING), y, 0, 0});
+		y += t->h + SCALE1(4);
+		SDL_FreeSurface(t);
+	}
+	return y;
+}
+
+static int draw_row(SDL_Surface* screen_s, const char* text, int y, bool selected) {
+	SDL_Color color = selected ? COLOR_BLACK : COLOR_WHITE;
+	if (selected) {
+		int w, h;
+		TTF_SizeUTF8(font.large, text, &w, &h);
+		SDL_Rect pill = {
+			SCALE1(PADDING), y - SCALE1(2),
+			w + SCALE1(BUTTON_PADDING * 2), h + SCALE1(4)
+		};
+		GFX_blitPill(ASSET_WHITE_PILL, screen_s, &pill);
+	}
+	SDL_Surface* t = TTF_RenderUTF8_Blended(font.large, text, color);
+	if (t) {
+		SDL_BlitSurface(t, NULL, screen_s,
+		                &(SDL_Rect){SCALE1(PADDING + BUTTON_PADDING), y, 0, 0});
+		y += t->h + SCALE1(6);
+		SDL_FreeSurface(t);
+	}
+	return y;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// screens
+//////////////////////////////////////////////////////////////////////////////
+
+/* Three screens' worth of choices, not one long list.
+ *
+ * The flat menu had grown to seven entries and pushed the WiFi status line off
+ * the bottom, with no way to scroll to it - which is precisely the information
+ * you need to tell an ad hoc session from a failed one. Submenus keep the top
+ * level short enough that the status line is always visible. */
+enum { MENU_HOST, MENU_JOIN, MENU_TOOLS, MENU_COUNT };
+enum { HOST_ADHOC, HOST_WIFI, HOST_COUNT };
+enum { TOOL_SETTINGS, TOOL_CHECKS, TOOL_FIXWIFI, TOOL_OFF, TOOL_COUNT };
+enum { SET_SHARE, SET_COMPAT, SET_FORCE_COMPAT, SET_VERBOSE_LOGS, SET_SIMPLE, SET_GAMESWITCHER, SET_INSTANCED, SET_COUNT };
+
+static const char* menu_label(int item) {
+	switch (item) {
+	case MENU_HOST:  return "Host";
+	case MENU_JOIN:  return "Join";
+	case MENU_TOOLS: return "Tools";
+	}
+	return "";
+}
+
+/* Creating our own network needs an AP-capable interface. Offering it on a
+ * device that cannot do it produces a failure the user cannot act on, so the
+ * entry is simply absent there. */
+static int host_menu_count(void) { return NS_canHostAdhoc() ? HOST_COUNT : 1; }
+
+static const char* host_label(int item) {
+	if (!NS_canHostAdhoc()) item = HOST_WIFI;   /* only one entry to show */
+	switch (item) {
+	case HOST_ADHOC: return "Create ad hoc network";
+	case HOST_WIFI:  return "Host over WiFi";
+	}
+	return "";
+}
+
+static const char* tool_label(int item) {
+	switch (item) {
+	case TOOL_SETTINGS: return "Settings";
+	case TOOL_CHECKS:  return "Run checks";
+	case TOOL_FIXWIFI: return "Restore WiFi";
+	case TOOL_OFF:     return "Turn off (remove bindings)";
+	}
+	return "";
+}
+
+/* Rendered as "Name: value" on one row, because these are toggles rather than
+ * destinations - a submenu per setting would be three button presses to flip a
+ * boolean. Instanced cores is the exception: it has a third state that opens a
+ * picker, shown as ">" so it reads as "there is more behind this". */
+static int settings_sel = 0;
+static int inst_sel = 0;
+
+static void setting_row(char* out, int len, int item) {
+	NS_Settings* c = NS_settings();
+	switch (item) {
+	case SET_SHARE:
+		snprintf(out, len, "Share cores:  %s", c->share_cores ? "Yes" : "No");
+		break;
+	case SET_COMPAT:
+		snprintf(out, len, "Use compatibility cores:  %s", c->compatibility_cores ? "Yes" : "No");
+		break;
+	case SET_FORCE_COMPAT:
+		snprintf(out, len, "Force compatibility cores:  %s", c->force_compatibility ? "Yes" : "No");
+		break;
+	case SET_VERBOSE_LOGS:
+		snprintf(out, len, "Verbose debugging logs:  %s", c->verbose_logs ? "Yes" : "No");
+		break;
+	case SET_SIMPLE:
+		snprintf(out, len, "Simple client (planned):  %s", c->simple_client ? "Yes" : "No");
+		break;
+	case SET_GAMESWITCHER:
+		snprintf(out, len, "Add Netplay to Game Switcher:  %s", c->add_gameswitcher ? "Yes" : "No");
+		break;
+	case SET_INSTANCED:
+		switch (c->instanced) {
+		case NS_INST_OFF:      snprintf(out, len, "Instanced link:  No"); break;
+		case NS_INST_ALL:      snprintf(out, len, "Instanced link:  Yes (supported)"); break;
+		case NS_INST_SELECTED: {
+			int n = 0;
+			for (int i = 0; i < NS_INST_CORES; i++) if (c->inst_core[i]) n++;
+			snprintf(out, len, "Instanced link:  %d selected  >", n);
+			break;
+		}
+		}
+		break;
+	default: out[0] = '\0';
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// wifi status
+//
+// Polled, not read per frame: PLAT_wifiConnection shells out to wpa_cli, ip
+// and iw, which is far too expensive to do at render rate.
+//////////////////////////////////////////////////////////////////////////////
+
+static char wifi_ssid[SSID_MAX] = "";
+static int  wifi_rssi = 0;
+static bool wifi_up = false;
+static uint32_t wifi_checked_ms = 0;
+
+#define WIFI_POLL_MS 5000
+
+static void wifi_poll(bool force) {
+	uint32_t now = SDL_GetTicks();
+	if (!force && wifi_checked_ms && now - wifi_checked_ms < WIFI_POLL_MS) return;
+	wifi_checked_ms = now;
+
+	struct WIFI_connection c;
+	memset(&c, 0, sizeof(c));
+	PLAT_wifiConnection(&c);
+
+	wifi_up = c.valid && c.ssid[0];
+	wifi_rssi = c.rssi;
+	snprintf(wifi_ssid, sizeof(wifi_ssid), "%s", wifi_up ? c.ssid : "not connected");
+	if (c.valid && c.ip[0]) snprintf(local_ip, sizeof(local_ip), "%s", c.ip);
+}
+
+/* SSID plus what it means for us: the address a peer would dial. */
+static int draw_wifi_line(SDL_Surface* s, int y) {
+	char line[160];
+	if (wifi_up) snprintf(line, sizeof(line), "%s  (%d dBm)  -  %s", wifi_ssid, wifi_rssi, local_ip);
+	else         snprintf(line, sizeof(line), "WiFi: %s", wifi_ssid);
+	return draw_line(s, line, y, COLOR_GRAY, true);
+}
+
+/* Joining blocks for up to a minute inside NS_hotspotJoin. Without a frame in
+ * between, the device looks hung at exactly the moment the user is most likely
+ * to power-cycle it. The callback lets us draw one per second. */
+static SDL_Surface* progress_surface;
+
+/* What the spinner is currently for. Joining is not the only slow operation:
+ * ending a session puts the client stack back, which is the same work in
+ * reverse and just as slow, and it used to run with nothing on screen at all. */
+static const char* progress_title = "Joining";
+static const char* progress_note  = "This can take up to a minute.";
+
+static void set_progress(const char* title, const char* note) {
+	progress_title = title;
+	progress_note  = note;
+}
+
+static void draw_progress(const char* stage, int step, int steps) {
+	static const char* SPINNER[] = { "|", "/", "-", "\\" };
+	static int tick;
+
+	if (!progress_surface) return;
+
+	SDL_Surface* s = progress_surface;
+	GFX_clear(s);
+	GFX_blitHardwareGroup(s, 0);
+	draw_title(s, progress_title);
+
+	int y = SCALE1(PADDING + 44);
+	char line[128];
+	snprintf(line, sizeof(line), "%s %s", SPINNER[tick++ % 4], stage);
+	y = draw_line(s, line, y, COLOR_WHITE, false);
+	y += SCALE1(6);
+	/* Used to name NS_ADHOC_SSID, which is the legacy fixed name and not what
+	 * a generated nextui-XXXX session is actually called. */
+	snprintf(line, sizeof(line), "step %d of %d", step, steps);
+	y = draw_line(s, line, y, COLOR_GRAY, true);
+	draw_line(s, progress_note, y, COLOR_GRAY, true);
+
+	GFX_flip(s);
+}
+
+static void render(SDL_Surface* s) {
+	GFX_clear(s);
+
+	/* Battery and the WiFi signal icon, in the standard top-right position. */
+	GFX_blitHardwareGroup(s, 0);
+
+	switch (screen) {
+	case SCREEN_MENU: {
+		draw_title(s, quick_mode
+		           ? (NS_isArmed() ? "Netplay Quick - armed" : "Netplay Quick")
+		           : (NS_isArmed() ? "Netplay - armed" : "Netplay"));
+		int y = SCALE1(PADDING + 44);
+		for (int i = 0; i < MENU_COUNT; i++)
+			y = draw_row(s, menu_label(i), y, i == menu_sel);
+		y = draw_wifi_line(s, y + SCALE1(8));
+		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
+		GFX_blitButtonGroup(NS_isArmed()
+		                    ? (char*[]){"B", "EXIT", "X", "END SESSION", "A", "SELECT", NULL}
+		                    : (char*[]){"B", "EXIT", "A", "SELECT", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_HOST_MENU: {
+		draw_title(s, "Host");
+		int y = SCALE1(PADDING + 44);
+		for (int i = 0; i < host_menu_count(); i++)
+			y = draw_row(s, host_label(i), y, i == sub_sel);
+		if (!NS_canHostAdhoc())
+			y = draw_line(s, "This device cannot create a network (no AP interface).",
+			              y + SCALE1(6), COLOR_GRAY, true);
+		y = draw_wifi_line(s, y + SCALE1(8));
+		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
+		GFX_blitButtonGroup((char*[]){"B", "BACK", "A", "SELECT", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_TOOLS: {
+		draw_title(s, "Tools");
+		int y = SCALE1(PADDING + 44);
+		for (int i = 0; i < TOOL_COUNT; i++)
+			y = draw_row(s, tool_label(i), y, i == sub_sel);
+		y = draw_wifi_line(s, y + SCALE1(8));
+		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
+		GFX_blitButtonGroup((char*[]){"B", "BACK", "A", "SELECT", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_SETTINGS: {
+		draw_title(s, "Settings");
+		int y = SCALE1(PADDING + 44);
+		char row[128];
+		for (int i = 0; i < SET_COUNT; i++) {
+			setting_row(row, sizeof(row), i);
+			y = draw_row(s, row, y, i == settings_sel);
+		}
+		y += SCALE1(6);
+		const char* hint = "";
+		switch (settings_sel) {
+		case SET_SHARE:
+			hint = "Frozen for now; no core files are transferred."; break;
+		case SET_COMPAT:
+			hint = "Use pak cores only when installed builds differ."; break;
+		case SET_FORCE_COMPAT:
+			hint = "Testing: use pak cores even when builds match."; break;
+		case SET_SIMPLE:
+			hint = "Planned: accept invitations for matching local games."; break;
+		case SET_GAMESWITCHER:
+			hint = "While armed, the switcher contains only Netplay."; break;
+		case SET_INSTANCED:
+			hint = "Both devices, and both carts on each. Else link cable."; break;
+		}
+		y = draw_line(s, hint, y, COLOR_GRAY, true);
+		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
+		GFX_blitButtonGroup((char*[]){"B", "BACK", "A", "CHANGE", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_INSTANCED: {
+		draw_title(s, "Instanced cores");
+		int y = SCALE1(PADDING + 44);
+		NS_Settings* c = NS_settings();
+		for (int i = 0; i < NS_INST_CORES; i++) {
+			char row[128];
+			bool have = NS_coreInstalled(NS_INST_CORE[i]);
+			snprintf(row, sizeof(row), "[%s] %s%s%s",
+			         c->inst_core[i] ? "x" : " ", NS_INST_CORE[i],
+			         have ? "" : "  (not installed)",
+			         i == 0 ? "" : "  (planned)");
+			y = draw_row(s, row, y, i == inst_sel);
+		}
+		y += SCALE1(6);
+		y = draw_line(s, "Only link-cable cores can be instanced -", y, COLOR_GRAY, true);
+		draw_line(s, "a shared-screen core is already one instance.", y, COLOR_GRAY, true);
+		GFX_blitButtonGroup((char*[]){"B", "BACK", "A", "TOGGLE", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_CHECKS: {
+		draw_title(s, "Checks");
+		int y = SCALE1(PADDING + 44);
+		for (int i = 0; i < check_count; i++) {
+			char line[160];
+			const char* mark = checks[i].result == NS_CHECK_OK ? "OK  "
+			                 : checks[i].result == NS_CHECK_WARN ? "WARN" : "FAIL";
+			snprintf(line, sizeof(line), "%s  %s", mark, checks[i].label);
+			y = draw_line(s, line, y,
+			              checks[i].result == NS_CHECK_OK ? COLOR_WHITE : COLOR_GRAY, false);
+			y = draw_line(s, checks[i].detail, y, COLOR_GRAY, true);
+		}
+		GFX_blitButtonGroup((char*[]){"B", "BACK", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_HOSTING: {
+		draw_title(s, "Hosting");
+		int y = SCALE1(PADDING + 44);
+		char line[128];
+		snprintf(line, sizeof(line), "This device: %s", local_ip);
+		y = draw_line(s, line, y, COLOR_WHITE, false);
+		y += SCALE1(6);
+		y = draw_line(s, "On the other device choose Join.", y, COLOR_GRAY, true);
+		if (hosting_hotspot) {
+			snprintf(line, sizeof(line), "Ad hoc network: %s  (%s)", hs_ssid, NS_ADHOC_PSK);
+			y = draw_line(s, line, y, COLOR_GRAY, true);
+
+			// Who has actually turned up. Without this the host cannot tell a
+			// client that joined from one that silently never did.
+			NS_Client clients[NS_MAX_CLIENTS];
+			int nc = NS_hotspotClients(clients, NS_MAX_CLIENTS);
+			if (nc == 0) {
+				y = draw_line(s, "No devices connected yet.", y, COLOR_GRAY, true);
+			} else {
+				for (int i = 0; i < nc; i++) {
+					snprintf(line, sizeof(line), "  %s  %s",
+					         clients[i].ip[0] ? clients[i].ip : "(no address yet)",
+					         clients[i].mac);
+					y = draw_line(s, line, y, COLOR_WHITE, true);
+				}
+			}
+			y = draw_line(s, "Then launch the same game on both.", y, COLOR_GRAY, true);
+		} else {
+			y = draw_line(s, "Then launch the same game on both.", y, COLOR_GRAY, true);
+		}
+		GFX_blitButtonGroup((char*[]){"B", "BACK", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_JOINING: {
+		draw_title(s, "Join");
+		int y = SCALE1(PADDING + 44);
+		if (join_total == 0) {
+			y = draw_line(s, "Looking for a host...", y, COLOR_WHITE, false);
+			y += SCALE1(4);
+			y = draw_line(s, "On WiFi: the host must be on its Hosting screen.", y, COLOR_GRAY, true);
+			y = draw_line(s, "Ad hoc: press Y to scan again.", y, COLOR_GRAY, true);
+		} else {
+			for (int i = 0; i < join_total; i++) {
+				NS_Peer* pr = join_at(i);
+				char line[128];
+				if (pr->scanned) {
+					/* The SSID carries the host's code, which is what the user
+					 * sees on the hosting device - that is the thing to match. */
+					snprintf(line, sizeof(line), "%s  (ad hoc)", pr->ssid);
+				} else {
+					int same = !strcmp(pr->platform, NS_platform());
+					snprintf(line, sizeof(line), "%s%s%s", pr->ip,
+					         pr->hotspot ? "  ad hoc" : "  WiFi",
+					         same ? "" : "  (different device)");
+				}
+				y = draw_row(s, line, y, i == peer_sel);
+			}
+		}
+		y = draw_wifi_line(s, y + SCALE1(8));
+		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
+		GFX_blitButtonGroup((char*[]){"B", "BACK", "Y", "RESCAN", "A", "SELECT", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_ARMED: {
+		draw_title(s, "Ready");
+		int y = SCALE1(PADDING + 44);
+		y = draw_line(s, status, y, COLOR_WHITE, false);
+		y += SCALE1(6);
+		y = draw_line(s, "Launch the same game on both devices.", y, COLOR_GRAY, true);
+		draw_line(s, "Re-open this app to turn netplay off.", y, COLOR_GRAY, true);
+		GFX_blitButtonGroup((char*[]){"B", "BACK", NULL}, 1, s, 1);
+		break;
+	}
+	}
+
+	GFX_flip(s);
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+static void abort_arm_attempt(bool may_have_activated) {
+	/* One rollback path owns everything an arm attempt can start. NS_disarm is
+	 * deliberately reserved for attempts that may have created a session or
+	 * partial bindings; a failed preflight must not remove bindings retained
+	 * from an earlier, deliberately ended session. */
+	NS_announceStop();
+	NS_compatServeStop();
+	if (may_have_activated)
+		NS_disarm();
+	else
+		NS_hotspotStop();
+	hosting_hotspot = 0;
+}
+
+static void do_arm(NS_Role role, const char* peer) {
+	char err[96] = "";
+
+	/* Never overwrite a live session. Re-arming used to orphan the existing
+	 * peer and could replace its transport underneath a running game. */
+	if (NS_isArmed()) {
+		snprintf(status, sizeof(status), "End the current session with X first.");
+		screen = SCREEN_MENU;
+		return;
+	}
+
+	/* These are launch-path invariants, not optional diagnostics. If one fails,
+	 * arming would appear successful but games would either bypass the shim or
+	 * use the wrong save path. Cross-platform compatibility is decided by the
+	 * core manifest exchange below, so the old crude platform check is gone. */
+	check_count = NS_runChecks(checks, 8, &check_worst);
+	if (check_worst == NS_CHECK_FAIL) {
+		abort_arm_attempt(false);
+		snprintf(status, sizeof(status), "Checks failed - not arming");
+		screen = SCREEN_CHECKS;
+		return;
+	}
+
+	if (!NS_arm(role, peer, err, sizeof(err))) {
+		abort_arm_attempt(true);
+		snprintf(status, sizeof(status), "%s", err[0] ? err : "could not arm");
+		screen = SCREEN_MENU;
+		return;
+	}
+
+	// Name the transport and the delay it bought. Which network a session ended
+	// up on is the single thing that decides whether it is playable, and it was
+	// previously invisible - a session that quietly fell back to the house
+	// network looked identical to one on ad hoc until the game stuttered.
+	/* Settle the builds now, while the user is still choosing a game, rather
+	 * than in front of a launch. The host serves from its hosting tick; the
+	 * client drives the exchange here. */
+	if (role == NS_ROLE_HOST) {
+		if (!NS_compatServeStart()) {
+			abort_arm_attempt(true);
+			snprintf(status, sizeof(status), "Could not listen for core negotiation.");
+			screen = SCREEN_MENU;
+			return;
+		}
+	} else {
+		/* Always compare manifests. With compatibility disabled the exchange
+		 * still records differing installed builds so both launchers can warn;
+		 * the setting only controls whether a packaged fallback may be chosen. */
+		set_progress("Checking cores", "Comparing builds with the host.");
+		draw_progress("Comparing builds", 1, 1);
+		char cerr[128] = "";
+		int selected = NS_compatSync(peer, cerr, sizeof(cerr));
+		set_progress("Joining", "This can take up to a minute.");
+		if (selected > 0)
+			snprintf(core_note, sizeof(core_note), "  -  %d compatibility fallback(s)", selected);
+		else if (selected < 0) {
+			/* Compatibility selection is part of arming, not an optional status
+			 * probe. Continuing after it fails can put the peers on different
+			 * cores, which is guaranteed to desynchronize shared-screen play. */
+			abort_arm_attempt(true);
+			snprintf(status, sizeof(status), "Core check failed: %s", cerr);
+			screen = SCREEN_MENU;
+			return;
+		}
+		else
+			core_note[0] = '\0';
+	}
+
+	int adhoc = NS_hotspotActive();
+	if (role == NS_ROLE_HOST)
+		snprintf(status, sizeof(status), "Hosting on %s  -  %s, delay %d",
+		         local_ip, adhoc ? "ad hoc" : "WiFi",
+		         adhoc ? NS_INPUT_DELAY_ADHOC : NS_INPUT_DELAY_WIFI);
+	else
+		snprintf(status, sizeof(status), "Joined %s  -  %s, delay %d%s",
+		         peer, adhoc ? "ad hoc" : "WiFi",
+		         adhoc ? NS_INPUT_DELAY_ADHOC : NS_INPUT_DELAY_WIFI, core_note);
+	screen = SCREEN_ARMED;
+}
+
+int main(int argc, char* argv[]) {
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--quick")) quick_mode = true;
+	}
+
+	SDL_Surface* s = GFX_init(MODE_MAIN);
+	PAD_init();
+	PWR_init();
+	InitSettings();
+
+	signal(SIGINT, on_signal);
+	signal(SIGTERM, on_signal);
+
+	NS_init();
+	progress_surface = s;
+	NS_setProgressCallback(draw_progress);
+	WIFI_init();
+
+	// A join that failed - or an AP that vanished after a successful one - used
+	// to leave the device associated to nothing, with no way back except the
+	// system WiFi menu. Check on every launch, before anything else.
+	if (NS_wifiRecoverIfStranded()) {
+		snprintf(status, sizeof(status), "Reconnected to WiFi after an ad hoc session.");
+	}
+	if (!NS_localIP(local_ip, sizeof(local_ip))) snprintf(local_ip, sizeof(local_ip), "no network");
+	wifi_poll(true);
+	if (NS_isArmed()) snprintf(status, sizeof(status), "A session is already set up.");
+
+	int dirty = 1;
+	while (!quit) {
+		PAD_poll();
+
+		/* Rate-limited internally; a change in signal or SSID redraws. */
+		char was_ssid[SSID_MAX];
+		bool was_up = wifi_up;
+		snprintf(was_ssid, sizeof(was_ssid), "%s", wifi_ssid);
+		wifi_poll(false);
+		if (was_up != wifi_up || strcmp(was_ssid, wifi_ssid)) dirty = 1;
+
+		/* X ends the session from any screen. It is the thing most often
+		 * wanted and it used to be buried in the list. */
+		if (PAD_justPressed(BTN_X) && NS_isArmed()) {
+			// NS_endSession stops the AP and restores wifi itself; calling
+			// NS_hotspotStop again here ran the teardown twice and logged a
+			// spurious "nothing recorded to restore wifi with".
+			set_progress("Restoring original WiFi", "Leaving the ad hoc network.");
+			NS_endSession();
+			set_progress("Joining", "This can take up to a minute.");
+			core_note[0] = '\0';
+			hosting_hotspot = 0;
+			/* Forced, not the 5s poll. The cached values are from before the
+			 * teardown, so without this the status text reports the network we
+			 * were on while the live icon reports the one we are on - which is
+			 * how a device claiming to be connected showed no WiFi icon. */
+			wifi_poll(true);
+			snprintf(status, sizeof(status), wifi_up
+			         ? "Session ended. Bindings kept."
+			         : "Session ended. Original WiFi recovery continues...");
+			screen = SCREEN_MENU;
+			dirty = 1;
+		}
+
+		switch (screen) {
+		case SCREEN_MENU:
+			/* B from Hosting is navigation, not a lifecycle event. Keep the
+			 * host visible while this process remains in its menu. A future
+			 * broker will extend the same ownership beyond this app process. */
+			NS_announceTick();
+			NS_compatServeTick();   /* still serving while armed, wherever we are */
+			if (PAD_justPressed(BTN_UP))   { menu_sel = (menu_sel + MENU_COUNT - 1) % MENU_COUNT; dirty = 1; }
+			if (PAD_justPressed(BTN_DOWN)) { menu_sel = (menu_sel + 1) % MENU_COUNT; dirty = 1; }
+			if (PAD_justPressed(BTN_B))    quit = 1;
+			if (PAD_justPressed(BTN_A)) {
+				status[0] = '\0';
+				sub_sel = 0;
+				if (NS_isArmed() && (menu_sel == MENU_HOST || menu_sel == MENU_JOIN)) {
+					snprintf(status, sizeof(status), "End the current session with X first.");
+					dirty = 1;
+					break;
+				}
+				switch (menu_sel) {
+				case MENU_HOST:  screen = SCREEN_HOST_MENU; break;
+				case MENU_TOOLS: screen = SCREEN_TOOLS; break;
+				case MENU_JOIN:
+					peer_count = 0; peer_sel = 0; adhoc_count = 0; join_total = 0;
+					NS_discoverTick(NULL, 0);
+					NS_discoverStart();
+					screen = SCREEN_JOINING;
+					// One scan on entry so an ad hoc host shows up without the
+					// user having to know to press anything.
+					snprintf(status, sizeof(status), "Scanning for ad hoc networks...");
+					render(s);
+					adhoc_count = NS_scanAdhoc(adhoc, NS_MAX_PEERS);
+					status[0] = '\0';
+					break;
+				}
+				dirty = 1;
+			}
+			break;
+
+		case SCREEN_HOST_MENU: {
+			int n = host_menu_count();
+			if (PAD_justPressed(BTN_UP))   { sub_sel = (sub_sel + n - 1) % n; dirty = 1; }
+			if (PAD_justPressed(BTN_DOWN)) { sub_sel = (sub_sel + 1) % n; dirty = 1; }
+			if (PAD_justPressed(BTN_B))    { screen = SCREEN_MENU; dirty = 1; }
+			if (PAD_justPressed(BTN_A)) {
+				int choice = NS_canHostAdhoc() ? sub_sel : HOST_WIFI;
+				status[0] = '\0';
+
+				if (choice == HOST_ADHOC) {
+					NS_hotspotCredentials(hs_ssid, sizeof(hs_ssid), hs_psk, sizeof(hs_psk));
+					// The channel survey takes a couple of seconds; say so.
+					snprintf(status, sizeof(status), "Surveying channels...");
+					render(s);
+
+					char err[96] = "";
+					if (!NS_hotspotStart(hs_ssid, hs_psk, err, sizeof(err))) {
+						snprintf(status, sizeof(status), "%s", err);
+						dirty = 1;
+						break;   // stay here so the reason is readable
+					}
+					hosting_hotspot = 1;
+					snprintf(local_ip, sizeof(local_ip), "%s", NS_HOTSPOT_HOST_IP);
+					NS_announceHotspot(hs_ssid, hs_psk);
+				} else {
+					// Leaving an AP up would share one radio and one channel
+					// with the network this session is about to run over.
+					hosting_hotspot = 0;
+					NS_hotspotStop();
+					NS_announceHotspot(NULL, NULL);
+				}
+
+				NS_announceStart(NS_MODE_NETPLAY);
+				screen = SCREEN_HOSTING;
+				do_arm(NS_ROLE_HOST, NULL);
+				if (screen == SCREEN_ARMED) screen = SCREEN_HOSTING;
+				dirty = 1;
+			}
+			break;
+		}
+
+		case SCREEN_TOOLS:
+			if (PAD_justPressed(BTN_UP))   { sub_sel = (sub_sel + TOOL_COUNT - 1) % TOOL_COUNT; dirty = 1; }
+			if (PAD_justPressed(BTN_DOWN)) { sub_sel = (sub_sel + 1) % TOOL_COUNT; dirty = 1; }
+			if (PAD_justPressed(BTN_B))    { screen = SCREEN_MENU; dirty = 1; }
+			if (PAD_justPressed(BTN_A)) {
+				status[0] = '\0';
+				switch (sub_sel) {
+				case TOOL_SETTINGS:
+					settings_sel = 0;
+					screen = SCREEN_SETTINGS;
+					break;
+
+				case TOOL_CHECKS:
+					check_count = NS_runChecks(checks, 8, &check_worst);
+					screen = SCREEN_CHECKS;
+					break;
+
+				case TOOL_FIXWIFI:
+					snprintf(status, sizeof(status), "Restoring WiFi...");
+					render(s);
+					set_progress("Restoring WiFi", "Reconnecting to your network.");
+					NS_wifiRestore();
+					set_progress("Joining", "This can take up to a minute.");
+					wifi_poll(true);
+					snprintf(status, sizeof(status), wifi_up
+					         ? "Reconnected to %s." : "Could not reconnect - use system WiFi settings.",
+					         wifi_ssid);
+					screen = SCREEN_MENU;
+					break;
+
+				case TOOL_OFF:
+					set_progress("Turning off", "Putting WiFi back.");
+					NS_disarm();
+					set_progress("Joining", "This can take up to a minute.");
+					NS_announceStop();
+					NS_hotspotStop();
+					hosting_hotspot = 0;
+					snprintf(status, sizeof(status), "Netplay off. Launches are stock again.");
+					screen = SCREEN_MENU;
+					break;
+				}
+				dirty = 1;
+			}
+			break;
+
+		case SCREEN_SETTINGS: {
+			NS_Settings* c = NS_settings();
+			if (PAD_justPressed(BTN_UP))   { settings_sel = (settings_sel + SET_COUNT - 1) % SET_COUNT; dirty = 1; }
+			if (PAD_justPressed(BTN_DOWN)) { settings_sel = (settings_sel + 1) % SET_COUNT; dirty = 1; }
+			if (PAD_justPressed(BTN_B))    { screen = SCREEN_TOOLS; dirty = 1; }
+			if (PAD_justPressed(BTN_A)) {
+				status[0] = '\0';
+				switch (settings_sel) {
+				case SET_SHARE:  c->share_cores = !c->share_cores; break;
+				case SET_COMPAT:
+					c->compatibility_cores = !c->compatibility_cores;
+					if (!c->compatibility_cores) c->force_compatibility = false;
+					break;
+				case SET_FORCE_COMPAT:
+					c->force_compatibility = !c->force_compatibility;
+					if (c->force_compatibility) c->compatibility_cores = true;
+					break;
+				case SET_VERBOSE_LOGS: c->verbose_logs = !c->verbose_logs; break;
+				case SET_SIMPLE: c->simple_client = !c->simple_client; break;
+				case SET_GAMESWITCHER: c->add_gameswitcher = !c->add_gameswitcher; break;
+				case SET_INSTANCED:
+					/* Cycles No -> Yes (all) -> pick, and the third state opens
+					 * the picker rather than being a dead label. */
+					switch (c->instanced) {
+					case NS_INST_OFF:      c->instanced = NS_INST_ALL; break;
+					case NS_INST_ALL:      c->instanced = NS_INST_SELECTED;
+					                       screen = SCREEN_INSTANCED; inst_sel = 0; break;
+					case NS_INST_SELECTED: c->instanced = NS_INST_OFF; break;
+					}
+					break;
+				}
+				NS_settingsSave();
+				dirty = 1;
+			}
+			break;
+		}
+
+		case SCREEN_INSTANCED: {
+			NS_Settings* c = NS_settings();
+			if (PAD_justPressed(BTN_UP))   { inst_sel = (inst_sel + NS_INST_CORES - 1) % NS_INST_CORES; dirty = 1; }
+			if (PAD_justPressed(BTN_DOWN)) { inst_sel = (inst_sel + 1) % NS_INST_CORES; dirty = 1; }
+			if (PAD_justPressed(BTN_B))    { screen = SCREEN_SETTINGS; dirty = 1; }
+			if (PAD_justPressed(BTN_A)) {
+				if (inst_sel != 0) {
+					snprintf(status, sizeof(status), "%s instancing is not implemented yet.",
+					         NS_INST_CORE[inst_sel]);
+				} else if (NS_coreInstalled(NS_INST_CORE[inst_sel])) {
+					c->inst_core[inst_sel] = !c->inst_core[inst_sel];
+					NS_settingsSave();
+				} else {
+					snprintf(status, sizeof(status), "%s is not installed.", NS_INST_CORE[inst_sel]);
+				}
+				dirty = 1;
+			}
+			break;
+		}
+
+		case SCREEN_CHECKS:
+			/* This screen had no input case at all: it drew "B BACK" and
+			 * nothing read B, so opening it was a dead end that needed the
+			 * device power-cycled. The render switch handles every screen and
+			 * this one did not, which is exactly the asymmetry to watch for
+			 * when adding a screen. */
+			if (PAD_justPressed(BTN_B) || PAD_justPressed(BTN_A)) {
+				screen = SCREEN_TOOLS;
+				dirty = 1;
+			}
+			break;
+
+		case SCREEN_HOSTING: {
+			NS_announceTick();
+			/* Non-blocking accept, so this costs nothing until a client
+			 * actually connects to compare builds. */
+			NS_compatServeTick();
+
+			// The client list is read at render time, but this screen only
+			// redrew on a keypress - so a device that joined after the screen
+			// was drawn never appeared, and the host looked empty while a peer
+			// was in fact associated and passing traffic. Poll it.
+			static uint32_t hosting_drawn_ms;
+			uint32_t now_ms = SDL_GetTicks();
+			if (!hosting_drawn_ms || now_ms - hosting_drawn_ms > 1000) {
+				hosting_drawn_ms = now_ms;
+				dirty = 1;
+			}
+
+			// The AP is raised when Host is chosen, so there is no longer a
+			// keypress to start it - and the global X handler would shadow one
+			// here anyway, since this screen is only reached once armed.
+			if (PAD_justPressed(BTN_B)) {
+				screen = SCREEN_MENU;
+				dirty = 1;
+			}
+			break;
+		}
+
+		case SCREEN_JOINING: {
+			int n = NS_discoverTick(peers, NS_MAX_PEERS);
+			if (n != peer_count) { peer_count = n; dirty = 1; }
+			dedupe_adhoc();
+			join_total = peer_count + adhoc_count;
+			if (peer_sel >= join_total) peer_sel = join_total ? join_total - 1 : 0;
+
+			if (PAD_justPressed(BTN_UP) && join_total)   { peer_sel = (peer_sel + join_total - 1) % join_total; dirty = 1; }
+			if (PAD_justPressed(BTN_DOWN) && join_total) { peer_sel = (peer_sel + 1) % join_total; dirty = 1; }
+			if (PAD_justPressed(BTN_B)) { NS_discoverStop(); screen = SCREEN_MENU; dirty = 1; }
+
+			/* A scan costs ~2s and briefly steals the radio, so it is on demand
+			 * rather than on a timer - discovery keeps updating meanwhile. */
+			if (PAD_justPressed(BTN_Y)) {
+				snprintf(status, sizeof(status), "Scanning for ad hoc networks...");
+				render(s);
+				adhoc_count = NS_scanAdhoc(adhoc, NS_MAX_PEERS);
+				int scanned_count = adhoc_count;
+				dedupe_adhoc();
+				join_total = peer_count + adhoc_count;
+				snprintf(status, sizeof(status), "%d ad hoc network(s) found.", scanned_count);
+				dirty = 1;
+			}
+
+			if (PAD_justPressed(BTN_A) && join_total) {
+				NS_Peer* pr = join_at(peer_sel);
+				NS_discoverStop();
+
+				if (pr->hotspot) {
+					char err[96] = "";
+					// Credentials are fixed, so a network found by scan - or an
+					// announcement that predates this build - is still joinable.
+					const char* ssid = pr->ssid[0] ? pr->ssid : NS_ADHOC_SSID;
+					const char* psk  = pr->psk[0]  ? pr->psk  : NS_ADHOC_PSK;
+
+					snprintf(status, sizeof(status), "Joining %s...", ssid);
+					render(s);   // this blocks for a while; say so first
+					if (!NS_hotspotJoin(ssid, psk, err, sizeof(err))) {
+						// NS_hotspotJoin has already put the old network back.
+						snprintf(status, sizeof(status), "%s", err);
+						screen = SCREEN_MENU;
+						dirty = 1;
+						break;
+					}
+					// The host's address on its own network is fixed, so we
+					// already know the peer even though its old one is gone.
+					do_arm(NS_ROLE_CLIENT, NS_HOTSPOT_HOST_IP);
+				} else {
+					do_arm(NS_ROLE_CLIENT, pr->ip);
+				}
+				dirty = 1;
+			}
+			break;
+		}
+
+		case SCREEN_ARMED:
+			NS_announceTick(); /* harmless when not hosting */
+			/* Serve here too. This used to run only on the hosting screen, so a
+			 * host that had moved on - which is where arming leaves it, and
+			 * where it sits while choosing a game - silently stopped answering
+			 * core requests. Non-blocking and a no-op when not hosting. */
+			NS_compatServeTick();
+			if (PAD_justPressed(BTN_B) || PAD_justPressed(BTN_A)) { screen = SCREEN_MENU; dirty = 1; }
+			break;
+		}
+
+		PWR_update(&dirty, NULL, NULL, NULL);
+
+		if (dirty) { render(s); dirty = 0; }
+		else GFX_sync();
+	}
+
+	NS_announceStop();
+	NS_compatServeStop();
+	NS_discoverStop();
+
+	QuitSettings();
+	PWR_quit();
+	PAD_quit();
+	GFX_quit();
+	return 0;
+}
