@@ -227,6 +227,35 @@ else
 fi
 
 echo
+echo "== a genuinely blocked core call trips the starvation watchdog"
+# Queue silence is normal in menus, but one retro_run call which does not return
+# is an actual core-side failure. Lower the field threshold for this regression.
+PORT19=$((PORT + 18))
+printf 'role=host\nport=%s\nmode=link\n'                  "$PORT19" > "$OUT/h19.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\n' "$PORT19" > "$OUT/c19.session"
+
+NETPLAY_LINK_STARVE_MS=500 \
+	NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h19.session" \
+	"$OUT/harness" "$SHIM" 250 10 > "$OUT/h19.log" 2>&1 &
+H19=$!
+sleep 0.3
+NETPLAY_LINK_STARVE_MS=500 FAKE_CORE_BLOCK_AT=100 FAKE_CORE_BLOCK_MS=1000 \
+	NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c19.session" \
+	"$OUT/harness" "$SHIM" 250 10 > "$OUT/c19.log" 2>&1 &
+C19=$!
+wait $H19 2>/dev/null || true
+wait $C19 2>/dev/null || true
+
+expect "$OUT/c19.log" "link starved: one core call blocked" "blocked call was identified"
+expect "$OUT/c19.log" "Other player's game stopped sending link data" "blocked call reached recovery UI"
+if grep -q "link starved:" "$OUT/h19.log"; then
+	echo "  MISS normally running host tripped the watchdog"
+	fail=1
+else
+	echo "  ok   normally running host did not trip the watchdog"
+fi
+
+echo
 echo "== menu still pauses the peer for a core that owns its own link"
 # gambatte never registers netpacket, but a menu on one device should still hold
 # the other - otherwise it sits blocked on a serial read with no idea why.
@@ -549,6 +578,13 @@ for side in h2 c2; do
 	else
 		echo "  ok   $side stayed connected"
 	fi
+	if grep -q "link starved:\|Other player's game stopped sending link data" "$OUT/$side.log"; then
+		echo "  MISS $side treated a normally running quiet core as blocked"
+		grep -E "link starved:|Other player's game" "$OUT/$side.log" | sed 's/^/       /'
+		fail=1
+	else
+		echo "  ok   $side allowed normal zero-packet frames"
+	fi
 done
 # One clean teardown each at the end is expected; more means it flapped.
 flaps=$(grep -c "netpacket session started" "$OUT/c2.log" || true)
@@ -641,6 +677,31 @@ c15_sum=$(sed -n 's/.*core:inputsum frames=\([0-9]*\) sum=\(.*\)/\1 \2/p' "$OUT/
 [ -n "$h15_sum" ] && [ "$h15_sum" = "$c15_sum" ] \
 	&& echo "  ok   converged peers ran identical inputs ($h15_sum)" \
 	|| { echo "  MISS input streams differ (host='$h15_sum' client='$c15_sum')"; fail=1; }
+
+echo
+echo "== automatic RTT negotiation preserves the transport delay floor"
+# Loopback proposes the minimum of two frames. Ordinary Wi-Fi sessions are
+# intentionally written with a ten-frame floor because later jitter is much
+# worse than a couple of quiet startup probes can establish.
+PORT18=$((PORT + 17))
+printf 'role=host\nport=%s\nmode=netplay\ninput_delay=10\ninput_delay_auto=1\n' "$PORT18" > "$OUT/h18.session"
+printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=netplay\ninput_delay=10\ninput_delay_auto=1\n' "$PORT18" > "$OUT/c18.session"
+NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/h18.session" \
+	"$OUT/harness" "$SHIM" 400 5 > "$OUT/h18.log" 2>&1 &
+H18=$!
+sleep 0.2
+NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/c18.session" \
+	"$OUT/harness" "$SHIM" 400 5 > "$OUT/c18.log" 2>&1 &
+C18=$!
+wait $H18 2>/dev/null || true
+wait $C18 2>/dev/null || true
+for side in h18 c18; do
+	expect "$OUT/$side.log" "keeping transport floor 10" "$side rejected an optimistic startup sample"
+	delay=$(sed -n 's/.*agreed input delay \([0-9]*\).*/\1/p' "$OUT/$side.log" | tail -1)
+	[ "$delay" = "10" ] \
+		&& echo "  ok   $side retained ten frames" \
+		|| { echo "  MISS $side negotiated delay $delay instead of 10"; fail=1; }
+done
 
 echo
 echo "== mode comes from the core, not the session"

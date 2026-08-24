@@ -20,7 +20,7 @@
  *     rather than overwritten; CMD_SESSION_IDENTITY carries rom_size;
  *     CMD_LINK_VERDICT added.
  * 11: CMD_RTT_PROBE/CMD_RTT_ECHO added; input delay is negotiated from the
- *     measured round trip rather than fixed by the session file. */
+ *     measured round trip above the session's transport-specific floor. */
 #define NETLINK_PROTOCOL 13
 
 #define QUEUE_SIZE    512
@@ -163,9 +163,8 @@ static struct {
 	uint32_t resync_commit_epoch;
 	bool     resync_commit_ready;
 
-	/* Smoothed round trip. Kept as a small ring rather than an average so one
-	 * scheduling hiccup on either device cannot pin the estimate high: the
-	 * median of the last few samples is what the delay is derived from. */
+	/* Recent round trips. Kept as a small ring so the median can describe the
+	 * normal link while the maximum sizes the jitter-tolerance window. */
 	uint32_t rtt_us[RTT_SAMPLES];
 	unsigned rtt_count, rtt_next;
 	uint32_t rtt_token;
@@ -173,7 +172,6 @@ static struct {
 	bool     rtt_outstanding;
 	struct timeval rtt_last_probe;
 
-	struct timeval starved_since; /* core running, queue empty, peer connected */
 	struct timeval last_run;      /* last retro_run, per NetLink_markFrame */
 	struct timeval peer_paused_at;
 	bool           told_peer_paused;
@@ -527,7 +525,6 @@ static void drop_connection(const char* reason) {
 		 * strands us waiting for a CMD_RESUME that can never arrive. */
 		nl.peer_paused = false;
 		nl.told_peer_paused = false;
-		nl.starved_since.tv_sec = nl.starved_since.tv_usec = 0;
 		nl.rtt_count = nl.rtt_next = 0;
 		nl.rtt_outstanding = false;
 		/* Everything the departed peer told us dies with it, so a reconnecting
@@ -959,34 +956,6 @@ void NetLink_markFrame(void) {
 void NetLink_setCoreRunning(bool running) {
 	nl.core_running = running;
 	if (!running) gettimeofday(&nl.last_run, NULL);
-
-	/* A link core may legitimately block in retro_run waiting for a serial byte,
-	 * and NetLink_markFrame deliberately does not count that as a frontend
-	 * stall - saying otherwise would pause the peer and starve the very data the
-	 * core is waiting for. The consequence is that a byte which never arrives
-	 * blocks forever, unobserved.
-	 *
-	 * So observe it, without changing what is reported to the peer: note when
-	 * the core enters a run with nothing queued for it. Any delivery clears it
-	 * (see NetLink_popPacket), which is why "quiet" alone can never trip this. */
-	pthread_mutex_lock(&nl.lock);
-	if (running && nl.connected && nl.q_head == nl.q_tail) {
-		if (!nl.starved_since.tv_sec) gettimeofday(&nl.starved_since, NULL);
-	} else if (!running) {
-		/* Leave the timer running across the frame boundary: a core that blocks
-		 * for several frames is one starvation, not several. */
-	}
-	pthread_mutex_unlock(&nl.lock);
-}
-
-/* Milliseconds the core has been running with an empty queue on a live
- * connection, or 0 when it is not starved. */
-long NetLink_starvedMs(void) {
-	pthread_mutex_lock(&nl.lock);
-	long ms = 0;
-	if (nl.connected && nl.starved_since.tv_sec) ms = ms_since(&nl.starved_since);
-	pthread_mutex_unlock(&nl.lock);
-	return ms;
 }
 
 bool NetLink_isPeerPaused(void) {
@@ -1362,9 +1331,6 @@ bool NetLink_popPacket(void* out, size_t out_cap, size_t* out_len) {
 	memcpy(out, p->data, n);
 	*out_len = n;
 	nl.q_head = (nl.q_head + 1) % QUEUE_SIZE;
-	/* Serial data reached the core, so whatever it was waiting for arrived. */
-	nl.starved_since.tv_sec = nl.starved_since.tv_usec = 0;
-
 	pthread_mutex_unlock(&nl.lock);
 	return true;
 }

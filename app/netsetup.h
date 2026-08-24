@@ -95,6 +95,34 @@ void NS_endSession(void);
 bool NS_isArmed(void);         /* a session file exists */
 bool NS_stubsInstalled(void);  /* launch stubs are in place, session or not */
 
+/* Durable facts used by a newly opened setup app. The session file owns the
+ * role/network/host fields; the detached broker contributes liveness and the
+ * host's current guest table. */
+typedef struct {
+	bool    armed;
+	NS_Role role;
+	char    network[NS_SSID_LEN];
+	char    psk[NS_PSK_LEN];
+	char    host[NS_IP_LEN];
+	bool    broker_running;
+	int     guest_count;
+	struct {
+		char id[32];
+		char ip[NS_IP_LEN];
+	} guest[4];
+} NS_SessionInfo;
+
+bool NS_sessionInfo(NS_SessionInfo* out);
+
+/* Remove an active-session record that belongs to a previous device boot.
+ * Empty hosts and temporarily absent peers are valid and are never considered
+ * stale. Returns true only when a leftover session was actually removed. */
+bool NS_cleanupStaleSession(void);
+
+/* Host-only detached owner of discovery and compatibility negotiation. */
+bool NS_brokerStart(char* err, int errlen);
+void NS_brokerStop(void);
+
 /* --- settings -----------------------------------------------------------
  *
  * Persisted to state/settings as key=value. Read once at startup; written on
@@ -176,11 +204,12 @@ uint32_t NS_runtimeGlibc(void);
  */
 #define NS_CORE_PORT 55439
 
-/* Host: accept and serve one exchange if a client is waiting. Non-blocking on
- * accept, so it can sit in the hosting screen's once-a-second tick. */
+/* Host broker: accept and serve one exchange if a client is waiting.
+ * Non-blocking accept keeps the idle detached process inexpensive. */
 bool NS_compatServeStart(void);
 void NS_compatServeTick(void);
 void NS_compatServeStop(void);
+const char* NS_compatLastPeer(void);
 
 /* Client: compare manifests with the host. Returns the number of compatibility
  * fallbacks selected on both devices, or -1 on failure. */

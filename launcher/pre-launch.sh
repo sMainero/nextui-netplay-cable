@@ -21,6 +21,12 @@
 # Exported for the minarch shadow and any launcher helpers it invokes.
 export NETPLAY_PAK
 
+# A session cannot retain process or network ownership across a reboot. Clean
+# that unambiguous leftover before deciding whether this launch is armed.
+if [ -x "$NETPLAY_PAK/launcher/session-cleanup.sh" ]; then
+	"$NETPLAY_PAK/launcher/session-cleanup.sh" || :
+fi
+
 # Nothing below costs anything without a session, so a stock launch is
 # untouched - which is the whole point of leaving the mounts up permanently.
 if [ -f "$NETPLAY_PAK/state/session" ]; then

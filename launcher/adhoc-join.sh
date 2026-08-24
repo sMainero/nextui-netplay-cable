@@ -16,6 +16,14 @@
 SESSION="$1"
 [ -f "$SESSION" ] || exit 0
 
+# The host session also records the ad-hoc SSID so the persistent broker and a
+# reopened setup UI can describe the network they own.  That is metadata, not
+# an instruction to associate as a station.  Running the client rejoin path on
+# a host tears down/reconfigures wlan0 while hostapd owns wlan1 and can make the
+# host's 10.0.0.1 endpoint unreachable just before the emulator starts.
+ROLE=$(sed -n 's/^role=//p' "$SESSION" | head -1)
+[ "$ROLE" = "client" ] || exit 0
+
 # Derive our own paths. launch-stub.sh sets NETPLAY_PAK but does not export it,
 # and this runs as a separate process - so taking it from the session path is
 # the only thing guaranteed to be right.

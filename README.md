@@ -20,9 +20,9 @@ True multiplayer for GameBoy Advance/Game Boy Color/Game Boy. Each player has th
 - Works for GBC/GB games that support Game Link. 
 - Linked games do not have to be the same — Red/Blue, Seasons/Ages all work
 
-### Instanced link (experimental, Game Boy only)
+### Instanced cores (experimental, Game Boy only)
 
-Turn on **Instanced link** in Settings and each device emulates *both* Game Boys,
+Turn on **Use instanced cores** in Settings and each device emulates *both* Game Boys,
 keeping the link cable inside the device and sending only controller inputs over
 WiFi. It removes a WiFi round trip from every cable exchange, which is what makes
 trading and battling feel responsive instead of sluggish.
@@ -82,6 +82,13 @@ Might come soon?
 ## Update
 Delete previous Netplay.pak folder. Extract new one.
 
+## Development harness
+
+The DevBridge-powered two-device harness can discover handhelds through the
+Windows-to-WSL relay, check emulator readiness, atomically deploy mGBA/DraStic
+development artifacts with backups, create correlated sessions, and collect
+their logs. See [docs/test-harness.md](docs/test-harness.md).
+
 ## Usage
 
 ### Netplay (LAN)
@@ -94,9 +101,19 @@ Delete previous Netplay.pak folder. Extract new one.
 4. After both devices are connected, exit the .pak and navigate to the game you want to play together
 5. When you are done playing, go back to the .pak and press X to end the session. Previous wifi networks should be re-established.
 
+Hosting continues in a detached session broker after the setup app closes. If
+you reopen Netplay.pak, the main screen shows `Hosting: nextui-XXXX` and its
+connected guests on the host, or `Joined: nextui-XXXX` and the host address on
+the guest. Host and Join stay hidden until the session ends.
+
+An empty host remains available for guests to leave and rejoin. If the device
+reboots without ending the session, Netplay discards that previous-boot session
+on the next boot, game launch, or opening of the setup app; installed launcher
+bindings remain as inactive passthroughs.
+
 ### Game Switcher shortcut
 
-`Tools > Settings > Add Netplay to Game Switcher` is off by default. When it is
+`Tools > Settings > Add Netplay to GameSwitcher` is off by default. When it is
 enabled, Netplay appears at the top of NextUI's Game Switcher. Opening it starts
 the Netplay Quick app, where you can host, join, or press X to end an armed
 session.

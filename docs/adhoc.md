@@ -143,7 +143,7 @@ On failure it logs hostapd's own output and the app falls back to hosting on the
 existing network rather than refusing to host at all.
 
 The SSID is `nextui-XXXX`, where the four characters are generated once per
-session and shown on the hosting screen; the passphrase is fixed
+session and shown on the armed main screen; the passphrase is fixed
 (`playwithme`).
 
 That shape is deliberate. Credentials used to be generated *and advertised over
@@ -332,7 +332,7 @@ present.
 | `Could not read interface mon.wlan1 flags: No such device`; a working AP is destroyed by a second Host | interface picker took the first device that was not `wlan0`, and `iw dev` lists hostapd's leftover monitor vif **first** | Match on name *and* type; skip `mon.*` and `type monitor`; make `NS_hotspotStart` idempotent |
 | Client joins successfully, then the device is on no network at all and cannot recover | a second Host attempt killed the AP the client was associated to | Never tear down an AP that is already serving the right SSID |
 | Signal icon and SSID blank while ad hoc is up and passing traffic | the join replaced the platform supplicant with one on a different control socket, so the frontend's `wpa_cli -p <dir>` had nothing to talk to | Discover the platform's `ctrl_interface` (`-O`, else the `-c` config) and reuse it |
-| Host shows no connected clients while a client is demonstrably associated | the client list is read at render time, but the Hosting screen only redrew on a keypress | Poll the screen once a second |
+| Host shows no connected clients while a client is demonstrably associated | the UI depended on process-local AP state and only redrew on a keypress | Have the broker publish a reconstructed guest table and poll its atomic status once a second |
 | `Could not set channel for kernel driver` / `Interface initialization failed` | Config channel disagrees with `wlan0`'s, violating `#channels <= 1` | Read the channel at runtime |
 | Same error, but only on the **second** session | Killing hostapd leaves the interface `type AP` with SSID and channel still claimed | Reset before start: delete `mon.*`, link down, `set type managed` |
 | `Could not read interface mon.wlan1 flags: No such device` | `iw dev` lists hostapd's leftover monitor vif **first**, so "first interface that is not wlan0" picked `mon.wlan1` | Match on name *and* type; skip `mon.*` and `type monitor` |
@@ -400,20 +400,38 @@ survive the ssh session dropping (anything that touches `wlan0`), use
 ## The menu
 
 ```
-Netplay          Host                        Tools              Settings
-  Host      ->     Create ad hoc network  ->   Settings    ->     Share cores: No (frozen)
-  Join             Host over WiFi             Run checks         Use compatibility cores: Yes
-  Tools                                       Restore WiFi       Simple client: No
-                                              Turn off           Add Netplay to Game Switcher: No
-                                                                 Instanced cores: No / Yes / >
+Netplay          Host                        Tools                         Settings
+  Host      ->     Create ad hoc network       Settings              ->     Use simple client: No
+  Join             Host over WiFi              Debug                 ->     Use compatibility cores: Yes
+  Tools                                       Restore WiFi                  Use instanced cores: No / Yes / >
+                                              Turn off Netplay               Add Netplay to GameSwitcher: No
+                                              (Remove Bindings)
+
+                                                                         Debug
+                                                                           Force compatibility cores: No
+                                                                           Verbose debugging logs: Yes
+                                                                           Run checks
 ```
+
+Once armed, Host and Join are replaced by durable session status:
+
+```
+Host                                      Guest
+  Hosting: nextui-XXXX                      Joined: nextui-XXXX
+  Connected guests:                        Connected to host: 10.0.0.1
+    10.0.0.20  aa:bb:cc:dd:ee:ff            Tools
+  Tools
+```
+
+The detached broker keeps hosting discoverable after Netplay.pak exits. X ends
+the session and stops the broker; until then Host and Join stay hidden.
 
 `X` ends a session from any screen; the hint only appears when one is armed.
 
 Submenus are not decoration. The flat menu reached seven entries and pushed the
 WiFi status line off the bottom with no way to scroll to it - and that line is
-exactly how you tell an ad hoc session from one that quietly fell back. Three
-entries per screen keeps it visible.
+exactly how you tell an ad hoc session from one that quietly fell back. Short,
+focused screens keep it visible.
 
 *Create ad hoc network* is absent on devices without an AP-capable interface,
 with the reason shown in its place.
@@ -422,7 +440,8 @@ Settings are toggles drawn in place (`Name: value`) rather than destinations - a
 submenu per boolean would be three presses to flip one flag. *Instanced cores*
 is the exception: its third state opens a picker over the cores that can be
 instanced (gambatte, gpsp, mgba), marking any not installed rather than offering
-something that cannot run. Stored in `state/settings`, written with
+something that cannot run. Debug-only toggles and checks live in the separate
+*Debug* submenu. Settings are stored in `state/settings`, written with
 write-then-rename so a power cut cannot leave a half-written file that silently
 reads back as defaults.
 

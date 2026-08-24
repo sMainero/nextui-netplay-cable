@@ -201,6 +201,8 @@ do_down() {
 # stale or missing after a NextUI update, and the correct response to that is an
 # unwrapped system, never a device that will not start.
 do_boot() {
+	[ ! -x "$NP/launcher/session-cleanup.sh" ] || \
+		"$NP/launcher/session-cleanup.sh" >/dev/null 2>&1 || :
 	[ -d "$STAGE" ] || exit 0
 	do_up >/dev/null 2>&1
 	exit 0

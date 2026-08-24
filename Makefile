@@ -245,7 +245,7 @@ app:
 		$(MAKE) -s -C "$(BUILDER)" build PLATFORM=$$p PROJECT="$$PWD" \
 			CMD='sh -c "cd app && make PLATFORM='$$p' NEXTUI=/opt/nextui-src"' || exit 1; \
 	done
-	@ls -la bin/*/netplay.elf | awk '{printf "   %-46s %s bytes\n", $$NF, $$5}'
+	@ls -la bin/*/netplay.elf bin/*/netplay-broker.elf | awk '{printf "   %-46s %s bytes\n", $$NF, $$5}'
 
 test:
 	@./shim/test/run.sh
@@ -254,6 +254,7 @@ test:
 	@./shim/test/romscan.sh
 	@./cores/tests/run.sh
 	@./launcher/test.sh
+	@PYTHONDONTWRITEBYTECODE=1 python3 tools/test-netplay-harness.py
 
 ###########################################################
 # Test build.
@@ -286,7 +287,7 @@ dist-base: $(BASE_DIST_CHECKS)
 
 	@cp pak.json "$(BASE_STAGE)/$(PAK)/"
 	@cp launcher/pak-launch.sh "$(BASE_STAGE)/$(PAK)/launch.sh"
-	@cp launcher/minarch.elf launcher/launch-stub.sh launcher/adhoc-join.sh launcher/wifi-watchdog.sh \
+	@cp launcher/minarch.elf launcher/launch-stub.sh launcher/adhoc-join.sh launcher/wifi-watchdog.sh launcher/session-cleanup.sh \
 	    launcher/install-stubs.sh launcher/wrap-pak.sh launcher/bind-mount.sh launcher/pre-launch.sh \
 	    launcher/mount-common.sh launcher/gameswitcher.sh launcher/gameswitcher-launch.sh \
 	    "$(BASE_STAGE)/$(PAK)/launcher/"
@@ -303,6 +304,7 @@ dist-base: $(BASE_DIST_CHECKS)
 		mkdir -p "$(BASE_STAGE)/$(PAK)/bin/$$p"; \
 		cp bin/$$p/netplay_shim.so "$(BASE_STAGE)/$(PAK)/bin/$$p/"; \
 		cp bin/$$p/netplay.elf "$(BASE_STAGE)/$(PAK)/bin/$$p/"; \
+		cp bin/$$p/netplay-broker.elf "$(BASE_STAGE)/$(PAK)/bin/$$p/"; \
 		done
 	@chmod 755 "$(BASE_STAGE)/$(PAK)/launch.sh" "$(BASE_STAGE)/$(PAK)/launcher"/*
 	@find "$(BASE_STAGE)" -name '.DS_Store' -delete
@@ -341,6 +343,8 @@ check-shim-%:
 check-app-%:
 	@test -f bin/$*/netplay.elf || { \
 		echo "missing bin/$*/netplay.elf - run 'make app' first"; exit 1; }
+	@test -f bin/$*/netplay-broker.elf || { \
+		echo "missing bin/$*/netplay-broker.elf - run 'make app' first"; exit 1; }
 
 clean:
 	rm -rf dist

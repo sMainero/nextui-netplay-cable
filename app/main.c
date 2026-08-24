@@ -26,11 +26,10 @@ typedef enum {
 	SCREEN_HOST_MENU,
 	SCREEN_TOOLS,
 	SCREEN_SETTINGS,
+	SCREEN_DEBUG,
 	SCREEN_INSTANCED,
 	SCREEN_CHECKS,
-	SCREEN_HOSTING,
 	SCREEN_JOINING,
-	SCREEN_ARMED,
 } Screen;
 
 static int quit = 0;
@@ -118,20 +117,25 @@ static int draw_line(SDL_Surface* screen_s, const char* text, int y, SDL_Color c
 
 static int draw_row(SDL_Surface* screen_s, const char* text, int y, bool selected) {
 	SDL_Color color = selected ? COLOR_BLACK : COLOR_WHITE;
-	if (selected) {
-		int w, h;
-		TTF_SizeUTF8(font.large, text, &w, &h);
-		SDL_Rect pill = {
-			SCALE1(PADDING), y - SCALE1(2),
-			w + SCALE1(BUTTON_PADDING * 2), h + SCALE1(4)
-		};
-		GFX_blitPill(ASSET_WHITE_PILL, screen_s, &pill);
-	}
 	SDL_Surface* t = TTF_RenderUTF8_Blended(font.large, text, color);
 	if (t) {
+		/* Pill caps are atlas assets with the platform's fixed PILL_SIZE.
+		 * Deriving their height from TTF metrics can request a source rectangle
+		 * larger than the asset; SDL then clips its right cap and bottom edge.
+		 * Use NextUI's standard row geometry and center the rendered glyphs. */
+		int row_h = SCALE1(PILL_SIZE);
+		int x = SCALE1(PADDING);
+		int text_x = x + SCALE1(BUTTON_PADDING);
+		int pill_w = t->w + SCALE1(BUTTON_PADDING * 2);
+		int max_w = screen_s->w - x - SCALE1(PADDING);
+		if (pill_w > max_w) pill_w = max_w;
+		if (selected) {
+			SDL_Rect pill = {x, y, pill_w, row_h};
+			GFX_blitPill(ASSET_WHITE_PILL, screen_s, &pill);
+		}
 		SDL_BlitSurface(t, NULL, screen_s,
-		                &(SDL_Rect){SCALE1(PADDING + BUTTON_PADDING), y, 0, 0});
-		y += t->h + SCALE1(6);
+		                &(SDL_Rect){text_x, y + (row_h - t->h) / 2, 0, 0});
+		y += row_h;
 		SDL_FreeSurface(t);
 	}
 	return y;
@@ -141,7 +145,7 @@ static int draw_row(SDL_Surface* screen_s, const char* text, int y, bool selecte
 // screens
 //////////////////////////////////////////////////////////////////////////////
 
-/* Three screens' worth of choices, not one long list.
+/* Several short screens' worth of choices, not one long list.
  *
  * The flat menu had grown to seven entries and pushed the WiFi status line off
  * the bottom, with no way to scroll to it - which is precisely the information
@@ -149,8 +153,9 @@ static int draw_row(SDL_Surface* screen_s, const char* text, int y, bool selecte
  * level short enough that the status line is always visible. */
 enum { MENU_HOST, MENU_JOIN, MENU_TOOLS, MENU_COUNT };
 enum { HOST_ADHOC, HOST_WIFI, HOST_COUNT };
-enum { TOOL_SETTINGS, TOOL_CHECKS, TOOL_FIXWIFI, TOOL_OFF, TOOL_COUNT };
-enum { SET_SHARE, SET_COMPAT, SET_FORCE_COMPAT, SET_VERBOSE_LOGS, SET_SIMPLE, SET_GAMESWITCHER, SET_INSTANCED, SET_COUNT };
+enum { TOOL_SETTINGS, TOOL_DEBUG, TOOL_FIXWIFI, TOOL_OFF, TOOL_COUNT };
+enum { SET_SIMPLE, SET_COMPAT, SET_INSTANCED, SET_GAMESWITCHER, SET_COUNT };
+enum { DEBUG_FORCE_COMPAT, DEBUG_VERBOSE_LOGS, DEBUG_CHECKS, DEBUG_COUNT };
 
 static const char* menu_label(int item) {
 	switch (item) {
@@ -178,9 +183,9 @@ static const char* host_label(int item) {
 static const char* tool_label(int item) {
 	switch (item) {
 	case TOOL_SETTINGS: return "Settings";
-	case TOOL_CHECKS:  return "Run checks";
+	case TOOL_DEBUG:    return "Debug";
 	case TOOL_FIXWIFI: return "Restore WiFi";
-	case TOOL_OFF:     return "Turn off (remove bindings)";
+	case TOOL_OFF:     return "Turn off Netplay (Remove Bindings)";
 	}
 	return "";
 }
@@ -190,40 +195,48 @@ static const char* tool_label(int item) {
  * boolean. Instanced cores is the exception: it has a third state that opens a
  * picker, shown as ">" so it reads as "there is more behind this". */
 static int settings_sel = 0;
+static int debug_sel = 0;
 static int inst_sel = 0;
 
 static void setting_row(char* out, int len, int item) {
 	NS_Settings* c = NS_settings();
 	switch (item) {
-	case SET_SHARE:
-		snprintf(out, len, "Share cores:  %s", c->share_cores ? "Yes" : "No");
+	case SET_SIMPLE:
+		snprintf(out, len, "Use simple client:  %s", c->simple_client ? "Yes" : "No");
 		break;
 	case SET_COMPAT:
 		snprintf(out, len, "Use compatibility cores:  %s", c->compatibility_cores ? "Yes" : "No");
 		break;
-	case SET_FORCE_COMPAT:
-		snprintf(out, len, "Force compatibility cores:  %s", c->force_compatibility ? "Yes" : "No");
-		break;
-	case SET_VERBOSE_LOGS:
-		snprintf(out, len, "Verbose debugging logs:  %s", c->verbose_logs ? "Yes" : "No");
-		break;
-	case SET_SIMPLE:
-		snprintf(out, len, "Simple client (planned):  %s", c->simple_client ? "Yes" : "No");
-		break;
-	case SET_GAMESWITCHER:
-		snprintf(out, len, "Add Netplay to Game Switcher:  %s", c->add_gameswitcher ? "Yes" : "No");
-		break;
 	case SET_INSTANCED:
 		switch (c->instanced) {
-		case NS_INST_OFF:      snprintf(out, len, "Instanced link:  No"); break;
-		case NS_INST_ALL:      snprintf(out, len, "Instanced link:  Yes (supported)"); break;
+		case NS_INST_OFF:      snprintf(out, len, "Use instanced cores:  No"); break;
+		case NS_INST_ALL:      snprintf(out, len, "Use instanced cores:  Yes (supported)"); break;
 		case NS_INST_SELECTED: {
 			int n = 0;
 			for (int i = 0; i < NS_INST_CORES; i++) if (c->inst_core[i]) n++;
-			snprintf(out, len, "Instanced link:  %d selected  >", n);
+			snprintf(out, len, "Use instanced cores:  %d selected  >", n);
 			break;
 		}
 		}
+		break;
+	case SET_GAMESWITCHER:
+		snprintf(out, len, "Add Netplay to GameSwitcher:  %s", c->add_gameswitcher ? "Yes" : "No");
+		break;
+	default: out[0] = '\0';
+	}
+}
+
+static void debug_row(char* out, int len, int item) {
+	NS_Settings* c = NS_settings();
+	switch (item) {
+	case DEBUG_FORCE_COMPAT:
+		snprintf(out, len, "Force compatibility cores:  %s", c->force_compatibility ? "Yes" : "No");
+		break;
+	case DEBUG_VERBOSE_LOGS:
+		snprintf(out, len, "Verbose debugging logs:  %s", c->verbose_logs ? "Yes" : "No");
+		break;
+	case DEBUG_CHECKS:
+		snprintf(out, len, "Run checks");
 		break;
 	default: out[0] = '\0';
 	}
@@ -315,15 +328,48 @@ static void render(SDL_Surface* s) {
 
 	switch (screen) {
 	case SCREEN_MENU: {
+		NS_SessionInfo session;
+		bool armed = NS_sessionInfo(&session);
 		draw_title(s, quick_mode
-		           ? (NS_isArmed() ? "Netplay Quick - armed" : "Netplay Quick")
-		           : (NS_isArmed() ? "Netplay - armed" : "Netplay"));
+		           ? (armed ? "Netplay Quick - armed" : "Netplay Quick")
+		           : (armed ? "Netplay - armed" : "Netplay"));
 		int y = SCALE1(PADDING + 44);
-		for (int i = 0; i < MENU_COUNT; i++)
-			y = draw_row(s, menu_label(i), y, i == menu_sel);
+		if (armed) {
+			char line[128];
+			const char* network = session.network[0] ? session.network
+			                    : wifi_up ? wifi_ssid : "WiFi";
+			if (session.role == NS_ROLE_HOST) {
+				snprintf(line, sizeof(line), "Hosting: %s", network);
+				y = draw_line(s, line, y, COLOR_WHITE, false);
+				y = draw_line(s, "Connected guests:", y + SCALE1(4), COLOR_GRAY, true);
+				if (session.guest_count == 0) {
+					y = draw_line(s, "  None yet", y, COLOR_GRAY, true);
+				} else {
+					for (int i = 0; i < session.guest_count; i++) {
+						snprintf(line, sizeof(line), "  %s%s%s",
+						         session.guest[i].ip[0] ? session.guest[i].ip : "associated",
+						         session.guest[i].id[0] ? "  " : "",
+						         session.guest[i].id);
+						y = draw_line(s, line, y, COLOR_WHITE, true);
+					}
+				}
+				if (!session.broker_running)
+					y = draw_line(s, "Host broker is not running.", y, COLOR_GRAY, true);
+			} else {
+				snprintf(line, sizeof(line), "Joined: %s", network);
+				y = draw_line(s, line, y, COLOR_WHITE, false);
+				snprintf(line, sizeof(line), "Connected to host: %s",
+				         session.host[0] ? session.host : "unknown");
+				y = draw_line(s, line, y + SCALE1(4), COLOR_GRAY, true);
+			}
+			y = draw_row(s, "Tools", y + SCALE1(8), true);
+		} else {
+			for (int i = 0; i < MENU_COUNT; i++)
+				y = draw_row(s, menu_label(i), y, i == menu_sel);
+		}
 		y = draw_wifi_line(s, y + SCALE1(8));
 		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
-		GFX_blitButtonGroup(NS_isArmed()
+		GFX_blitButtonGroup(armed
 		                    ? (char*[]){"B", "EXIT", "X", "END SESSION", "A", "SELECT", NULL}
 		                    : (char*[]){"B", "EXIT", "A", "SELECT", NULL}, 1, s, 1);
 		break;
@@ -362,14 +408,10 @@ static void render(SDL_Surface* s) {
 		y += SCALE1(6);
 		const char* hint = "";
 		switch (settings_sel) {
-		case SET_SHARE:
-			hint = "Frozen for now; no core files are transferred."; break;
-		case SET_COMPAT:
-			hint = "Use pak cores only when installed builds differ."; break;
-		case SET_FORCE_COMPAT:
-			hint = "Testing: use pak cores even when builds match."; break;
 		case SET_SIMPLE:
 			hint = "Planned: accept invitations for matching local games."; break;
+		case SET_COMPAT:
+			hint = "Use pak cores only when installed builds differ."; break;
 		case SET_GAMESWITCHER:
 			hint = "While armed, the switcher contains only Netplay."; break;
 		case SET_INSTANCED:
@@ -378,6 +420,29 @@ static void render(SDL_Surface* s) {
 		y = draw_line(s, hint, y, COLOR_GRAY, true);
 		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
 		GFX_blitButtonGroup((char*[]){"B", "BACK", "A", "CHANGE", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_DEBUG: {
+		draw_title(s, "Debug");
+		int y = SCALE1(PADDING + 44);
+		char row[128];
+		for (int i = 0; i < DEBUG_COUNT; i++) {
+			debug_row(row, sizeof(row), i);
+			y = draw_row(s, row, y, i == debug_sel);
+		}
+		y += SCALE1(6);
+		const char* hint = "";
+		switch (debug_sel) {
+		case DEBUG_FORCE_COMPAT:
+			hint = "Testing: use pak cores even when builds match."; break;
+		case DEBUG_VERBOSE_LOGS:
+			hint = "Retain a complete log for each game launch."; break;
+		case DEBUG_CHECKS:
+			hint = "Check bindings, paths, cores, and network support."; break;
+		}
+		y = draw_line(s, hint, y, COLOR_GRAY, true);
+		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
+		GFX_blitButtonGroup((char*[]){"B", "BACK", "A", "SELECT", NULL}, 1, s, 1);
 		break;
 	}
 	case SCREEN_INSTANCED: {
@@ -414,46 +479,13 @@ static void render(SDL_Surface* s) {
 		GFX_blitButtonGroup((char*[]){"B", "BACK", NULL}, 1, s, 1);
 		break;
 	}
-	case SCREEN_HOSTING: {
-		draw_title(s, "Hosting");
-		int y = SCALE1(PADDING + 44);
-		char line[128];
-		snprintf(line, sizeof(line), "This device: %s", local_ip);
-		y = draw_line(s, line, y, COLOR_WHITE, false);
-		y += SCALE1(6);
-		y = draw_line(s, "On the other device choose Join.", y, COLOR_GRAY, true);
-		if (hosting_hotspot) {
-			snprintf(line, sizeof(line), "Ad hoc network: %s  (%s)", hs_ssid, NS_ADHOC_PSK);
-			y = draw_line(s, line, y, COLOR_GRAY, true);
-
-			// Who has actually turned up. Without this the host cannot tell a
-			// client that joined from one that silently never did.
-			NS_Client clients[NS_MAX_CLIENTS];
-			int nc = NS_hotspotClients(clients, NS_MAX_CLIENTS);
-			if (nc == 0) {
-				y = draw_line(s, "No devices connected yet.", y, COLOR_GRAY, true);
-			} else {
-				for (int i = 0; i < nc; i++) {
-					snprintf(line, sizeof(line), "  %s  %s",
-					         clients[i].ip[0] ? clients[i].ip : "(no address yet)",
-					         clients[i].mac);
-					y = draw_line(s, line, y, COLOR_WHITE, true);
-				}
-			}
-			y = draw_line(s, "Then launch the same game on both.", y, COLOR_GRAY, true);
-		} else {
-			y = draw_line(s, "Then launch the same game on both.", y, COLOR_GRAY, true);
-		}
-		GFX_blitButtonGroup((char*[]){"B", "BACK", NULL}, 1, s, 1);
-		break;
-	}
 	case SCREEN_JOINING: {
 		draw_title(s, "Join");
 		int y = SCALE1(PADDING + 44);
 		if (join_total == 0) {
 			y = draw_line(s, "Looking for a host...", y, COLOR_WHITE, false);
 			y += SCALE1(4);
-			y = draw_line(s, "On WiFi: the host must be on its Hosting screen.", y, COLOR_GRAY, true);
+			y = draw_line(s, "On WiFi: the host session must still be armed.", y, COLOR_GRAY, true);
 			y = draw_line(s, "Ad hoc: press Y to scan again.", y, COLOR_GRAY, true);
 		} else {
 			for (int i = 0; i < join_total; i++) {
@@ -475,16 +507,6 @@ static void render(SDL_Surface* s) {
 		y = draw_wifi_line(s, y + SCALE1(8));
 		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
 		GFX_blitButtonGroup((char*[]){"B", "BACK", "Y", "RESCAN", "A", "SELECT", NULL}, 1, s, 1);
-		break;
-	}
-	case SCREEN_ARMED: {
-		draw_title(s, "Ready");
-		int y = SCALE1(PADDING + 44);
-		y = draw_line(s, status, y, COLOR_WHITE, false);
-		y += SCALE1(6);
-		y = draw_line(s, "Launch the same game on both devices.", y, COLOR_GRAY, true);
-		draw_line(s, "Re-open this app to turn netplay off.", y, COLOR_GRAY, true);
-		GFX_blitButtonGroup((char*[]){"B", "BACK", NULL}, 1, s, 1);
 		break;
 	}
 	}
@@ -543,12 +565,12 @@ static void do_arm(NS_Role role, const char* peer) {
 	// previously invisible - a session that quietly fell back to the house
 	// network looked identical to one on ad hoc until the game stuttered.
 	/* Settle the builds now, while the user is still choosing a game, rather
-	 * than in front of a launch. The host serves from its hosting tick; the
-	 * client drives the exchange here. */
+	 * than in front of a launch. The detached host broker serves the exchange;
+	 * the client drives it. */
 	if (role == NS_ROLE_HOST) {
-		if (!NS_compatServeStart()) {
+		if (!NS_brokerStart(err, sizeof(err))) {
 			abort_arm_attempt(true);
-			snprintf(status, sizeof(status), "Could not listen for core negotiation.");
+			snprintf(status, sizeof(status), "%s", err[0] ? err : "Could not start host broker.");
 			screen = SCREEN_MENU;
 			return;
 		}
@@ -585,7 +607,7 @@ static void do_arm(NS_Role role, const char* peer) {
 		snprintf(status, sizeof(status), "Joined %s  -  %s, delay %d%s",
 		         peer, adhoc ? "ad hoc" : "WiFi",
 		         adhoc ? NS_INPUT_DELAY_ADHOC : NS_INPUT_DELAY_WIFI, core_note);
-	screen = SCREEN_ARMED;
+	screen = SCREEN_MENU;
 }
 
 int main(int argc, char* argv[]) {
@@ -605,18 +627,33 @@ int main(int argc, char* argv[]) {
 	progress_surface = s;
 	NS_setProgressCallback(draw_progress);
 	WIFI_init();
+	bool cleaned_leftover = NS_cleanupStaleSession();
 
 	// A join that failed - or an AP that vanished after a successful one - used
 	// to leave the device associated to nothing, with no way back except the
 	// system WiFi menu. Check on every launch, before anything else.
 	if (NS_wifiRecoverIfStranded()) {
 		snprintf(status, sizeof(status), "Reconnected to WiFi after an ad hoc session.");
+	} else if (cleaned_leftover) {
+		snprintf(status, sizeof(status), "Cleaned up a session left by a previous boot.");
 	}
 	if (!NS_localIP(local_ip, sizeof(local_ip))) snprintf(local_ip, sizeof(local_ip), "no network");
 	wifi_poll(true);
-	if (NS_isArmed()) snprintf(status, sizeof(status), "A session is already set up.");
+	NS_SessionInfo startup_session;
+	if (NS_sessionInfo(&startup_session)) {
+		if (startup_session.role == NS_ROLE_HOST && !startup_session.broker_running) {
+			char broker_err[96] = "";
+			if (NS_brokerStart(broker_err, sizeof(broker_err)))
+				snprintf(status, sizeof(status), "Host broker restarted.");
+			else
+				snprintf(status, sizeof(status), "%s", broker_err);
+		} else {
+			snprintf(status, sizeof(status), "A session is already set up.");
+		}
+	}
 
 	int dirty = 1;
+	uint32_t session_checked_ms = 0;
 	while (!quit) {
 		PAD_poll();
 
@@ -626,6 +663,13 @@ int main(int argc, char* argv[]) {
 		snprintf(was_ssid, sizeof(was_ssid), "%s", wifi_ssid);
 		wifi_poll(false);
 		if (was_up != wifi_up || strcmp(was_ssid, wifi_ssid)) dirty = 1;
+		if (NS_isArmed()) {
+			uint32_t now = SDL_GetTicks();
+			if (!session_checked_ms || now - session_checked_ms >= 1000) {
+				session_checked_ms = now;
+				dirty = 1;
+			}
+		}
 
 		/* X ends the session from any screen. It is the thing most often
 		 * wanted and it used to be buried in the list. */
@@ -652,11 +696,18 @@ int main(int argc, char* argv[]) {
 
 		switch (screen) {
 		case SCREEN_MENU:
-			/* B from Hosting is navigation, not a lifecycle event. Keep the
-			 * host visible while this process remains in its menu. A future
-			 * broker will extend the same ownership beyond this app process. */
-			NS_announceTick();
-			NS_compatServeTick();   /* still serving while armed, wherever we are */
+			if (NS_isArmed()) {
+				/* Session status replaces Host/Join while armed. Tools is the only
+				 * selectable row; X remains the explicit lifecycle action. */
+				if (PAD_justPressed(BTN_B)) quit = 1;
+				if (PAD_justPressed(BTN_A)) {
+					status[0] = '\0';
+					sub_sel = 0;
+					screen = SCREEN_TOOLS;
+					dirty = 1;
+				}
+				break;
+			}
 			if (PAD_justPressed(BTN_UP))   { menu_sel = (menu_sel + MENU_COUNT - 1) % MENU_COUNT; dirty = 1; }
 			if (PAD_justPressed(BTN_DOWN)) { menu_sel = (menu_sel + 1) % MENU_COUNT; dirty = 1; }
 			if (PAD_justPressed(BTN_B))    quit = 1;
@@ -720,10 +771,7 @@ int main(int argc, char* argv[]) {
 					NS_announceHotspot(NULL, NULL);
 				}
 
-				NS_announceStart(NS_MODE_NETPLAY);
-				screen = SCREEN_HOSTING;
 				do_arm(NS_ROLE_HOST, NULL);
-				if (screen == SCREEN_ARMED) screen = SCREEN_HOSTING;
 				dirty = 1;
 			}
 			break;
@@ -741,9 +789,9 @@ int main(int argc, char* argv[]) {
 					screen = SCREEN_SETTINGS;
 					break;
 
-				case TOOL_CHECKS:
-					check_count = NS_runChecks(checks, 8, &check_worst);
-					screen = SCREEN_CHECKS;
+				case TOOL_DEBUG:
+					debug_sel = 0;
+					screen = SCREEN_DEBUG;
 					break;
 
 				case TOOL_FIXWIFI:
@@ -782,17 +830,11 @@ int main(int argc, char* argv[]) {
 			if (PAD_justPressed(BTN_A)) {
 				status[0] = '\0';
 				switch (settings_sel) {
-				case SET_SHARE:  c->share_cores = !c->share_cores; break;
+				case SET_SIMPLE: c->simple_client = !c->simple_client; break;
 				case SET_COMPAT:
 					c->compatibility_cores = !c->compatibility_cores;
 					if (!c->compatibility_cores) c->force_compatibility = false;
 					break;
-				case SET_FORCE_COMPAT:
-					c->force_compatibility = !c->force_compatibility;
-					if (c->force_compatibility) c->compatibility_cores = true;
-					break;
-				case SET_VERBOSE_LOGS: c->verbose_logs = !c->verbose_logs; break;
-				case SET_SIMPLE: c->simple_client = !c->simple_client; break;
 				case SET_GAMESWITCHER: c->add_gameswitcher = !c->add_gameswitcher; break;
 				case SET_INSTANCED:
 					/* Cycles No -> Yes (all) -> pick, and the third state opens
@@ -806,6 +848,33 @@ int main(int argc, char* argv[]) {
 					break;
 				}
 				NS_settingsSave();
+				dirty = 1;
+			}
+			break;
+		}
+
+		case SCREEN_DEBUG: {
+			NS_Settings* c = NS_settings();
+			if (PAD_justPressed(BTN_UP))   { debug_sel = (debug_sel + DEBUG_COUNT - 1) % DEBUG_COUNT; dirty = 1; }
+			if (PAD_justPressed(BTN_DOWN)) { debug_sel = (debug_sel + 1) % DEBUG_COUNT; dirty = 1; }
+			if (PAD_justPressed(BTN_B))    { screen = SCREEN_TOOLS; dirty = 1; }
+			if (PAD_justPressed(BTN_A)) {
+				status[0] = '\0';
+				switch (debug_sel) {
+				case DEBUG_FORCE_COMPAT:
+					c->force_compatibility = !c->force_compatibility;
+					if (c->force_compatibility) c->compatibility_cores = true;
+					NS_settingsSave();
+					break;
+				case DEBUG_VERBOSE_LOGS:
+					c->verbose_logs = !c->verbose_logs;
+					NS_settingsSave();
+					break;
+				case DEBUG_CHECKS:
+					check_count = NS_runChecks(checks, 8, &check_worst);
+					screen = SCREEN_CHECKS;
+					break;
+				}
 				dirty = 1;
 			}
 			break;
@@ -838,37 +907,10 @@ int main(int argc, char* argv[]) {
 			 * this one did not, which is exactly the asymmetry to watch for
 			 * when adding a screen. */
 			if (PAD_justPressed(BTN_B) || PAD_justPressed(BTN_A)) {
-				screen = SCREEN_TOOLS;
+				screen = SCREEN_DEBUG;
 				dirty = 1;
 			}
 			break;
-
-		case SCREEN_HOSTING: {
-			NS_announceTick();
-			/* Non-blocking accept, so this costs nothing until a client
-			 * actually connects to compare builds. */
-			NS_compatServeTick();
-
-			// The client list is read at render time, but this screen only
-			// redrew on a keypress - so a device that joined after the screen
-			// was drawn never appeared, and the host looked empty while a peer
-			// was in fact associated and passing traffic. Poll it.
-			static uint32_t hosting_drawn_ms;
-			uint32_t now_ms = SDL_GetTicks();
-			if (!hosting_drawn_ms || now_ms - hosting_drawn_ms > 1000) {
-				hosting_drawn_ms = now_ms;
-				dirty = 1;
-			}
-
-			// The AP is raised when Host is chosen, so there is no longer a
-			// keypress to start it - and the global X handler would shadow one
-			// here anyway, since this screen is only reached once armed.
-			if (PAD_justPressed(BTN_B)) {
-				screen = SCREEN_MENU;
-				dirty = 1;
-			}
-			break;
-		}
 
 		case SCREEN_JOINING: {
 			int n = NS_discoverTick(peers, NS_MAX_PEERS);
@@ -925,15 +967,6 @@ int main(int argc, char* argv[]) {
 			break;
 		}
 
-		case SCREEN_ARMED:
-			NS_announceTick(); /* harmless when not hosting */
-			/* Serve here too. This used to run only on the hosting screen, so a
-			 * host that had moved on - which is where arming leaves it, and
-			 * where it sits while choosing a game - silently stopped answering
-			 * core requests. Non-blocking and a no-op when not hosting. */
-			NS_compatServeTick();
-			if (PAD_justPressed(BTN_B) || PAD_justPressed(BTN_A)) { screen = SCREEN_MENU; dirty = 1; }
-			break;
 		}
 
 		PWR_update(&dirty, NULL, NULL, NULL);

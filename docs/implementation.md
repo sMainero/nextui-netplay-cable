@@ -408,10 +408,11 @@ the natural models.
 Two halves, because the negotiation has to be settled before a core is opened
 and the app cannot know which core a game will use until one is launched.
 
-**At arm time, in the app.** The host serves on port 55439 from its hosting
-tick - a non-blocking accept, so it costs nothing until a client connects. The
-client exchanges manifests once, immediately after arming, and stages whatever
-it needs into `cores/staged/`. The client drives, and can push as well as pull:
+**At arm time, through the broker.** The detached host broker serves on port
+55439 for the entire armed session - a non-blocking accept, so it costs nothing
+until a client connects. The client exchanges manifests once, immediately after
+arming, and stages whatever it needs into `cores/staged/`. The client drives,
+and can push as well as pull:
 if it cannot load the host's build but the host could load its own, it uploads
 instead of giving up. Every read and write carries a 30s deadline.
 
@@ -440,14 +441,10 @@ between a 32-bit and a 64-bit device.
 Two gaps between what these docs described and what the code did. Both are
 fixed; recorded because the shape recurs.
 
-**The host only served cores from the hosting screen.** `NS_coreServeTick()`
-was called from one screen's tick, but arming leaves the host on the *armed*
-screen, and it sits at the top level while choosing a game. So the design -
-"the host serves; the transfer happens while the user is still browsing" - held
-only for the few seconds a host happened to be looking at the hosting screen.
-The client's sync runs immediately after arming, which is why it worked in
-testing and would have failed the moment anything delayed it. Now ticked from
-the armed and top-level screens too.
+**The host only served cores while the setup app was alive.** Ticking from more
+UI screens fixed navigation but still made setup-process exit a silent service
+boundary. `netplay-broker.elf` now owns the listener and announcements until the
+session ends, independently of which screen or game is active.
 
 **The checks screen could not be left.** It had no input case at all: the render
 switch handled nine screens and the input switch eight, so it drew "B BACK"
@@ -560,8 +557,8 @@ The shape, and how each part differs from the original design:
   on `wlan0` and treated hosting as leaving the network.
 - **`#channels <= 1`**, so the AP must take whatever channel `wlan0` is already
   on, read at runtime. A hardcoded channel is rejected by the driver.
-- **Credentials are not advertised.** The SSID is `nextui-XXXX` with a code
-  shown on the hosting screen and a fixed passphrase; the client scans for the
+- **The SSID does not depend on announcements.** It is `nextui-XXXX`, shown on
+  the armed main screen, with a fixed passphrase; the client scans for the
   `nextui-` prefix and the user matches the code. Nothing is broadcast, and the
   bootstrap problem is gone - a host that has already moved can still be found,
   which an announcement-only scheme cannot do.

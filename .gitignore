@@ -18,5 +18,6 @@ cores/*
 wrapped/
 dist/
 logs/
+testing/results/*
 docs/evals
 .cache/

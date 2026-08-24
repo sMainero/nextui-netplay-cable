@@ -87,29 +87,39 @@ are merged into one Join list without losing the visible SSID.
 
 The implementation captures the original supplicant command before moving the
 guest radio, persists a recovery breadcrumb, restores original Wi-Fi on session
-end/failure, and runs a detached watchdog if the AP disappears. Remaining work
-includes reconstructing AP state after an app crash or relaunch. Static guest
-addressing may eventually remove the `udhcpd` dependency.
+end/failure, and runs a detached watchdog if the AP disappears. A reopened app
+and the broker reconstruct the active AP interface and SSID from durable session
+metadata and hostapd configuration. Static guest addressing may eventually
+remove the `udhcpd` dependency.
 
-### 5. Persistent hosting/session broker — Planned
+### 5. Persistent hosting/session broker — Partial
 
-Hosting should outlive the Hosting screen and setup-app process. A small
-detached broker, started when a host arms, should own:
+Hosting outlives the setup-app process. A small detached broker, started when a
+host arms, owns:
 
 - LAN announcements and ad-hoc session metadata;
 - compatibility negotiation;
-- game offers and replies;
 - peer admission, stable peer identity, capacity and `BUSY` replies;
-- broker status for Netplay.pak and a future NextUI/MinArch integration;
+- broker status for Netplay.pak;
 - clean shutdown when the session ends.
 
-The AP already survives the setup app and its beacon overhead already exists.
-A small UDP announcement and idle listener add negligible load; lifecycle,
-pairing/authentication, and stale-session cleanup are the real risks.
+The broker admits one compatibility peer for the current two-player transport,
+actively rejects a different address with `BUSY`, publishes its PID/network and
+guest table atomically, and is restarted by a reopened host UI if needed. The
+main menu reads durable session state: hosts see the network and connected
+guests, guests see the network and host, and Host/Join remain hidden until X
+ends the session.
 
-Pressing B on Hosting leaves the screen without ending the session. Hosting
-continues advertising where possible. Selecting Host for an already-hosting
-session re-enables advertising if necessary and displays connected peers.
+Sessions carry the kernel boot identity that created them. On a later boot the
+boot hook, game pre-launch path, or setup UI removes the leftover active-session
+record and its broker/Wi-Fi breadcrumbs while retaining the installed passthrough
+bindings. Guest count is never a staleness signal: an empty host remains a valid
+hot-seat lobby for as long as that boot and session continue. Older sessions
+without a boot identity are preserved rather than removed speculatively.
+
+Game offers/replies, authenticated pairing, authorization tied to gameplay
+sockets remain. A future NextUI/MinArch integration can consume the same status
+file rather than owning another network listener.
 
 ### 6. Compatibility cores — Implemented
 
@@ -144,7 +154,7 @@ the visible desync-risk warning rather than failing closed.
 
 ### 7. Executable core sharing — Frozen
 
-The **Share cores** setting remains visible and defaults to false, but all code
+The former **Share cores** setting is hidden and defaults to false, and all code
 that transfers or adopts executable core files is compiled out. Unauthenticated
 binary transfer is not an acceptable compatibility mechanism.
 

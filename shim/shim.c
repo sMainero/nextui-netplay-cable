@@ -86,16 +86,11 @@
 #define RECOVERY_TIMEOUT_MS 10000
 #define RECOVERY_FRAME_JUMP 512
 #define PEER_WAIT_TIMEOUT_MS 30000
-/* How long a link core may sit inside retro_run with an empty queue and a live
- * peer before the session says so. Deliberately generous and deliberately not a
- * new number: it is netlink's own TIMEOUT_MS, the point at which that layer
- * already considers a connection unresponsive.
- *
- * The trigger is "core blocked AND queue empty AND peer connected", never
- * "quiet". A Gen 3 trade legitimately goes silent while a player reads a menu
- * and a turn-based game can go silent for minutes; neither has the core blocked
- * on a byte. Tunable while the threshold is still a judgement call rather than
- * a measurement. */
+/* How long one call into a link core may take before the session identifies it
+ * as blocked. Queue silence is deliberately irrelevant: a Gen 3 trade can be
+ * quiet while a player reads a menu, and an empty receive queue says nothing
+ * about whether retro_run returned. Tunable while the threshold is still a
+ * judgement call rather than a measurement. */
 #define LINK_STARVE_TIMEOUT_MS 5000
 #define MAX_DESYNC_RECOVERIES 3
 #define DESYNC_WINDOW_MS 60000
@@ -888,6 +883,21 @@ static void adopt_peer_delay(uint32_t peer_delay, const char* who) {
 	shim_log("%s proposed input delay %u; adopting it over our %d\n",
 	         who, peer_delay, input_delay);
 	input_delay = (int)peer_delay;
+}
+
+/* The app's transport-specific value is a measured safety floor: ordinary
+ * Wi-Fi needs substantially more jitter tolerance than ad hoc. A few quiet
+ * startup probes can justify raising that floor, but cannot prove that the
+ * later link will never spike above it. */
+static void adopt_measured_delay(int proposed) {
+	if (proposed > input_delay) {
+		shim_log("measured link raises input delay to %d (was %d)\n",
+		         proposed, input_delay);
+		input_delay = proposed;
+	} else if (proposed > 0 && proposed < input_delay) {
+		shim_log("measured link suggests input delay %d; keeping transport floor %d\n",
+		         proposed, input_delay);
+	}
 }
 
 static const char* find_option_override(const char* key) {
@@ -2140,11 +2150,7 @@ static void netplay_handshake(void) {
 		if (!input_delay_pinned) {
 			int proposed = rtt_proposed_delay();
 			if (!proposed && elapsed_ms(&recovery_started) < RTT_SETTLE_MS) return;
-			if (proposed && proposed != input_delay) {
-				shim_log("measured link proposes input delay %d (was %d)\n",
-				         proposed, input_delay);
-				input_delay = proposed;
-			}
+			adopt_measured_delay(proposed);
 		}
 		NetLinkSessionIdentity mine;
 		memset(&mine, 0, sizeof(mine));
@@ -2567,8 +2573,6 @@ static void netplay_reportPacing(void) {
  * keep their own timing on this path - it is whether serial data is flowing
  * between frames or arriving frame-locked, which is exactly the before/after
  * signal for delivering packets mid-frame. */
-static int link_starved_reported;
-
 /* Tunable so the threshold can be chosen from the telemetry above rather than
  * from taste, and so a device test can force it without a rebuild. */
 static long link_starve_timeout_ms(void) {
@@ -3432,11 +3436,7 @@ static bool dual_bootstrap_tick(void) {
 		if (!input_delay_pinned) {
 			int proposed = rtt_proposed_delay();
 			if (!proposed && elapsed_ms(&dual_wait_since) < RTT_SETTLE_MS) return false;
-			if (proposed && proposed != input_delay) {
-				shim_log("measured link proposes input delay %d (was %d)\n",
-				         proposed, input_delay);
-				input_delay = proposed;
-			}
+			adopt_measured_delay(proposed);
 		}
 		NetLinkSessionIdentity mine;
 		memset(&mine, 0, sizeof(mine));
@@ -4037,22 +4037,6 @@ void retro_run(void) {
 		link_frames++;
 		link_report_pacing();
 
-		/* The core is blocked on serial data that is not coming. Nothing can be
-		 * injected from here - the shim moves opaque netpacket payloads and has
-		 * no idea what a valid idle word looks like for GameLink or RFU, and a
-		 * filler that collided with a real protocol value would corrupt a trade
-		 * silently. What it can do is stop the freeze being anonymous. */
-		if (!link_starved_reported) {
-			long starved = NetLink_starvedMs();
-			if (starved > link_starve_timeout_ms()) {
-				link_starved_reported = 1;
-				shim_log("link starved: core blocked %ldms with an empty queue "
-				         "and the peer connected\n", starved);
-				recovery_fail("Other player's game stopped sending link data.");
-			}
-		} else if (!NetLink_starvedMs()) {
-			link_starved_reported = 0;
-		}
 		if (recovery_failed) {
 			if (fe_input_poll) fe_input_poll();
 			failure_input_tick();
@@ -4087,9 +4071,19 @@ void retro_run(void) {
 	//
 	// Bracketed so a core that blocks in here waiting on its peer is not
 	// mistaken for a frontend that has gone away.
+	struct timeval link_run_started, link_run_finished;
+	gettimeofday(&link_run_started, NULL);
 	NetLink_setCoreRunning(true);
 	core.run();
 	NetLink_setCoreRunning(false);
+	gettimeofday(&link_run_finished, NULL);
+	uint32_t link_run_us = timeval_delta_us(&link_run_started, &link_run_finished);
+	if (NetLink_isConnected() &&
+	    link_run_us > (uint32_t)link_starve_timeout_ms() * 1000u) {
+		shim_log("link starved: one core call blocked %ums while the peer was connected\n",
+		         link_run_us / 1000u);
+		recovery_fail("Other player's game stopped sending link data.");
+	}
 }
 
 size_t retro_serialize_size(void) {

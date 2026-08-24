@@ -82,15 +82,6 @@ void NetLink_markFrame(void);
  * removes the very data the blocked core is waiting for - a deadlock. */
 void NetLink_setCoreRunning(bool running);
 
-/* How long the core has been running with nothing queued for it on a live
- * connection, in milliseconds; 0 when it is not starved.
- *
- * Deliberately not a pause signal. A core blocked inside retro_run is working,
- * and telling the peer otherwise would stop it sending the data being waited
- * for. This exists so an indefinite freeze can be named and bounded rather than
- * simply endured. */
-long NetLink_starvedMs(void);
-
 /* Round-trip time over the last few seconds, in microseconds; false until a
  * probe has completed. Measured continuously on the transport thread, so it
  * reflects the link rather than either side's frame loop.

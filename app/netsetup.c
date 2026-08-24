@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -553,6 +555,7 @@ int NS_coreManifest(NS_CoreInfo* out, int max) {
 //////////////////////////////////////////////////////////////////////////////
 
 #define CORE_MAGIC 0x4E504333u   /* 'NPC3': metadata-only compatibility protocol */
+#define CORE_BUSY  0x42555359u   /* 'BUSY': this session already admitted a peer */
 #define CORE_IO_MS   30000
 
 typedef struct __attribute__((packed)) {
@@ -568,6 +571,7 @@ typedef struct __attribute__((packed)) {
 } CoreWire;
 
 static int core_listen_fd = -1;
+static char core_last_peer[NS_IP_LEN];
 
 /* Bounded, so neither side can be parked forever by a peer that stops talking
  * mid-transfer - the failure that has bitten this codebase repeatedly. */
@@ -623,6 +627,7 @@ static int recv_manifest(int fd, NS_CoreInfo* out, int max,
                          bool* peer_instanced) {
 	uint32_t hdr[5];
 	if (!io_all(fd, hdr, sizeof(hdr), false)) return -1;
+	if (ntohl(hdr[0]) == CORE_BUSY) return -2;
 	if (ntohl(hdr[0]) != CORE_MAGIC) return -1;
 	int n = (int)ntohl(hdr[1]);
 	*peer_compat_enabled = ntohl(hdr[2]) != 0;
@@ -819,11 +824,25 @@ void NS_compatServeStop(void) {
 	if (core_listen_fd >= 0) { close(core_listen_fd); core_listen_fd = -1; }
 }
 
+const char* NS_compatLastPeer(void) { return core_last_peer; }
+
 void NS_compatServeTick(void) {
 	if (core_listen_fd < 0) return;
 
-	int fd = accept(core_listen_fd, NULL, NULL);
+	struct sockaddr_in peer;
+	socklen_t peer_len = sizeof(peer);
+	int fd = accept(core_listen_fd, (struct sockaddr*)&peer, &peer_len);
 	if (fd < 0) return;                       /* nothing waiting - normal */
+	char peer_ip[NS_IP_LEN] = "";
+	inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
+	if (core_last_peer[0] && strcmp(core_last_peer, peer_ip)) {
+		uint32_t busy[5] = { htonl(CORE_BUSY), 0, 0, 0, 0 };
+		io_all(fd, busy, sizeof(busy), true);
+		ns_log("core compatibility negotiation: %s rejected BUSY; admitted peer is %s\n",
+		       peer_ip, core_last_peer);
+		close(fd);
+		return;
+	}
 
 	NS_CoreInfo mine[NS_MAX_MANIFEST];
 	int n = NS_coreManifest(mine, NS_MAX_MANIFEST);
@@ -841,6 +860,7 @@ void NS_compatServeTick(void) {
 		close(fd);
 		return;
 	}
+	snprintf(core_last_peer, sizeof(core_last_peer), "%s", peer_ip);
 	int selected = select_compatibility(mine, n, theirs, tn,
 	                                    peer_compat_enabled, peer_force_compatibility,
 	                                    peer_instanced);
@@ -953,6 +973,11 @@ int NS_compatSync(const char* host_ip, char* err, int errlen) {
 	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST,
 	                       &peer_compat_enabled, &peer_force_compatibility,
 	                       &peer_instanced);
+	if (tn == -2) {
+		close(fd);
+		snprintf(err, errlen, "host is busy with another guest");
+		return -1;
+	}
 	if (tn < 0) {
 		close(fd);
 		snprintf(err, errlen, "manifest exchange failed");
@@ -1177,6 +1202,167 @@ bool NS_isArmed(void) {
 	return file_exists(p);
 }
 
+bool NS_cleanupStaleSession(void) {
+	char cmd[1024];
+	snprintf(cmd, sizeof(cmd),
+	         "SDCARD_PATH='%s' PLATFORM='%s' NETPLAY_PAK='%s' "
+	         "sh '%s/launcher/session-cleanup.sh' >/dev/null 2>&1",
+	         ns_sd, ns_platform, ns_pak, ns_pak);
+	int rc = system(cmd);
+	return rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 10;
+}
+
+static int broker_pid(void) {
+	char path[512];
+	snprintf(path, sizeof(path), "%s/state/broker.pid", ns_pak);
+	FILE* f = fopen(path, "r");
+	int pid = 0;
+	if (f) { if (fscanf(f, "%d", &pid) != 1) pid = 0; fclose(f); }
+	if (pid <= 1) return 0;
+
+	char proc[64];
+	snprintf(proc, sizeof(proc), "/proc/%d/cmdline", pid);
+	f = fopen(proc, "r");
+	if (!f) return 0;
+	char cmdline[256] = "";
+	size_t n = fread(cmdline, 1, sizeof(cmdline) - 1, f);
+	fclose(f);
+	cmdline[n] = '\0';
+	return strstr(cmdline, "netplay-broker.elf") ? pid : 0;
+}
+
+bool NS_sessionInfo(NS_SessionInfo* out) {
+	if (!out) return false;
+	memset(out, 0, sizeof(*out));
+
+	char path[512];
+	snprintf(path, sizeof(path), "%s/state/session", ns_pak);
+	FILE* f = fopen(path, "r");
+	if (!f) return false;
+	out->armed = true;
+	out->role = NS_ROLE_HOST;
+
+	char line[192];
+	while (fgets(line, sizeof(line), f)) {
+		char* nl = strpbrk(line, "\r\n");
+		if (nl) *nl = '\0';
+		char* value = strchr(line, '=');
+		if (!value) continue;
+		*value++ = '\0';
+		if (!strcmp(line, "role")) out->role = !strcmp(value, "client") ? NS_ROLE_CLIENT : NS_ROLE_HOST;
+		else if (!strcmp(line, "peer")) snprintf(out->host, sizeof(out->host), "%s", value);
+		else if (!strcmp(line, "adhoc_ssid")) snprintf(out->network, sizeof(out->network), "%s", value);
+		else if (!strcmp(line, "adhoc_psk")) snprintf(out->psk, sizeof(out->psk), "%s", value);
+	}
+	fclose(f);
+	if (out->role == NS_ROLE_HOST && !out->network[0] &&
+	    system("pidof hostapd >/dev/null 2>&1") == 0) {
+		/* Upgrade an already-running host created before host metadata was
+		 * written into state/session. */
+		f = fopen("/tmp/netplay_hostapd.conf", "r");
+		while (f && fgets(line, sizeof(line), f)) {
+			char value[NS_PSK_LEN];
+			if (sscanf(line, "ssid=%23s", value) == 1)
+				snprintf(out->network, sizeof(out->network), "%s", value);
+			else if (sscanf(line, "wpa_passphrase=%23s", value) == 1)
+				snprintf(out->psk, sizeof(out->psk), "%s", value);
+		}
+		if (f) fclose(f);
+	}
+
+	out->broker_running = broker_pid() != 0;
+	if (out->role != NS_ROLE_HOST || !out->broker_running) return true;
+
+	snprintf(path, sizeof(path), "%s/state/broker.status", ns_pak);
+	f = fopen(path, "r");
+	if (!f) return true;
+	while (fgets(line, sizeof(line), f)) {
+		char* nl = strpbrk(line, "\r\n");
+		if (nl) *nl = '\0';
+		int i;
+		if (sscanf(line, "guest_count=%d", &i) == 1) {
+			out->guest_count = i < 0 ? 0 : i > 4 ? 4 : i;
+			continue;
+		}
+		char* value = strchr(line, '=');
+		if (!value) continue;
+		*value++ = '\0';
+		if (sscanf(line, "guest_%d_id", &i) == 1 && i >= 0 && i < 4)
+			snprintf(out->guest[i].id, sizeof(out->guest[i].id), "%s", value);
+		else if (sscanf(line, "guest_%d_ip", &i) == 1 && i >= 0 && i < 4)
+			snprintf(out->guest[i].ip, sizeof(out->guest[i].ip), "%s", value);
+	}
+	fclose(f);
+	return true;
+}
+
+bool NS_brokerStart(char* err, int errlen) {
+	if (broker_pid()) return true;
+	char stale[512];
+	snprintf(stale, sizeof(stale), "%s/state/broker.pid", ns_pak); remove(stale);
+	snprintf(stale, sizeof(stale), "%s/state/broker.status", ns_pak); remove(stale);
+
+	char executable[512];
+	snprintf(executable, sizeof(executable), "%s/bin/%s/netplay-broker.elf", ns_pak, ns_platform);
+	if (access(executable, X_OK) != 0) {
+		snprintf(err, errlen, "persistent host broker is missing");
+		return false;
+	}
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		snprintf(err, errlen, "could not start host broker");
+		return false;
+	}
+	if (pid == 0) {
+		setsid();
+		char log_path[512];
+		snprintf(log_path, sizeof(log_path), "%s/state/broker.log", ns_pak);
+		int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+		int null_fd = open("/dev/null", O_RDONLY);
+		if (null_fd >= 0) { dup2(null_fd, STDIN_FILENO); close(null_fd); }
+		if (log_fd >= 0) {
+			dup2(log_fd, STDOUT_FILENO);
+			dup2(log_fd, STDERR_FILENO);
+			if (log_fd > STDERR_FILENO) close(log_fd);
+		}
+		long max_fd = sysconf(_SC_OPEN_MAX);
+		if (max_fd < 0 || max_fd > 4096) max_fd = 4096;
+		for (int fd = STDERR_FILENO + 1; fd < max_fd; fd++) close(fd);
+		setenv("SDCARD_PATH", ns_sd, 1);
+		setenv("PLATFORM", ns_platform, 1);
+		execl(executable, executable, (char*)NULL);
+		_exit(127);
+	}
+
+	for (int i = 0; i < 30; i++) {
+		usleep(100 * 1000);
+		snprintf(stale, sizeof(stale), "%s/state/broker.status", ns_pak);
+		if (broker_pid() && file_exists(stale)) return true;
+		if (kill(pid, 0) != 0 && errno == ESRCH) break;
+	}
+	waitpid(pid, NULL, WNOHANG);
+	snprintf(err, errlen, "host broker did not start");
+	return false;
+}
+
+void NS_brokerStop(void) {
+	int pid = broker_pid();
+	if (pid) {
+		kill(pid, SIGTERM);
+		for (int i = 0; i < 20 && kill(pid, 0) == 0; i++) {
+			int status;
+			if (waitpid(pid, &status, WNOHANG) == pid) break;
+			usleep(100 * 1000);
+		}
+		if (kill(pid, 0) == 0) kill(pid, SIGKILL);
+		waitpid(pid, NULL, WNOHANG);
+	}
+	char path[512];
+	snprintf(path, sizeof(path), "%s/state/broker.pid", ns_pak); remove(path);
+	snprintf(path, sizeof(path), "%s/state/broker.status", ns_pak); remove(path);
+}
+
 bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	char path[512];
 
@@ -1212,16 +1398,28 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	for (size_t i = 0; i < sizeof(nonce); i++) fprintf(f, i ? "%02x" : "session_id=%02x", nonce[i]);
 	fputc('\n', f);
 
+	/* App-process persistence is intentional; cross-boot persistence is not.
+	 * A boot identity lets the launcher discard an otherwise-valid session
+	 * after a crash/reboot without using guest presence as a liveness signal. */
+	FILE* boot = fopen("/proc/sys/kernel/random/boot_id", "r");
+	if (boot) {
+		char boot_id[80] = "";
+		if (fgets(boot_id, sizeof(boot_id), boot)) {
+			char* nl = strpbrk(boot_id, "\r\n");
+			if (nl) *nl = '\0';
+			if (boot_id[0]) fprintf(f, "boot_id=%s\n", boot_id);
+		}
+		fclose(boot);
+	}
+
 	/* Sized for the transport actually in use. Both sides reach the same answer
 	 * because a client only holds an ad hoc address when it joined this host's
 	 * network, and the host only serves one when it is hosting ad hoc.
 	 *
-	 * This is now the fallback rather than the verdict: the shim measures the
-	 * round trip during the handshake and both peers adopt the higher of their
-	 * two proposals, so a good ad hoc link can settle below this and a poor one
-	 * above it. The number still matters - it is what a link that never answers
-	 * a probe uses, and it is picked from the transport actually in use, which
-	 * is more than the shim can know on its own. */
+	 * This is a safety floor, not merely a startup guess. The shim can raise it
+	 * when measured RTT requires more room, but a couple of quiet handshake
+	 * probes cannot lower it: later jitter is what the window must survive. The
+	 * transport selection is information the shim cannot infer on its own. */
 	bool adhoc = hotspot_running || joined_hotspot;
 	fprintf(f, "input_delay=%d\n", adhoc ? NS_INPUT_DELAY_ADHOC : NS_INPUT_DELAY_WIFI);
 	fprintf(f, "input_delay_auto=1\n");
@@ -1239,7 +1437,9 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	/* Record the ad hoc network so the launch stub can put us back on it. The
 	 * join done here does not survive the app exiting - the platform brings its
 	 * own WiFi back up before the game ever starts. */
-	if (joined_hotspot && joined_ssid[0]) {
+	if (role == NS_ROLE_HOST && announce_ssid[0]) {
+		fprintf(f, "adhoc_ssid=%s\nadhoc_psk=%s\n", announce_ssid, announce_psk);
+	} else if (joined_hotspot && joined_ssid[0]) {
 		fprintf(f, "adhoc_ssid=%s\nadhoc_psk=%s\n", joined_ssid, joined_psk);
 	}
 
@@ -1326,6 +1526,7 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 
 void NS_disarm(void) {
 	char cmd[1200];
+	NS_brokerStop();
 	NS_announceStop();
 	NS_compatServeStop();
 	/* Takes both routes down - mounts, the boot hook, and any legacy stubs -
@@ -1358,6 +1559,7 @@ void NS_disarm(void) {
  * instead of a full reinstall across every Emus pak. */
 void NS_endSession(void) {
 	char cmd[1200];
+	NS_brokerStop();
 	NS_announceStop();
 	NS_compatServeStop();
 	snprintf(cmd, sizeof(cmd), "rm -f '%s/state/session'", ns_pak);
@@ -2011,6 +2213,23 @@ static bool hotspot_processes_alive(void) {
 	    || system("pidof udhcpd  >/dev/null 2>&1") == 0;
 }
 
+static bool active_hotspot_interface(char* out, int len) {
+	out[0] = '\0';
+	if (ns_ap_if[0]) {
+		snprintf(out, len, "%s", ns_ap_if);
+		return true;
+	}
+	if (!hotspot_processes_alive()) return false;
+
+	FILE* conf = fopen("/tmp/netplay_hostapd.conf", "r");
+	char line[128];
+	while (conf && fgets(line, sizeof(line), conf)) {
+		if (sscanf(line, "interface=%63s", out) == 1) break;
+	}
+	if (conf) fclose(conf);
+	return out[0] != '\0';
+}
+
 bool NS_hotspotStart(const char* ssid, const char* psk, char* err, int errlen) {
 	/* Already serving this network? Leave it alone.
 	 *
@@ -2287,6 +2506,12 @@ bool NS_hotspotJoin(const char* ssid, const char* psk, char* err, int errlen) {
 void NS_hotspotStop(void) {
 	announce_ssid[0] = '\0';
 	announce_psk[0]  = '\0';
+	/* Recover the AP interface before stopping its owner. A reopened app has no
+	 * process-local ns_ap_if, but still must return the interface to managed
+	 * mode when ending a broker-owned session. */
+	char recovered_ap_if[64];
+	if (!ns_ap_if[0] && active_hotspot_interface(recovered_ap_if, sizeof(recovered_ap_if)))
+		snprintf(ns_ap_if, sizeof(ns_ap_if), "%s", recovered_ap_if);
 
 	/* Host and client undo different things, and doing the wrong one is how
 	 * Turn off used to take a device off WiFi with no way back. */
@@ -2384,12 +2609,19 @@ void NS_wifiRestore(void) {
  * still have no address - so this reports the address where one is known and
  * says so plainly when it is not, rather than implying a working peer. */
 int NS_hotspotClients(NS_Client* out, int max) {
-	if (!hotspot_running || !ns_ap_if[0] || !out || max <= 0) return 0;
+	if (!out || max <= 0) return 0;
+
+	/* A broker or newly opened setup app has no process-local hotspot flags.
+	 * Reconstruct the interface from the config owned by the still-live hostapd
+	 * instead of making every post-launch guest table look empty. */
+	char apif[64] = "";
+	active_hotspot_interface(apif, sizeof(apif));
+	if (!apif[0]) return 0;
 
 	char cmd[256];
 	snprintf(cmd, sizeof(cmd),
 	         "iw dev %s station dump 2>/dev/null | sed -n 's/^Station \\([0-9a-f:]*\\).*/\\1/p'",
-	         ns_ap_if);
+	         apif);
 	FILE* p = popen(cmd, "r");
 	if (!p) return 0;
 
@@ -2408,7 +2640,7 @@ int NS_hotspotClients(NS_Client* out, int max) {
 		char look[256];
 		snprintf(look, sizeof(look),
 		         "awk 'tolower($4)==\"%s\" && $6==\"%s\" {print $1; exit}' /proc/net/arp 2>/dev/null",
-		         mac, ns_ap_if);
+		         mac, apif);
 		FILE* a = popen(look, "r");
 		if (a) {
 			if (fgets(out[n].ip, sizeof(out[n].ip), a)) {

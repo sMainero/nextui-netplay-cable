@@ -23,10 +23,53 @@ check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; 
 # --- fake SD card ---------------------------------------------------------
 mkdir -p "$USERDATA_PATH" "$SYSTEM_PATH/bin" "$SYSTEM_PATH/cores" "$NP/launcher" "$NP/bin/$PLATFORM" "$NP/state"
 cp "$HERE/launch-stub.sh" "$HERE/install-stubs.sh" "$HERE/minarch.elf" "$HERE/wrap-pak.sh" \
-   "$HERE/bind-mount.sh" "$HERE/mount-common.sh" "$HERE/pre-launch.sh" \
-   "$HERE/gameswitcher.sh" "$HERE/gameswitcher-launch.sh" "$NP/launcher/"
+	   "$HERE/bind-mount.sh" "$HERE/mount-common.sh" "$HERE/pre-launch.sh" \
+	   "$HERE/adhoc-join.sh" "$HERE/session-cleanup.sh" \
+	   "$HERE/gameswitcher.sh" "$HERE/gameswitcher-launch.sh" "$NP/launcher/"
 chmod 755 "$NP/launcher"/*
 : > "$NP/bin/$PLATFORM/netplay_shim.so"
+
+echo "== ad-hoc launch role routing"
+mkdir -p "$ROOT/fake-bin"
+cat > "$ROOT/fake-bin/iw" <<EOF
+#!/bin/sh
+touch "$ROOT/host-ran-client-rejoin"
+exit 1
+EOF
+chmod 755 "$ROOT/fake-bin/iw"
+printf 'role=host\nadhoc_ssid=nextui-TEST\nadhoc_psk=playwithme\n' > "$NP/state/session"
+PATH="$ROOT/fake-bin:$PATH" "$NP/launcher/adhoc-join.sh" "$NP/state/session"
+[ ! -e "$ROOT/host-ran-client-rejoin" ] \
+	&& ok "host treats ad-hoc credentials as broker metadata" \
+	|| bad "host ran the client ad-hoc rejoin path"
+rm -f "$NP/state/session"
+
+echo
+echo "== leftover session cleanup"
+printf 'boot-now\n' > "$ROOT/boot-id"
+printf 'role=host\nboot_id=boot-now\n' > "$NP/state/session"
+printf 'guest_count=0\n' > "$NP/state/broker.status"
+NETPLAY_BOOT_ID_PATH="$ROOT/boot-id" "$NP/launcher/session-cleanup.sh" || rc=$?
+[ -f "$NP/state/session" ] \
+	&& ok "empty host remains armed during the same boot" \
+	|| bad "empty host was mistaken for a stale session"
+
+printf 'role=host\nboot_id=boot-before\n' > "$NP/state/session"
+printf '123\n' > "$NP/state/broker.pid"
+printf 'guest_count=0\n' > "$NP/state/broker.status"
+rc=0
+NETPLAY_BOOT_ID_PATH="$ROOT/boot-id" "$NP/launcher/session-cleanup.sh" || rc=$?
+[ "$rc" = 10 ] && [ ! -e "$NP/state/session" ] \
+	&& [ ! -e "$NP/state/broker.pid" ] && [ ! -e "$NP/state/broker.status" ] \
+	&& ok "previous-boot host session and broker artifacts removed" \
+	|| bad "previous-boot host session survived cleanup"
+
+printf 'role=host\n' > "$NP/state/session"
+NETPLAY_BOOT_ID_PATH="$ROOT/boot-id" "$NP/launcher/session-cleanup.sh" || rc=$?
+[ -f "$NP/state/session" ] \
+	&& ok "legacy session without boot identity is preserved" \
+	|| bad "legacy session was removed without proof it was stale"
+rm -f "$NP/state/session"
 
 # A stand-in minarch that just reports the arguments and env it was handed.
 cat > "$SYSTEM_PATH/bin/minarch.elf" <<'EOF'
