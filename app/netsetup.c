@@ -255,6 +255,7 @@ void NS_wifiPowerSaveRestore(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 const char* const NS_INST_CORE[NS_INST_CORES] = { "gambatte", "gpsp", "mgba" };
+const bool NS_INST_IMPLEMENTED[NS_INST_CORES] = { true, false, true };
 
 /* Executable sharing is frozen and therefore defaults off. Compatibility cores
  * are local, pinned artifacts and are the safe default fallback. */
@@ -597,13 +598,16 @@ static bool io_all(int fd, void* buf, size_t len, bool writing) {
 	return true;
 }
 
-static bool instanced_gambatte_available(void);
+#define INST_CAP_GAMBATTE (1u << 0)
+#define INST_CAP_MGBA     (1u << 1)
+
+static uint32_t instanced_available_mask(void);
 
 static bool send_manifest(int fd, NS_CoreInfo* m, int n) {
 	uint32_t hdr[5] = { htonl(CORE_MAGIC), htonl((uint32_t)n),
 	                    htonl(NS_settings()->compatibility_cores ? 1u : 0u),
 	                    htonl(NS_settings()->force_compatibility ? 1u : 0u),
-	                    htonl(instanced_gambatte_available() ? 1u : 0u) };
+	                    htonl(instanced_available_mask()) };
 	if (!io_all(fd, hdr, sizeof(hdr), true)) return false;
 	for (int i = 0; i < n; i++) {
 		CoreWire w;
@@ -624,7 +628,7 @@ static bool send_manifest(int fd, NS_CoreInfo* m, int n) {
 
 static int recv_manifest(int fd, NS_CoreInfo* out, int max,
                          bool* peer_compat_enabled, bool* peer_force_compatibility,
-                         bool* peer_instanced) {
+                         uint32_t* peer_instanced) {
 	uint32_t hdr[5];
 	if (!io_all(fd, hdr, sizeof(hdr), false)) return -1;
 	if (ntohl(hdr[0]) == CORE_BUSY) return -2;
@@ -632,7 +636,7 @@ static int recv_manifest(int fd, NS_CoreInfo* out, int max,
 	int n = (int)ntohl(hdr[1]);
 	*peer_compat_enabled = ntohl(hdr[2]) != 0;
 	*peer_force_compatibility = ntohl(hdr[3]) != 0;
-	*peer_instanced = ntohl(hdr[4]) != 0;
+	*peer_instanced = ntohl(hdr[4]);
 	if (n < 0 || n > NS_MAX_MANIFEST) return -1;
 
 	int kept = 0;
@@ -688,7 +692,7 @@ static bool compatibility_builds_match(const NS_CoreInfo* a, const NS_CoreInfo* 
 static bool write_compat_file(const char* path,
                               const char selected[][32], int count,
                               const char mismatched[][32], int mismatch_count,
-                              bool instanced_gambatte) {
+                              uint32_t instanced_mask) {
 	char tmp[560];
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	FILE* in = fopen(path, "r");
@@ -700,7 +704,8 @@ static bool write_compat_file(const char* path,
 	while (fgets(line, sizeof(line), in))
 		if (strncmp(line, "compat_core.", 12) &&
 		    strncmp(line, "core_mismatch.", 14) &&
-		    strncmp(line, "instanced_gambatte=", 19)) fputs(line, out);
+		    strncmp(line, "instanced_gambatte=", 19) &&
+		    strncmp(line, "instanced_mgba=", 15)) fputs(line, out);
 	for (int i = 0; i < count; i++) fprintf(out, "compat_core.%s=1\n", selected[i]);
 	for (int i = 0; i < mismatch_count; i++)
 		fprintf(out, "core_mismatch.%s=1\n", mismatched[i]);
@@ -708,7 +713,8 @@ static bool write_compat_file(const char* path,
 	 * agreement. Instanced play cannot be one-sided - a device running the
 	 * paired core against a peer running the ordinary network-serial core has
 	 * nothing to talk to - and both session files are rewritten here. */
-	fprintf(out, "instanced_gambatte=%d\n", instanced_gambatte ? 1 : 0);
+	fprintf(out, "instanced_gambatte=%d\n", (instanced_mask & INST_CAP_GAMBATTE) ? 1 : 0);
+	fprintf(out, "instanced_mgba=%d\n", (instanced_mask & INST_CAP_MGBA) ? 1 : 0);
 
 	fclose(in);
 	if (fclose(out) != 0 || rename(tmp, path) != 0) {
@@ -718,19 +724,26 @@ static bool write_compat_file(const char* path,
 	return true;
 }
 
-/* Whether this device can even offer instanced play: the setting is on for
- * Gambatte and the paired artifact is actually staged here. Both halves have to
- * hold on both devices, so this is exchanged with the manifest and ANDed. */
-static bool instanced_gambatte_available(void) {
+/* Offer only paired cores that are selected and actually installed. The masks
+ * are intersected during negotiation so neither peer can enter a one-sided
+ * dual-core session. */
+static uint32_t instanced_available_mask(void) {
 	char path[512];
+	uint32_t mask = 0;
 	snprintf(path, sizeof(path), "%s/cores/override/%s/gambatte_dual_libretro.so",
 	         ns_pak, ns_platform);
-	return instanced_core_enabled("gambatte") && file_exists(path);
+	if (instanced_core_enabled("gambatte") && file_exists(path))
+		mask |= INST_CAP_GAMBATTE;
+	snprintf(path, sizeof(path), "%s/Emus/%s/MGBA.pak/mgba_dual_libretro.so",
+	         ns_sd, ns_platform);
+	if (instanced_core_enabled("mgba") && file_exists(path))
+		mask |= INST_CAP_MGBA;
+	return mask;
 }
 
 static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, int tn,
 								bool peer_enabled, bool peer_force,
-								bool peer_instanced) {
+								uint32_t peer_instanced) {
 	char selected[NS_MAX_MANIFEST][32];
 	char mismatched[NS_MAX_MANIFEST][32];
 	int count = 0;
@@ -767,10 +780,12 @@ static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, 
 			       MANIFEST_CORES[i]);
 		}
 	}
-	bool instanced = instanced_gambatte_available() && peer_instanced;
-	ns_log("instanced gambatte: here=%d peer=%d -> %s\n",
-	       instanced_gambatte_available() ? 1 : 0, peer_instanced ? 1 : 0,
-	       instanced ? "enabled" : "network serial");
+	uint32_t local_instanced = instanced_available_mask();
+	uint32_t instanced = local_instanced & peer_instanced;
+	ns_log("paired cores: here=0x%x peer=0x%x agreed=0x%x (gambatte=%d mgba=%d)\n",
+	       local_instanced, peer_instanced, instanced,
+	       (instanced & INST_CAP_GAMBATTE) ? 1 : 0,
+	       (instanced & INST_CAP_MGBA) ? 1 : 0);
 
 	char path[512];
 	snprintf(path, sizeof(path), "%s/session.conf", ns_pak);
@@ -850,7 +865,7 @@ void NS_compatServeTick(void) {
 	NS_CoreInfo theirs[NS_MAX_MANIFEST];
 	bool peer_compat_enabled = false;
 	bool peer_force_compatibility = false;
-	bool peer_instanced = false;
+	uint32_t peer_instanced = 0;
 	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST,
 	                       &peer_compat_enabled, &peer_force_compatibility,
 	                       &peer_instanced);
@@ -964,7 +979,7 @@ int NS_compatSync(const char* host_ip, char* err, int errlen) {
 	NS_CoreInfo theirs[NS_MAX_MANIFEST];
 	bool peer_compat_enabled = false;
 	bool peer_force_compatibility = false;
-	bool peer_instanced = false;
+	uint32_t peer_instanced = 0;
 	if (!send_manifest(fd, mine, n)) {
 		close(fd);
 		snprintf(err, errlen, "manifest exchange failed");
@@ -1429,10 +1444,10 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	fprintf(f, "compatibility_cores=%d\n", NS_settings()->compatibility_cores ? 1 : 0);
 	fprintf(f, "force_compatibility=%d\n", NS_settings()->force_compatibility ? 1 : 0);
 	fprintf(f, "verbose_logs=%d\n", NS_settings()->verbose_logs ? 1 : 0);
-	/* Gambatte is the first implemented instanced core. The other choices stay
-	 * persisted so their UI/API do not need another format change when their
-	 * local-link hosts are ready. Unknown session keys are deliberately safe. */
+	/* These are local wishes until manifest negotiation intersects them with the
+	 * paired artifacts and selections available on the other device. */
 	fprintf(f, "instanced_gambatte=%d\n", instanced_core_enabled("gambatte") ? 1 : 0);
+	fprintf(f, "instanced_mgba=%d\n", instanced_core_enabled("mgba") ? 1 : 0);
 
 	/* Record the ad hoc network so the launch stub can put us back on it. The
 	 * join done here does not survive the app exiting - the platform brings its

@@ -121,6 +121,11 @@ Game offers/replies, authenticated pairing, authorization tied to gameplay
 sockets remain. A future NextUI/MinArch integration can consume the same status
 file rather than owning another network listener.
 
+The setup UI returns the CPU to NextUI's platform Auto profile instead of
+remaining at the blanket performance setting used to launch paks. Gameplay is
+separate: the shim still pins performance for the lifetime of an armed emulator
+process and restores the previous policy at teardown.
+
 ### 6. Compatibility cores — Implemented
 
 The locally installed core remains the first choice. During arming, devices
@@ -152,18 +157,9 @@ ownership, and broader cross-platform determinism testing—especially
 pcsx_rearmed. Unresolved installed-build differences deliberately launch with
 the visible desync-risk warning rather than failing closed.
 
-### 7. Executable core sharing — Frozen
-
-The former **Share cores** setting is hidden and defaults to false, and all code
-that transfers or adopts executable core files is compiled out. Unauthenticated
-binary transfer is not an acceptable compatibility mechanism.
-
-Reconsider only with an authenticated, signed manifest and a clear trust/update
-model. Packaged compatibility cores are the supported replacement.
-
 ## Game selection and lightweight guest UX
 
-### 8. Open-game invitation — Planned
+### 7. Open-game invitation — Planned
 
 Either paired device can choose a shared-screen game and offer it to the other:
 
@@ -189,7 +185,7 @@ The Netplay.pak UI can present an offer itself. Receiving/offering from the
 NextUI menu requires a narrow frontend IPC/modal and local-launch hook; the
 current `queueNext()` mechanism is internal to NextUI.
 
-### 9. Simple client — Needs decision
+### 8. Simple client — Needs decision
 
 The existing setting and UI copy describe an appliance-like guest that stays in
 Netplay.pak while the other device chooses a game. That UX is compatible with
@@ -202,7 +198,7 @@ storage, and arbitrary-code-execution implications. It is not part of the
 current plan. Unless explicitly redesigned, **Simple client means simplified
 local matching/launch, not ROM or executable transfer**.
 
-### 10. Interactive netplay status and controls — Partial
+### 9. Interactive netplay status and controls — Partial
 
 Shim-owned Starting/Waiting/Recovery overlays already poll standard RetroPad
 input. The shared-screen failure overlay now provides explicit wait/retry,
@@ -216,7 +212,7 @@ button-test process or read `/dev/input` behind the frontend's back.
 
 ## Controller topology
 
-### 11. Swappable controller ports — Planned
+### 10. Swappable controller ports — Planned
 
 Negotiate a stable emulated controller slot independently of network role. A
 two-device session may map the guest to port 1, 2, 3, etc., and may transfer or
@@ -229,7 +225,7 @@ input cannot control two ports or disappear for different frames on each peer.
 This is the prerequisite for multi-controller sessions and is much smaller than
 multi-peer transport.
 
-### 12. Three or more simultaneous players — Planned, substantial refactor
+### 11. Three or more simultaneous players — Planned, substantial refactor
 
 Shared-screen play becomes a host-hub topology:
 
@@ -251,7 +247,7 @@ two-player. GBA RFU can potentially support more, but NetLink must first retain
 and route libretro client IDs/broadcasts instead of collapsing everything to one
 peer.
 
-### 13. Hotseat/drop-in sessions — Planned
+### 12. Hotseat/drop-in sessions — Planned
 
 “Hotseat” here means controller occupancy may be left and rejoined without
 ending the host's game—not traditional pass-the-handheld play. It builds on the
@@ -265,7 +261,7 @@ barrier. The host remains authoritative; this is not host migration.
 
 ## Local multi-instance mode
 
-### 14. Instanced cores — Partial; Gambatte implemented
+### 13. Instanced cores — Partial; Gambatte implemented
 
 For Gambatte, each handheld runs a paired core (`gambatte_dual_libretro.so`)
 holding both logical consoles and the cable between them. One core call per
@@ -298,7 +294,7 @@ planned and cannot currently be enabled.
 
 ## Saves, reset, and authority
 
-### 15. Shared-screen save policy — Implemented
+### 14. Shared-screen save policy — Implemented
 
 - Frontend save/load/autosave/auto-resume are unavailable during the session.
 - Host SRAM/RTC is authoritative and remains persistent through the frontend.
@@ -310,7 +306,7 @@ planned and cannot currently be enabled.
 Link-mode games keep independent local saves because they are independent
 consoles.
 
-### 16. Reset policy — Implemented
+### 15. Reset policy — Implemented
 
 In shared-screen mode, a host reset becomes an explicit authoritative recovery
 transaction at a frame barrier: the host resets, sends its post-reset state,
@@ -318,7 +314,7 @@ and both peers remain paused until the guest adopts it and the host commits the
 new timeline. A guest reset request is rejected with a clear message. In link
 mode and solo play, reset affects only the local console.
 
-### 17. PSX guest memory card slot 2 — Needs decision
+### 16. PSX guest memory card slot 2 — Needs decision
 
 Current safety policy forces PCSX-ReARMed card 1 to libretro management and
 disables card 2 for the session, preventing core-managed files from bypassing
@@ -338,13 +334,13 @@ cached card state internally. Until then, card 2 remains disabled.
 
 ## Platform and release quality
 
-### 18. Five-platform builds — Implemented
+### 17. Five-platform builds — Implemented
 
 The app and shim target my282, my355, h700, tg5040 and tg5050 through the pinned
 build-platform environments. Dedicated cores are per platform; compatibility
 cores are shared at the ARMv7/AArch64 architecture level where verified.
 
-### 19. Compatibility/determinism qualification — In progress
+### 18. Compatibility/determinism qualification — In progress
 
 Every supported core/platform pairing needs an explicit result for load,
 initial sync, five-second agreement, authoritative resync, host/guest crash

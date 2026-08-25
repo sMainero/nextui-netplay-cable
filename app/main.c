@@ -455,7 +455,7 @@ static void render(SDL_Surface* s) {
 			snprintf(row, sizeof(row), "[%s] %s%s%s",
 			         c->inst_core[i] ? "x" : " ", NS_INST_CORE[i],
 			         have ? "" : "  (not installed)",
-			         i == 0 ? "" : "  (planned)");
+			         NS_INST_IMPLEMENTED[i] ? "" : "  (planned)");
 			y = draw_row(s, row, y, i == inst_sel);
 		}
 		y += SCALE1(6);
@@ -618,6 +618,11 @@ int main(int argc, char* argv[]) {
 	SDL_Surface* s = GFX_init(MODE_MAIN);
 	PAD_init();
 	PWR_init();
+	/* NextUI launches every pak at the performance ceiling. This setup UI and
+	 * its detached broker are low-duty control-plane work; use the platform's
+	 * normal menu profile instead (schedutil on tg5040, conservative on A30).
+	 * The game shim still pins performance only while an armed game runs. */
+	PWR_setCPUSpeed(CPU_SPEED_MENU);
 	InitSettings();
 
 	signal(SIGINT, on_signal);
@@ -886,7 +891,7 @@ int main(int argc, char* argv[]) {
 			if (PAD_justPressed(BTN_DOWN)) { inst_sel = (inst_sel + 1) % NS_INST_CORES; dirty = 1; }
 			if (PAD_justPressed(BTN_B))    { screen = SCREEN_SETTINGS; dirty = 1; }
 			if (PAD_justPressed(BTN_A)) {
-				if (inst_sel != 0) {
+				if (!NS_INST_IMPLEMENTED[inst_sel]) {
 					snprintf(status, sizeof(status), "%s instancing is not implemented yet.",
 					         NS_INST_CORE[inst_sel]);
 				} else if (NS_coreInstalled(NS_INST_CORE[inst_sel])) {

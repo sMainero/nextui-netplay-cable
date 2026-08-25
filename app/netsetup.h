@@ -137,6 +137,7 @@ void NS_brokerStop(void);
  * hence a fixed, short compatibility list rather than "any core". */
 #define NS_INST_CORES 3
 extern const char* const NS_INST_CORE[NS_INST_CORES];   /* gambatte, gpsp, mgba */
+extern const bool NS_INST_IMPLEMENTED[NS_INST_CORES];   /* yes, no, yes */
 
 typedef enum {
 	NS_INST_OFF = 0,     /* never */
