@@ -687,7 +687,7 @@ static int contains_ci(const char* hay, const char* needle) {
 // cores/override/<platform>/, and the name the core reports is the thing that
 // actually identifies it.
 static int core_wants_link(void) {
-	static const char* LINK_CORES[] = { "gambatte", "gpsp" };
+	static const char* LINK_CORES[] = { "gambatte", "gpsp", "mgba dual" };
 
 	struct retro_system_info info;
 	memset(&info, 0, sizeof(info));
@@ -707,15 +707,66 @@ static int core_is_gambatte(void) {
 	return info.library_name && contains_ci(info.library_name, "gambatte");
 }
 
-static int session_instanced_gambatte(const char* path) {
+static int core_is_mgba(void) {
+	struct retro_system_info info;
+	memset(&info, 0, sizeof(info));
+	core.get_system_info(&info);
+	return info.library_name && contains_ci(info.library_name, "mgba");
+}
+
+/*
+ * What to answer mGBA when it asks the frontend for a target audio rate.
+ *
+ * Default is 0: decline, and let mGBA keep its own 65536. That is measured, not
+ * assumed - see below - and this knob exists so the measurement can be redone.
+ *
+ * The idea was that mGBA upsamples GBA's native 32768Hz to 65536 for nothing,
+ * since minarch resamples again to 48000 for the device. Answering 32768 makes
+ * libretro.c take its `coreSampleRate == targetSampleRate` branch and skip its
+ * resampler entirely.
+ *
+ * Measured on an A30 at 1344MHz, Mario Kart Super Circuit, process-wide:
+ *
+ *   target 65536 (declining, mGBA's default)   12.63 ms/frame
+ *   target 32768                               14.64 ms/frame
+ *
+ * Backwards, and the reason is instructive. 32768 is the GBA's *reset* value;
+ * games write SOUNDBIAS and most then run at 65536 or higher. So mGBA's default
+ * already matches what a real game produces and its resampler is already being
+ * skipped - answering 32768 does not remove a conversion, it *adds* one, and the
+ * ~2ms delta is mGBA's resampler being switched on rather than off. minarch has
+ * no same-rate short-circuit either (api.c resample_audio runs unconditionally),
+ * so there was never a second pass to collapse.
+ *
+ * The +49% reported for `audio_out_rate = 32768` elsewhere is a RetroArch
+ * number, and RetroArch's audio path is not this one.
+ *
+ * A game that genuinely runs at 32768 would want that answered instead, and
+ * would save the ~2ms. We cannot know which at load time - the environment call
+ * lands before the game writes SOUNDBIAS - and mGBA fixes the rate once. Hence
+ * the knob rather than a guess.
+ */
+#define MGBA_TARGET_SAMPLE_RATE 0
+
+static unsigned mgba_target_sample_rate(void) {
+	const char* env = getenv("NETPLAY_MGBA_SAMPLE_RATE");
+	if (env && *env) {
+		long v = strtol(env, NULL, 10);
+		if (v >= 0) return (unsigned) v;
+	}
+	return MGBA_TARGET_SAMPLE_RATE;
+}
+
+static int session_instanced_core(const char* path, const char* core_name) {
 	FILE* f = fopen(path, "r");
 	if (!f) return 0;
 	char line[256];
+	char key[64];
+	snprintf(key, sizeof(key), "instanced_%s=", core_name);
+	size_t key_len = strlen(key);
 	int enabled = 0;
 	while (fgets(line, sizeof(line), f)) {
-		int value;
-		if (sscanf(line, "instanced_gambatte=%d", &value) == 1)
-			enabled = value != 0;
+		if (!strncmp(line, key, key_len)) enabled = atoi(line + key_len) != 0;
 	}
 	fclose(f);
 	return enabled;
@@ -1360,8 +1411,10 @@ static void ensure_loaded(void) {
 		 * this game demoted itself: the paired core is not even staged, so this
 		 * is belt and braces against relaunching into the same negotiation. */
 		const char* dual_disabled = getenv(SHIM_ENV_NO_DUAL);
-		bool dual_requested = !netplay_mode && core_is_gambatte() &&
-		                      session_instanced_gambatte(session) &&
+		bool dual_core_enabled =
+			(core_is_gambatte() && session_instanced_core(session, "gambatte")) ||
+			(core_is_mgba() && session_instanced_core(session, "mgba"));
+		bool dual_requested = !netplay_mode && dual_core_enabled &&
 		                      !(dual_disabled && dual_disabled[0] == '1');
 		dual_link_mode = dual_requested && core_has_dual_contract();
 		if (dual_link_mode) {
@@ -1373,11 +1426,11 @@ static void ensure_loaded(void) {
 				dual_link_mode = 0;
 				shim_log("dual contract rejected visible-console selection; using network serial\n");
 			} else {
-				shim_log("Gambatte dual ABI v%u enabled (console %c visible); Wi-Fi carries inputs only\n",
+				shim_log("paired-core dual ABI v%u enabled (console %c visible); Wi-Fi carries inputs only\n",
 				         core.dual_get_abi_version(), dual_local_console ? 'B' : 'A');
 			}
 		} else if (dual_requested) {
-			shim_log("paired Gambatte core/ABI unavailable; using network serial fallback\n");
+			shim_log("paired core/ABI unavailable; using network serial fallback\n");
 		}
 
 		// After the mode is known: only shared screen compares state, and only
@@ -1512,6 +1565,15 @@ static bool shim_environment(unsigned cmd, void* data) {
 	if (cmd == RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY && guest_save_dir[0] && data) {
 		*(const char**)data = guest_save_dir;
 		return true;
+	}
+
+	if (cmd == RETRO_ENVIRONMENT_GET_TARGET_SAMPLE_RATE && data && core_is_mgba()) {
+		unsigned rate = mgba_target_sample_rate();
+		if (rate) {
+			*(unsigned*)data = rate;
+			shim_log("answering mGBA target sample rate: %u\n", rate);
+			return true;
+		}
 	}
 
 	if (cmd == RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE && session_active && data) {
@@ -3656,7 +3718,7 @@ static bool dual_bootstrap_tick(void) {
 	dual_wait_since.tv_sec = dual_wait_since.tv_usec = 0;
 	recovery_failed = 0;
 	recovery_error[0] = '\0';
-	shim_log("instanced Gambatte ready; serial is local and Wi-Fi is input-only\n");
+	shim_log("instanced paired core ready; cable is local and Wi-Fi is input-only\n");
 	return true;
 }
 

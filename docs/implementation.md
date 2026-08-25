@@ -630,12 +630,17 @@ gpSP does not emulate the link cable. From `serial_proto.c`:
 - `rfu` - generic wireless-adapter emulation, any adapter-aware game
 
 Auto-detection matches the ROM header and covers **only the Pokémon family**.
-Games using raw multi-player SIO - Mario Kart Super Circuit - cannot work.
+Games using raw multi-player SIO - Mario Kart Super Circuit, for example -
+cannot work through gpSP's link implementation.
 
-mGBA has real cycle-accurate SIO for every mode in `src/gba/sio/lockstep.c`
-(1,100 lines, shipping in its Qt and SDL frontends as "local link cable"), but
-its libretro adapter exposes **none** of it - zero references. Its README lists
-networked link as a *planned* feature.
+mGBA has real cycle-accurate SIO for every mode in `src/gba/sio/lockstep.c`.
+The stock libretro adapter exposes none of it, so Netplay's separately named
+paired frontend builds the driver, owns two local GBA cores, and presents the
+same dual ABI as paired Gambatte. Wi-Fi synchronizes inputs between mirrored
+replicas rather than carrying individual SIO transfers. Host tests exercise raw
+multiplayer SIO, and a two-Brick Mario Kart: Super Circuit race completed with
+audio. The implementation remains experimental because its 16.25-16.29 ms
+paired calls leave little margin inside a 16.74 ms frame.
 
 ## Dual instance
 

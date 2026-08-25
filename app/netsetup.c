@@ -254,7 +254,7 @@ void NS_wifiPowerSaveRestore(void) {
 // settings
 //////////////////////////////////////////////////////////////////////////////
 
-const char* const NS_INST_CORE[NS_INST_CORES] = { "gambatte", "gpsp", "mgba" };
+const char* const NS_INST_CORE[NS_INST_CORES] = { "gambatte", "mgba" };
 
 /* Executable sharing is frozen and therefore defaults off. Compatibility cores
  * are local, pinned artifacts and are the safe default fallback. */
@@ -266,7 +266,7 @@ static NS_Settings ns_set = {
 	.simple_client = false,
 	.add_gameswitcher = false,
 	.instanced     = NS_INST_OFF,
-	.inst_core     = { false, false, false },
+	.inst_core     = { false, false },
 };
 static bool ns_set_loaded = false;
 
@@ -597,13 +597,16 @@ static bool io_all(int fd, void* buf, size_t len, bool writing) {
 	return true;
 }
 
-static bool instanced_gambatte_available(void);
+#define INST_CAP_GAMBATTE (1u << 0)
+#define INST_CAP_MGBA     (1u << 1)
+
+static uint32_t instanced_available_mask(void);
 
 static bool send_manifest(int fd, NS_CoreInfo* m, int n) {
 	uint32_t hdr[5] = { htonl(CORE_MAGIC), htonl((uint32_t)n),
 	                    htonl(NS_settings()->compatibility_cores ? 1u : 0u),
 	                    htonl(NS_settings()->force_compatibility ? 1u : 0u),
-	                    htonl(instanced_gambatte_available() ? 1u : 0u) };
+	                    htonl(instanced_available_mask()) };
 	if (!io_all(fd, hdr, sizeof(hdr), true)) return false;
 	for (int i = 0; i < n; i++) {
 		CoreWire w;
@@ -624,7 +627,7 @@ static bool send_manifest(int fd, NS_CoreInfo* m, int n) {
 
 static int recv_manifest(int fd, NS_CoreInfo* out, int max,
                          bool* peer_compat_enabled, bool* peer_force_compatibility,
-                         bool* peer_instanced) {
+                         uint32_t* peer_instanced) {
 	uint32_t hdr[5];
 	if (!io_all(fd, hdr, sizeof(hdr), false)) return -1;
 	if (ntohl(hdr[0]) == CORE_BUSY) return -2;
@@ -632,7 +635,7 @@ static int recv_manifest(int fd, NS_CoreInfo* out, int max,
 	int n = (int)ntohl(hdr[1]);
 	*peer_compat_enabled = ntohl(hdr[2]) != 0;
 	*peer_force_compatibility = ntohl(hdr[3]) != 0;
-	*peer_instanced = ntohl(hdr[4]) != 0;
+	*peer_instanced = ntohl(hdr[4]);
 	if (n < 0 || n > NS_MAX_MANIFEST) return -1;
 
 	int kept = 0;
@@ -688,7 +691,7 @@ static bool compatibility_builds_match(const NS_CoreInfo* a, const NS_CoreInfo* 
 static bool write_compat_file(const char* path,
                               const char selected[][32], int count,
                               const char mismatched[][32], int mismatch_count,
-                              bool instanced_gambatte) {
+                              uint32_t instanced_mask) {
 	char tmp[560];
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	FILE* in = fopen(path, "r");
@@ -700,7 +703,8 @@ static bool write_compat_file(const char* path,
 	while (fgets(line, sizeof(line), in))
 		if (strncmp(line, "compat_core.", 12) &&
 		    strncmp(line, "core_mismatch.", 14) &&
-		    strncmp(line, "instanced_gambatte=", 19)) fputs(line, out);
+		    strncmp(line, "instanced_gambatte=", 19) &&
+		    strncmp(line, "instanced_mgba=", 15)) fputs(line, out);
 	for (int i = 0; i < count; i++) fprintf(out, "compat_core.%s=1\n", selected[i]);
 	for (int i = 0; i < mismatch_count; i++)
 		fprintf(out, "core_mismatch.%s=1\n", mismatched[i]);
@@ -708,7 +712,8 @@ static bool write_compat_file(const char* path,
 	 * agreement. Instanced play cannot be one-sided - a device running the
 	 * paired core against a peer running the ordinary network-serial core has
 	 * nothing to talk to - and both session files are rewritten here. */
-	fprintf(out, "instanced_gambatte=%d\n", instanced_gambatte ? 1 : 0);
+	fprintf(out, "instanced_gambatte=%d\n", (instanced_mask & INST_CAP_GAMBATTE) ? 1 : 0);
+	fprintf(out, "instanced_mgba=%d\n", (instanced_mask & INST_CAP_MGBA) ? 1 : 0);
 
 	fclose(in);
 	if (fclose(out) != 0 || rename(tmp, path) != 0) {
@@ -718,19 +723,26 @@ static bool write_compat_file(const char* path,
 	return true;
 }
 
-/* Whether this device can even offer instanced play: the setting is on for
- * Gambatte and the paired artifact is actually staged here. Both halves have to
- * hold on both devices, so this is exchanged with the manifest and ANDed. */
-static bool instanced_gambatte_available(void) {
+/* Whether this device can offer each paired core: its setting is on and its
+ * paired artifact is actually staged. Each bit must be present on both devices,
+ * so the masks are exchanged with the manifest and intersected. */
+static uint32_t instanced_available_mask(void) {
 	char path[512];
+	uint32_t mask = 0;
 	snprintf(path, sizeof(path), "%s/cores/override/%s/gambatte_dual_libretro.so",
 	         ns_pak, ns_platform);
-	return instanced_core_enabled("gambatte") && file_exists(path);
+	if (instanced_core_enabled("gambatte") && file_exists(path))
+		mask |= INST_CAP_GAMBATTE;
+	snprintf(path, sizeof(path), "%s/Emus/%s/MGBA.pak/mgba_dual_libretro.so",
+	         ns_sd, ns_platform);
+	if (instanced_core_enabled("mgba") && file_exists(path))
+		mask |= INST_CAP_MGBA;
+	return mask;
 }
 
 static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, int tn,
 								bool peer_enabled, bool peer_force,
-								bool peer_instanced) {
+								uint32_t peer_instanced) {
 	char selected[NS_MAX_MANIFEST][32];
 	char mismatched[NS_MAX_MANIFEST][32];
 	int count = 0;
@@ -767,10 +779,12 @@ static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, 
 			       MANIFEST_CORES[i]);
 		}
 	}
-	bool instanced = instanced_gambatte_available() && peer_instanced;
-	ns_log("instanced gambatte: here=%d peer=%d -> %s\n",
-	       instanced_gambatte_available() ? 1 : 0, peer_instanced ? 1 : 0,
-	       instanced ? "enabled" : "network serial");
+	uint32_t local_instanced = instanced_available_mask();
+	uint32_t instanced = local_instanced & peer_instanced;
+	ns_log("paired cores: here=0x%x peer=0x%x agreed=0x%x (gambatte=%d mgba=%d)\n",
+	       local_instanced, peer_instanced, instanced,
+	       (instanced & INST_CAP_GAMBATTE) ? 1 : 0,
+	       (instanced & INST_CAP_MGBA) ? 1 : 0);
 
 	char path[512];
 	snprintf(path, sizeof(path), "%s/session.conf", ns_pak);
@@ -850,7 +864,7 @@ void NS_compatServeTick(void) {
 	NS_CoreInfo theirs[NS_MAX_MANIFEST];
 	bool peer_compat_enabled = false;
 	bool peer_force_compatibility = false;
-	bool peer_instanced = false;
+	uint32_t peer_instanced = 0;
 	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST,
 	                       &peer_compat_enabled, &peer_force_compatibility,
 	                       &peer_instanced);
@@ -964,7 +978,7 @@ int NS_compatSync(const char* host_ip, char* err, int errlen) {
 	NS_CoreInfo theirs[NS_MAX_MANIFEST];
 	bool peer_compat_enabled = false;
 	bool peer_force_compatibility = false;
-	bool peer_instanced = false;
+	uint32_t peer_instanced = 0;
 	if (!send_manifest(fd, mine, n)) {
 		close(fd);
 		snprintf(err, errlen, "manifest exchange failed");
@@ -1429,10 +1443,10 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	fprintf(f, "compatibility_cores=%d\n", NS_settings()->compatibility_cores ? 1 : 0);
 	fprintf(f, "force_compatibility=%d\n", NS_settings()->force_compatibility ? 1 : 0);
 	fprintf(f, "verbose_logs=%d\n", NS_settings()->verbose_logs ? 1 : 0);
-	/* Gambatte is the first implemented instanced core. The other choices stay
-	 * persisted so their UI/API do not need another format change when their
-	 * local-link hosts are ready. Unknown session keys are deliberately safe. */
+	/* These are local wishes until the manifest exchange replaces them with the
+	 * intersection of artifacts/settings available on both devices. */
 	fprintf(f, "instanced_gambatte=%d\n", instanced_core_enabled("gambatte") ? 1 : 0);
+	fprintf(f, "instanced_mgba=%d\n", instanced_core_enabled("mgba") ? 1 : 0);
 
 	/* Record the ad hoc network so the launch stub can put us back on it. The
 	 * join done here does not survive the app exiting - the platform brings its
@@ -1551,6 +1565,8 @@ void NS_disarm(void) {
 	NS_wifiPowerSaveRestore();
 }
 
+static void wifi_client_leave_adhoc(void);
+
 /* Drop the session but leave the launch stubs installed.
  *
  * With no session file the shim loads as a pure passthrough, so games launch
@@ -1559,6 +1575,8 @@ void NS_disarm(void) {
  * instead of a full reinstall across every Emus pak. */
 void NS_endSession(void) {
 	char cmd[1200];
+	NS_SessionInfo session;
+	bool was_client = NS_sessionInfo(&session) && session.role == NS_ROLE_CLIENT;
 	NS_brokerStop();
 	NS_announceStop();
 	NS_compatServeStop();
@@ -1570,10 +1588,14 @@ void NS_endSession(void) {
 	         ns_sd, ns_platform, ns_pak, ns_pak);
 	system(cmd);
 
-	/* A session is a network arrangement as much as a file. Ending one has to
-	 * put the radio back: stop serving if we were, and rejoin the normal
-	 * network if we had left it. Callers used to have to remember both. */
-	NS_hotspotStop();
+	/* A session is a network arrangement as much as a file. Remember the role
+	 * before removing that file: a guest must restore its station interface,
+	 * but must never enter host teardown merely because an unrelated/stale
+	 * hostapd process exists on the system. */
+	if (was_client)
+		wifi_client_leave_adhoc();
+	else
+		NS_hotspotStop();
 	NS_wifiPowerSaveRestore();
 }
 
@@ -2055,21 +2077,32 @@ static bool wifi_client_stack_up(void) {
 	system("ip link set wlan0 up 2>/dev/null");
 
 	bool can_retry_saved = false;
+	bool used_saved = false;
 	char cmd[600] = "";
-	if (file_exists("/etc/wifi/wifi_init.sh")) {
-		system("/etc/wifi/wifi_init.sh stop  >/dev/null 2>&1");
+	/* Prefer the exact daemon command captured before joining ad hoc. On the
+	 * Brick, wifi_init.sh stop/start performs rfkill and service teardown after
+	 * we have already stopped/flushed the client stack; that redundant path was
+	 * measured blocking the UI for 10.1s before restoration even began. */
+	if (load_saved_supplicant()) {
+		/* Captured service command lines are not guaranteed to contain -B. A
+		 * foreground wpa_supplicant here blocks the UI forever; explicitly make
+		 * the replay daemonise while preserving every platform-specific option. */
+		bool already_backgrounds = strstr(saved_supplicant, " -B") != NULL;
+		snprintf(cmd, sizeof(cmd), "%s%s >/dev/null 2>&1", saved_supplicant,
+		         already_backgrounds ? "" : " -B");
+		system(cmd);
+		can_retry_saved = true;
+		used_saved = true;
+		ns_log("started saved supplicant command\n");
+	} else if (file_exists("/etc/wifi/wifi_init.sh")) {
+		/* The stack was already stopped above; start is sufficient and avoids
+		 * a second service/rfkill teardown. */
 		system("/etc/wifi/wifi_init.sh start >/dev/null 2>&1");
-		ns_log("started wifi restoration via wifi_init.sh\n");
-	} else if (!load_saved_supplicant()) {
+		ns_log("started wifi restoration via wifi_init.sh fallback\n");
+	} else {
 		ns_log("WARNING: nothing recorded to restore wifi with\n");
 		wifi_restore_lock_release();
 		return false;
-	} else {
-		/* The captured line already carries -B; it daemonises itself. */
-		snprintf(cmd, sizeof(cmd), "%s >/dev/null 2>&1", saved_supplicant);
-		system(cmd);
-		can_retry_saved = true;
-		ns_log("started saved supplicant command\n");
 	}
 
 	/* One loop to the deadline. What we are waiting for is an address; whether
@@ -2117,7 +2150,8 @@ static bool wifi_client_stack_up(void) {
 	}
 
 	if (got_ip) {
-		ns_log("restored wifi via saved supplicant command\n");
+		ns_log("restored wifi via %s\n",
+		       used_saved ? "saved supplicant command" : "platform startup script");
 		wifi_restore_lock_release();
 		return true;
 	}
@@ -2203,6 +2237,13 @@ static bool on_own_adhoc(void) {
 	snprintf(cmd, sizeof(cmd),
 	         "iw dev wlan0 link 2>/dev/null | grep -q 'SSID: %s-'", NS_ADHOC_PREFIX);
 	return system(cmd) == 0;
+}
+
+static void wifi_client_leave_adhoc(void) {
+	if (!joined_hotspot && !on_own_adhoc()) return;
+	ns_log("leaving ad hoc network, restoring wifi\n");
+	wifi_client_stack_up();
+	joined_hotspot = false;
 }
 
 /* An in-process flag is not enough: the app can be reopened after a crash or a
@@ -2561,11 +2602,7 @@ void NS_hotspotStop(void) {
 
 	/* Restore the client stack if we moved it - judged by what the radio is
 	 * actually associated to, not by a flag this process may not have set. */
-	if (joined_hotspot || on_own_adhoc()) {
-		ns_log("leaving ad hoc network, restoring wifi\n");
-		wifi_client_stack_up();
-		joined_hotspot = false;
-	}
+	wifi_client_leave_adhoc();
 }
 
 bool NS_hotspotActive(void) { return hotspot_running || joined_hotspot; }

@@ -726,6 +726,7 @@ mode_case m2 Gambatte ''            link-cable    "from core"
 mode_case m3 gpSP     ''            link-cable    "from core"
 mode_case m4 FakeCore 'mode=link'   link-cable    "from session"
 mode_case m5 Gambatte 'mode=netplay' shared-screen "from session"
+mode_case m6 'mGBA Dual' ''         link-cable    "from core"
 
 # A serial exchange that fits inside one retro_run only works if a packet that
 # arrived mid-frame is delivered mid-frame. Before deliver_packets existed the

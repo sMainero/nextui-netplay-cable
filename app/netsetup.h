@@ -135,8 +135,8 @@ void NS_brokerStop(void);
  * systems, where each player has their own screen. A shared-screen system is
  * already one instance by definition and instancing it would be pure overhead -
  * hence a fixed, short compatibility list rather than "any core". */
-#define NS_INST_CORES 3
-extern const char* const NS_INST_CORE[NS_INST_CORES];   /* gambatte, gpsp, mgba */
+#define NS_INST_CORES 2
+extern const char* const NS_INST_CORE[NS_INST_CORES];   /* gambatte, mgba */
 
 typedef enum {
 	NS_INST_OFF = 0,     /* never */

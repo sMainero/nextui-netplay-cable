@@ -39,9 +39,9 @@ RESTORE_LOCK="/tmp/netplay_wifi_restore.lock"
 HOST=10.0.0.1
 PREFIX=nextui
 
-INTERVAL=20      # seconds between checks
-FAILS_NEEDED=3   # consecutive failures before we act - so ~60s to recover
-MAX_CHECKS=1440  # ~8h backstop, so a stuck record cannot leave this running
+INTERVAL=${NETPLAY_WATCHDOG_INTERVAL:-20}      # seconds between checks
+FAILS_NEEDED=${NETPLAY_WATCHDOG_FAILS:-3}      # ~60s grace by default
+MAX_CHECKS=${NETPLAY_WATCHDOG_MAX_CHECKS:-1440} # ~8h backstop
 
 # Own our output. Callers used to redirect, which forced them to know where the
 # log lives and left us tied to their descriptors.
@@ -107,6 +107,13 @@ restore_wifi() {
 	killall -q wpa_supplicant 2>/dev/null
 	ip addr flush dev wlan0 2>/dev/null
 	ip link set wlan0 up 2>/dev/null
+	# Captured service commands are not guaranteed to daemonise themselves. A
+	# foreground supplicant would pin the watchdog inside this command and never
+	# reach DHCP or session cleanup.
+	case " $_cmd " in
+		*" -B "*) ;;
+		*) _cmd="$_cmd -B" ;;
+	esac
 	sh -c "$_cmd" >/dev/null 2>&1
 
 	_w=1
@@ -126,18 +133,28 @@ restore_wifi() {
 	log "recovered, back on wifi as $_ip"
 	rm -f "$RESTORE"
 
-	# The ad hoc network is gone - stop the launch stub chasing it.
-	#
-	# Without this the session still names a network that no longer exists, so
-	# the next game launch spends five bounded attempts (~60s of spinner)
-	# rejoining nothing before falling back. The rest of the session is left
-	# alone: the peer address is still recorded and the bindings still stand, so
-	# ending or replacing it stays the user's decision.
+	# The ad hoc network is gone. A host lobby is persistent by design, but a
+	# guest cannot continue a session whose transport and ad-hoc peer address no
+	# longer exist. End only that guest's session; bindings remain installed and
+	# therefore become passthrough. The role check is deliberately made after
+	# recovery so this detached process cannot tear down a host session.
 	_sess="$NP/state/session"
-	if [ -f "$_sess" ] && grep -q '^adhoc_ssid=' "$_sess" 2>/dev/null; then
+	if [ -f "$_sess" ] && grep -q '^role=client$' "$_sess" 2>/dev/null &&
+	   grep -q '^adhoc_ssid=' "$_sess" 2>/dev/null; then
+		rm -f "$_sess" "$NP/state/broker.pid" "$NP/state/broker.status"
+		if [ -x "$NP/launcher/gameswitcher.sh" ]; then
+			SDCARD_PATH="${SDCARD_PATH:-/mnt/SDCARD}" PLATFORM="${PLATFORM:-tg5040}" \
+			NETPLAY_PAK="$NP" sh "$NP/launcher/gameswitcher.sh" idle >/dev/null 2>&1
+		fi
+		_ps="$NP/state/wifi_powersave"
+		[ "$(head -1 "$_ps" 2>/dev/null)" = on ] &&
+			iw dev wlan0 set power_save on >/dev/null 2>&1
+		rm -f "$_ps"
+		log "original wifi restored - ended guest session"
+	elif [ -f "$_sess" ] && grep -q '^adhoc_ssid=' "$_sess" 2>/dev/null; then
 		grep -v '^adhoc_ssid=' "$_sess" | grep -v '^adhoc_psk=' > "$_sess.tmp" 2>/dev/null &&
 			mv "$_sess.tmp" "$_sess" &&
-			log "cleared adhoc_ssid from the session - that network is gone"
+			log "preserved non-guest session and cleared obsolete ad hoc credentials"
 	fi
 	rm -f "$RESTORE_LOCK/pid"; rmdir "$RESTORE_LOCK" 2>/dev/null
 }

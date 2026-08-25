@@ -87,7 +87,9 @@ are merged into one Join list without losing the visible SSID.
 
 The implementation captures the original supplicant command before moving the
 guest radio, persists a recovery breadcrumb, restores original Wi-Fi on session
-end/failure, and runs a detached watchdog if the AP disappears. A reopened app
+end/failure, and runs a detached watchdog if the AP disappears. After its
+failure grace period, a recovered guest session ends automatically once the
+original WiFi is back; persistent host/hot-seat sessions remain armed. A reopened app
 and the broker reconstruct the active AP interface and SSID from durable session
 metadata and hostapd configuration. Static guest addressing may eventually
 remove the `udhcpd` dependency.
@@ -120,6 +122,11 @@ without a boot identity are preserved rather than removed speculatively.
 Game offers/replies, authenticated pairing, authorization tied to gameplay
 sockets remain. A future NextUI/MinArch integration can consume the same status
 file rather than owning another network listener.
+
+The setup UI uses NextUI's normal menu CPU profile instead of retaining the
+performance setting used to launch paks. Gameplay remains separate: the shim
+pins performance only for the lifetime of an armed emulator process and restores
+the prior policy at teardown.
 
 ### 6. Compatibility cores — Implemented
 
@@ -265,7 +272,7 @@ barrier. The host remains authoritative; this is not host migration.
 
 ## Local multi-instance mode
 
-### 14. Instanced cores — Partial; Gambatte implemented
+### 14. Instanced cores — Partial; Gambatte and mGBA implemented
 
 For Gambatte, each handheld runs a paired core (`gambatte_dual_libretro.so`)
 holding both logical consoles and the cable between them. One core call per
@@ -292,9 +299,15 @@ shared-screen sessions, with a reconnect re-pairing from scratch rather than
 resuming a timeline the peer cannot vouch for. Continue solo keeps the paired
 core and leaves the abandoned console on neutral input.
 
-gpSP and mGBA remain planned. This is core-specific orchestration, not a generic
-toggle over the existing one-core shim; their entries are visibly marked
-planned and cannot currently be enabled.
+mGBA uses the same mirrored-replica protocol and dual ABI, but its paired core
+drives two GBA `mCore`s cooperatively through mGBA's own cycle-based SIO
+lockstep coordinator. It is implemented for tg5040 and has completed a Mario
+Kart: Super Circuit race with audio. Its paired call is close to the Brick's
+frame budget, and ordinary-Wi-Fi pacing still needs broader testing. gpSP stays
+on its existing Wi-Fi link implementation: its multiplayer protocols are
+latency-tolerant enough that duplicating the core locally has no useful payoff.
+This is core-specific orchestration, not a generic toggle over the existing
+one-core shim.
 
 ## Saves, reset, and authority
 

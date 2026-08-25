@@ -452,10 +452,9 @@ static void render(SDL_Surface* s) {
 		for (int i = 0; i < NS_INST_CORES; i++) {
 			char row[128];
 			bool have = NS_coreInstalled(NS_INST_CORE[i]);
-			snprintf(row, sizeof(row), "[%s] %s%s%s",
+			snprintf(row, sizeof(row), "[%s] %s%s",
 			         c->inst_core[i] ? "x" : " ", NS_INST_CORE[i],
-			         have ? "" : "  (not installed)",
-			         i == 0 ? "" : "  (planned)");
+			         have ? "" : "  (not installed)");
 			y = draw_row(s, row, y, i == inst_sel);
 		}
 		y += SCALE1(6);
@@ -618,6 +617,11 @@ int main(int argc, char* argv[]) {
 	SDL_Surface* s = GFX_init(MODE_MAIN);
 	PAD_init();
 	PWR_init();
+	/* NextUI launches every pak at the performance ceiling. This setup UI and
+	 * its detached broker are low-duty control-plane work; use the platform's
+	 * normal menu profile instead. Gameplay still pins performance only while
+	 * an armed emulator process is running. */
+	PWR_setCPUSpeed(CPU_SPEED_MENU);
 	InitSettings();
 
 	signal(SIGINT, on_signal);
@@ -886,10 +890,7 @@ int main(int argc, char* argv[]) {
 			if (PAD_justPressed(BTN_DOWN)) { inst_sel = (inst_sel + 1) % NS_INST_CORES; dirty = 1; }
 			if (PAD_justPressed(BTN_B))    { screen = SCREEN_SETTINGS; dirty = 1; }
 			if (PAD_justPressed(BTN_A)) {
-				if (inst_sel != 0) {
-					snprintf(status, sizeof(status), "%s instancing is not implemented yet.",
-					         NS_INST_CORE[inst_sel]);
-				} else if (NS_coreInstalled(NS_INST_CORE[inst_sel])) {
+				if (NS_coreInstalled(NS_INST_CORE[inst_sel])) {
 					c->inst_core[inst_sel] = !c->inst_core[inst_sel];
 					NS_settingsSave();
 				} else {

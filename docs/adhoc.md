@@ -439,7 +439,7 @@ with the reason shown in its place.
 Settings are toggles drawn in place (`Name: value`) rather than destinations - a
 submenu per boolean would be three presses to flip one flag. *Instanced cores*
 is the exception: its third state opens a picker over the cores that can be
-instanced (gambatte, gpsp, mgba), marking any not installed rather than offering
+instanced (gambatte and mgba), marking any not installed rather than offering
 something that cannot run. Debug-only toggles and checks live in the separate
 *Debug* submenu. Settings are stored in `state/settings`, written with
 write-then-rename so a power cut cannot leave a half-written file that silently

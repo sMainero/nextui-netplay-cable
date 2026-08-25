@@ -83,7 +83,7 @@ Thirty paks. Eight use a core the shim drives; the rest launch stock.
 | COLECO | gearcoleco | yes | no | - |
 | CPC | cap32 | yes | no | - |
 | LYNX | handy | no | hardware only - ComLynx not emulated | - |
-| MGBA | mgba | rarely | **yes** - full link cable, but not exposed via libretro netpacket | - **needs a core patch**, see below |
+| MGBA | mgba | rarely | **yes** - full GBA SIO | **instanced link (experimental)** - paired core completed a Mario Kart race on two Bricks |
 | SGB | mgba | yes (via SNES multitap) | no | - |
 | MSX | bluemsx | yes | no | - |
 | NGP | race | no | hardware only - link not emulated | - |
@@ -206,7 +206,7 @@ What it has instead is better suited to the instanced route. mGBA ships a
 is what mGBA's own desktop frontend uses for multiplayer. It arbitrates transfer
 start, mode changes and hard sync across up to four players behind a mutex.
 
-Two caveats found by inspecting the build:
+Two limitations found by inspecting the stock build were:
 
 - The libretro build compiles `src/core/lockstep.o` but **not**
   `src/gba/sio/lockstep.o`, so the GBA SIO driver that would use it is absent
@@ -214,11 +214,14 @@ Two caveats found by inspecting the build:
 - It is built with `-DDISABLE_THREADING`, which matters because the coordinator
   is written to be driven from multiple threads.
 
-So mGBA link needs a core patch either way: expose the netpacket interface, or
-expose the lockstep coordinator so two in-process instances can be wired
-together. The second is the smaller change and is the one that fits the
-instanced-cores design, since link play needs each player to have their own
-screen regardless.
+The experimental paired core now takes the second route. Its build adds the GBA
+lockstep driver and a separate libretro frontend owning two `mCore`s, a
+`GBASIOLockstepCoordinator`, and a cooperative `runLoop` scheduler. It implements
+the same dual ABI used by paired Gambatte, so Wi-Fi carries controller inputs and
+checkpoints rather than SIO exchanges. Synthetic tests complete hundreds of raw
+multiplayer transfers without a lockstep assertion, and two Bricks completed a
+Mario Kart: Super Circuit race with audio. This is currently a tg5040
+experimental implementation, not a replacement for the stock mGBA core.
 
 **Shared screen requires the same core build on both devices.** Every `netplay`
 row above assumes it. `NO_ARM_ASM=1` is necessary and sufficient for picodrive,
