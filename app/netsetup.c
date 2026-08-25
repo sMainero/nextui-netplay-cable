@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <dlfcn.h>
+#include <dirent.h>
 #include <gnu/libc-version.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -34,6 +35,7 @@ typedef struct __attribute__((packed)) {
 
 static char ns_platform[16] = "tg5040";
 static char ns_pak[256];
+static char ns_state[256];
 static char ns_sd[128] = "/mnt/SDCARD";
 
 static int announce_fd = -1;
@@ -48,6 +50,7 @@ static char ns_ap_if[64];      /* interface hostapd was given, for teardown */
 static char joined_ssid[NS_SSID_LEN];  /* recorded into the session so the */
 static char joined_psk[NS_PSK_LEN];    /* launch stub can rejoin per game */
 static NS_ProgressFn ns_progress;      /* lets the UI animate a blocking join */
+static bool file_exists(const char* p);
 
 //////////////////////////////////////////////////////////////////////////////
 // environment
@@ -61,10 +64,44 @@ void NS_init(void) {
 	if (sd && sd[0]) snprintf(ns_sd, sizeof(ns_sd), "%s", sd);
 
 	snprintf(ns_pak, sizeof(ns_pak), "%s/Tools/%s/Netplay.pak", ns_sd, ns_platform);
+	snprintf(ns_state, sizeof(ns_state), "%s/.userdata/shared/Netplay", ns_sd);
+
+	/* Updates replace the pak directory, so no user preference or recovery
+	 * record may live underneath it. Migrate files from the historical location
+	 * without overwriting anything already present in the shared directory. */
+	char shared[256];
+	snprintf(shared, sizeof(shared), "%s/.userdata/shared", ns_sd);
+	mkdir(shared, 0777);
+	mkdir(ns_state, 0777);
+	char legacy[320];
+	snprintf(legacy, sizeof(legacy), "%s/state", ns_pak);
+	DIR* dir = opendir(legacy);
+	if (dir) {
+		struct dirent* entry;
+		while ((entry = readdir(dir))) {
+			if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+			char old_path[512], new_path[512];
+			snprintf(old_path, sizeof(old_path), "%s/%s", legacy, entry->d_name);
+			if (!strcmp(entry->d_name, "harness-backup")) {
+				snprintf(new_path, sizeof(new_path), "%s/netplay-harness", ns_state);
+				mkdir(new_path, 0777);
+				snprintf(new_path, sizeof(new_path), "%s/netplay-harness/session-backups", ns_state);
+			} else {
+				snprintf(new_path, sizeof(new_path), "%s/%s", ns_state, entry->d_name);
+			}
+			if (!file_exists(new_path)) rename(old_path, new_path);
+		}
+		closedir(dir);
+	}
+	char old_conf[320], new_conf[320];
+	snprintf(old_conf, sizeof(old_conf), "%s/session.conf", ns_pak);
+	snprintf(new_conf, sizeof(new_conf), "%s/session.conf", ns_state);
+	if (!file_exists(new_conf) && file_exists(old_conf)) rename(old_conf, new_conf);
 }
 
 const char* NS_platform(void) { return ns_platform; }
 const char* NS_pakPath(void)  { return ns_pak; }
+const char* NS_statePath(void) { return ns_state; }
 
 /* Read the first non-loopback IPv4 from `ip addr`. Cheaper and more portable
  * across these firmwares than getifaddrs, which busybox images vary on. */
@@ -201,7 +238,7 @@ static int popen_bounded(const char* cmd, int timeout_ms,
 }
 
 static void ps_state_path(char* out, int len) {
-	snprintf(out, len, "%s/state/wifi_powersave", ns_pak);
+	snprintf(out, len, "%s/wifi_powersave", ns_state);
 }
 
 /* "on" / "off", as `iw` reports it. */
@@ -271,7 +308,7 @@ static NS_Settings ns_set = {
 static bool ns_set_loaded = false;
 
 static void settings_path(char* out, int len) {
-	snprintf(out, len, "%s/state/settings", ns_pak);
+	snprintf(out, len, "%s/settings", ns_state);
 }
 
 static const char* compatibility_arch(void) {
@@ -371,6 +408,14 @@ void NS_settingsSave(void) {
  * (which is where mgba is - MGBA.pak, not the system cores dir). */
 bool NS_coreInstalled(const char* core) {
 	char p[640];
+	/* mGBA is intentionally installable from this pak, so its picker remains
+	 * available before an SD-card MGBA.pak exists. This path is platform-specific
+	 * and therefore also prevents unsupported devices enabling it. */
+	if (!strcmp(core, "mgba")) {
+		snprintf(p, sizeof(p), "%s/cores/mgba/%s/MGBA.pak/mgba_libretro.so",
+		         ns_pak, ns_platform);
+		return file_exists(p);
+	}
 
 	snprintf(p, sizeof(p), "%s/.system/%s/cores/%s_libretro.so", ns_sd, ns_platform, core);
 	if (file_exists(p)) return true;
@@ -383,6 +428,54 @@ bool NS_coreInstalled(const char* core) {
 	snprintf(cmd, sizeof(cmd),
 	         "ls '%s/Emus/%s'/*.pak/%s_libretro.so >/dev/null 2>&1", ns_sd, ns_platform, core);
 	return system(cmd) == 0;
+}
+
+static bool mgba_helper(const char* args, char* err, int errlen) {
+	char cmd[1280];
+	snprintf(cmd, sizeof(cmd),
+	         "SDCARD_PATH='%s' PLATFORM='%s' NETPLAY_PAK='%s' NETPLAY_STATE='%s' "
+	         "sh '%s/launcher/mgba-manage.sh' %s >/tmp/netplay-mgba-result 2>&1",
+	         ns_sd, ns_platform, ns_pak, ns_state, ns_pak, args);
+	int rc = system(cmd);
+	if (rc == 0) return true;
+	if (err && errlen) {
+		FILE* f = fopen("/tmp/netplay-mgba-result", "r");
+		if (f && fgets(err, errlen, f)) {
+			char* nl = strpbrk(err, "\r\n"); if (nl) *nl = '\0';
+		} else snprintf(err, errlen, "mGBA file operation failed.");
+		if (f) fclose(f);
+	}
+	return false;
+}
+
+bool NS_mgbaStatus(NS_MgbaStatus* out) {
+	if (!out) return false;
+	memset(out, 0, sizeof(*out));
+	if (!mgba_helper("status", NULL, 0)) return false;
+	FILE* f = fopen("/tmp/netplay-mgba-result", "r");
+	if (!f) return false;
+	char line[160];
+	while (fgets(line, sizeof(line), f)) {
+		char* nl = strpbrk(line, "\r\n"); if (nl) *nl = '\0';
+		char* eq = strchr(line, '='); if (!eq) continue;
+		*eq++ = '\0';
+		if (!strcmp(line, "installed")) out->installed = atoi(eq) != 0;
+		else if (!strcmp(line, "managed")) out->managed = atoi(eq) != 0;
+		else if (!strcmp(line, "missing")) out->missing = atoi(eq) != 0;
+		else if (!strcmp(line, "mismatch")) out->mismatch = atoi(eq) != 0;
+		else if (!strcmp(line, "mismatch_ignored")) out->mismatch_ignored = atoi(eq) != 0;
+		else if (!strcmp(line, "backup_date")) snprintf(out->backup_date, sizeof(out->backup_date), "%s", eq);
+	}
+	fclose(f);
+	return true;
+}
+
+bool NS_mgbaInstall(char* err, int errlen) { return mgba_helper("install", err, errlen); }
+bool NS_mgbaIgnoreMismatch(char* err, int errlen) { return mgba_helper("ignore", err, errlen); }
+bool NS_mgbaRestore(bool pak, bool saves, bool states, char* err, int errlen) {
+	char args[64];
+	snprintf(args, sizeof(args), "restore %d %d %d", pak ? 1 : 0, saves ? 1 : 0, states ? 1 : 0);
+	return mgba_helper(args, err, errlen);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -687,7 +780,7 @@ static bool compatibility_builds_match(const NS_CoreInfo* a, const NS_CoreInfo* 
 
 /* Rewrite only the generated compatibility selections, preserving role,
  * transport and hand-edited options. Both copies must agree because the
- * launcher reads state/session while session.conf is the durable template. */
+ * launcher reads session while session.conf is the durable shared template. */
 static bool write_compat_file(const char* path,
                               const char selected[][32], int count,
                               const char mismatched[][32], int mismatch_count,
@@ -733,8 +826,8 @@ static uint32_t instanced_available_mask(void) {
 	         ns_pak, ns_platform);
 	if (instanced_core_enabled("gambatte") && file_exists(path))
 		mask |= INST_CAP_GAMBATTE;
-	snprintf(path, sizeof(path), "%s/Emus/%s/MGBA.pak/mgba_dual_libretro.so",
-	         ns_sd, ns_platform);
+	snprintf(path, sizeof(path), "%s/cores/override/%s/mgba_dual_libretro.so",
+	         ns_pak, ns_platform);
 	if (instanced_core_enabled("mgba") && file_exists(path))
 		mask |= INST_CAP_MGBA;
 	return mask;
@@ -787,16 +880,16 @@ static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, 
 	       (instanced & INST_CAP_MGBA) ? 1 : 0);
 
 	char path[512];
-	snprintf(path, sizeof(path), "%s/session.conf", ns_pak);
+	snprintf(path, sizeof(path), "%s/session.conf", ns_state);
 	if (!write_compat_file(path, selected, count, mismatched, mismatch_count, instanced)) {
 		ns_log("cannot update compatibility selections in session.conf\n");
 		return -1;
 	}
-	snprintf(path, sizeof(path), "%s/state/session", ns_pak);
+	snprintf(path, sizeof(path), "%s/session", ns_state);
 	if (!write_compat_file(path, selected, count, mismatched, mismatch_count, instanced)) {
 		ns_log("cannot update compatibility selections in active session\n");
 		/* Do not leave a durable selection that disagrees with the active file. */
-		snprintf(path, sizeof(path), "%s/session.conf", ns_pak);
+		snprintf(path, sizeof(path), "%s/session.conf", ns_state);
 		write_compat_file(path, selected, 0, mismatched, 0, false);
 		return -1;
 	}
@@ -1212,7 +1305,7 @@ int NS_runChecks(NS_Check* out, int max, NS_CheckResult* worst) {
 
 bool NS_isArmed(void) {
 	char p[512];
-	snprintf(p, sizeof(p), "%s/state/session", ns_pak);
+	snprintf(p, sizeof(p), "%s/session", ns_state);
 	return file_exists(p);
 }
 
@@ -1228,7 +1321,7 @@ bool NS_cleanupStaleSession(void) {
 
 static int broker_pid(void) {
 	char path[512];
-	snprintf(path, sizeof(path), "%s/state/broker.pid", ns_pak);
+	snprintf(path, sizeof(path), "%s/broker.pid", ns_state);
 	FILE* f = fopen(path, "r");
 	int pid = 0;
 	if (f) { if (fscanf(f, "%d", &pid) != 1) pid = 0; fclose(f); }
@@ -1250,7 +1343,7 @@ bool NS_sessionInfo(NS_SessionInfo* out) {
 	memset(out, 0, sizeof(*out));
 
 	char path[512];
-	snprintf(path, sizeof(path), "%s/state/session", ns_pak);
+	snprintf(path, sizeof(path), "%s/session", ns_state);
 	FILE* f = fopen(path, "r");
 	if (!f) return false;
 	out->armed = true;
@@ -1272,7 +1365,7 @@ bool NS_sessionInfo(NS_SessionInfo* out) {
 	if (out->role == NS_ROLE_HOST && !out->network[0] &&
 	    system("pidof hostapd >/dev/null 2>&1") == 0) {
 		/* Upgrade an already-running host created before host metadata was
-		 * written into state/session. */
+		 * written into the shared session record. */
 		f = fopen("/tmp/netplay_hostapd.conf", "r");
 		while (f && fgets(line, sizeof(line), f)) {
 			char value[NS_PSK_LEN];
@@ -1287,7 +1380,7 @@ bool NS_sessionInfo(NS_SessionInfo* out) {
 	out->broker_running = broker_pid() != 0;
 	if (out->role != NS_ROLE_HOST || !out->broker_running) return true;
 
-	snprintf(path, sizeof(path), "%s/state/broker.status", ns_pak);
+	snprintf(path, sizeof(path), "%s/broker.status", ns_state);
 	f = fopen(path, "r");
 	if (!f) return true;
 	while (fgets(line, sizeof(line), f)) {
@@ -1313,8 +1406,8 @@ bool NS_sessionInfo(NS_SessionInfo* out) {
 bool NS_brokerStart(char* err, int errlen) {
 	if (broker_pid()) return true;
 	char stale[512];
-	snprintf(stale, sizeof(stale), "%s/state/broker.pid", ns_pak); remove(stale);
-	snprintf(stale, sizeof(stale), "%s/state/broker.status", ns_pak); remove(stale);
+	snprintf(stale, sizeof(stale), "%s/broker.pid", ns_state); remove(stale);
+	snprintf(stale, sizeof(stale), "%s/broker.status", ns_state); remove(stale);
 
 	char executable[512];
 	snprintf(executable, sizeof(executable), "%s/bin/%s/netplay-broker.elf", ns_pak, ns_platform);
@@ -1331,7 +1424,7 @@ bool NS_brokerStart(char* err, int errlen) {
 	if (pid == 0) {
 		setsid();
 		char log_path[512];
-		snprintf(log_path, sizeof(log_path), "%s/state/broker.log", ns_pak);
+		snprintf(log_path, sizeof(log_path), "%s/broker.log", ns_state);
 		int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
 		int null_fd = open("/dev/null", O_RDONLY);
 		if (null_fd >= 0) { dup2(null_fd, STDIN_FILENO); close(null_fd); }
@@ -1351,7 +1444,7 @@ bool NS_brokerStart(char* err, int errlen) {
 
 	for (int i = 0; i < 30; i++) {
 		usleep(100 * 1000);
-		snprintf(stale, sizeof(stale), "%s/state/broker.status", ns_pak);
+		snprintf(stale, sizeof(stale), "%s/broker.status", ns_state);
 		if (broker_pid() && file_exists(stale)) return true;
 		if (kill(pid, 0) != 0 && errno == ESRCH) break;
 	}
@@ -1373,17 +1466,14 @@ void NS_brokerStop(void) {
 		waitpid(pid, NULL, WNOHANG);
 	}
 	char path[512];
-	snprintf(path, sizeof(path), "%s/state/broker.pid", ns_pak); remove(path);
-	snprintf(path, sizeof(path), "%s/state/broker.status", ns_pak); remove(path);
+	snprintf(path, sizeof(path), "%s/broker.pid", ns_state); remove(path);
+	snprintf(path, sizeof(path), "%s/broker.status", ns_state); remove(path);
 }
 
 bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	char path[512];
 
-	snprintf(path, sizeof(path), "%s/state", ns_pak);
-	mkdir(path, 0755);
-
-	snprintf(path, sizeof(path), "%s/session.conf", ns_pak);
+	snprintf(path, sizeof(path), "%s/session.conf", ns_state);
 	FILE* f = fopen(path, "w");
 	if (!f) {
 		snprintf(err, errlen, "cannot write session.conf");
@@ -1484,7 +1574,7 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	fclose(f);
 
 	char cmd[1200];
-	snprintf(cmd, sizeof(cmd), "cp '%s/session.conf' '%s/state/session'", ns_pak, ns_pak);
+	snprintf(cmd, sizeof(cmd), "cp '%s/session.conf' '%s/session'", ns_state, ns_state);
 	if (system(cmd) != 0) {
 		snprintf(err, errlen, "cannot activate session");
 		return false;
@@ -1552,8 +1642,8 @@ void NS_disarm(void) {
 	         ns_sd, ns_platform, ns_sd, ns_platform, ns_sd, ns_platform, ns_pak);
 	system(cmd);
 
-	snprintf(cmd, sizeof(cmd), "rm -f '%s/state/session' '%s/state/force-shim'",
-	         ns_pak, ns_pak);
+	snprintf(cmd, sizeof(cmd), "rm -f '%s/session' '%s/force-shim'",
+	         ns_state, ns_state);
 	system(cmd);
 	snprintf(cmd, sizeof(cmd),
 	         "SDCARD_PATH='%s' PLATFORM='%s' NETPLAY_PAK='%s' "
@@ -1580,7 +1670,7 @@ void NS_endSession(void) {
 	NS_brokerStop();
 	NS_announceStop();
 	NS_compatServeStop();
-	snprintf(cmd, sizeof(cmd), "rm -f '%s/state/session'", ns_pak);
+	snprintf(cmd, sizeof(cmd), "rm -f '%s/session'", ns_state);
 	system(cmd);
 	snprintf(cmd, sizeof(cmd),
 	         "SDCARD_PATH='%s' PLATFORM='%s' NETPLAY_PAK='%s' "
@@ -1602,9 +1692,9 @@ void NS_endSession(void) {
 /* Covered by either route: mounts (preferred) or legacy stubs. */
 bool NS_stubsInstalled(void) {
 	char p[512];
-	snprintf(p, sizeof(p), "%s/state/mounts.list", ns_pak);
+	snprintf(p, sizeof(p), "%s/mounts.list", ns_state);
 	if (file_exists(p)) return true;
-	snprintf(p, sizeof(p), "%s/state/stubs.list", ns_pak);
+	snprintf(p, sizeof(p), "%s/stubs.list", ns_state);
 	return file_exists(p);
 }
 
@@ -1949,7 +2039,7 @@ static void wifi_client_stack_down(void) {
 	 * longer there and has nothing left that knows how to get back. */
 	if (saved_supplicant[0]) {
 		char path[512];
-		snprintf(path, sizeof(path), "%s/state/wifi_restore", ns_pak);
+		snprintf(path, sizeof(path), "%s/wifi_restore", ns_state);
 		FILE* w = fopen(path, "w");
 		if (w) { fprintf(w, "%s\n", saved_supplicant); fclose(w); }
 	}
@@ -1965,7 +2055,7 @@ static bool load_saved_supplicant(void) {
 	if (saved_supplicant[0]) return true;
 
 	char path[512];
-	snprintf(path, sizeof(path), "%s/state/wifi_restore", ns_pak);
+	snprintf(path, sizeof(path), "%s/wifi_restore", ns_state);
 	FILE* f = fopen(path, "r");
 	if (!f) return false;
 	if (fgets(saved_supplicant, sizeof(saved_supplicant), f)) {
@@ -2188,7 +2278,7 @@ static bool watchdog_running(void) {
  * neither used to leave anything behind that knew how to undo it. */
 bool NS_wifiRecoverIfStranded(void) {
 	char path[512];
-	snprintf(path, sizeof(path), "%s/state/wifi_restore", ns_pak);
+	snprintf(path, sizeof(path), "%s/wifi_restore", ns_state);
 	if (!file_exists(path)) return false;   /* never moved the client stack */
 
 	bool connected = system("iw dev wlan0 link 2>/dev/null | grep -q 'Connected to'") == 0;
@@ -2630,7 +2720,7 @@ void NS_setProgressCallback(NS_ProgressFn fn) { ns_progress = fn; }
 
 void NS_wifiRestore(void) {
 	char path[512];
-	snprintf(path, sizeof(path), "%s/state/wifi_restore", ns_pak);
+	snprintf(path, sizeof(path), "%s/wifi_restore", ns_state);
 
 	/* Stop serving too - on one radio, an AP left running is part of why the
 	 * client stack cannot settle. */

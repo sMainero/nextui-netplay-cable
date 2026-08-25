@@ -19,6 +19,8 @@ CORE="$1"
 
 NP="$SDCARD_PATH/Tools/$PLATFORM/Netplay.pak"
 SHIM="$NP/bin/$PLATFORM/netplay_shim.so"
+NETPLAY_PAK="$NP"
+. "$NP/launcher/state-path.sh"
 
 # Two ways we can be reached, and they need different answers for "where is the
 # real minarch":
@@ -40,8 +42,8 @@ fi
 # game list are started by NextUI, so there is nowhere in that path for anyone
 # to set an environment variable - we have to find the file ourselves and export
 # it for the shim. Same reason the force flag is a file.
-if [ -z "$NETPLAY_SESSION" ] && [ -f "$NP/state/session" ]; then
-	NETPLAY_SESSION="$NP/state/session"
+if [ -z "$NETPLAY_SESSION" ] && [ -f "$NETPLAY_STATE/session" ]; then
+	NETPLAY_SESSION="$NETPLAY_STATE/session"
 	export NETPLAY_SESSION
 fi
 
@@ -58,7 +60,7 @@ GS_MARKER="$SDCARD_PATH/.userdata/shared/.minui/game_switcher.txt"
 
 gameswitcher_prepare() {
 	[ -n "$NETPLAY_SESSION" ] || return 0
-	grep -q '^add_gameswitcher=1$' "$NP/state/settings" 2>/dev/null || return 0
+	grep -q '^add_gameswitcher=1$' "$NETPLAY_STATE/settings" 2>/dev/null || return 0
 	ROM_PATH=$1
 	case "$ROM_PATH" in "$SDCARD_PATH/Roms/"*) ;; *) return 0 ;; esac
 
@@ -110,7 +112,7 @@ gameswitcher_prepare "$1"
 # passthrough gets verified on device.
 if [ -z "$NETPLAY_SESSION" ] &&
    [ "$NETPLAY_FORCE_SHIM" != "1" ] &&
-   [ ! -f "$NP/state/force-shim" ]; then
+   [ ! -f "$NETPLAY_STATE/force-shim" ]; then
 	exec "$REAL_MINARCH" "$CORE" "$@"
 fi
 
@@ -143,6 +145,7 @@ if [ "$CORE_ID" = "snes9x2005" ]; then
 fi
 NETPLAY_CORE="$NP/cores/override/$PLATFORM/$CORE_NAME"
 DUAL_GAMBATTE_CORE="$NP/cores/override/$PLATFORM/gambatte_dual_libretro.so"
+DUAL_MGBA_CORE="$NP/cores/override/$PLATFORM/mgba_dual_libretro.so"
 CORE_NOTICE=""
 
 # The stock gambatte has Game Link compiled out and stock gpSP lacks this
@@ -185,6 +188,17 @@ case "$CORE_ID" in
 			NETPLAY_COMPAT_CORE=1
 			export NETPLAY_COMPAT_CORE
 			CORE_NOTICE=netlink
+		fi
+		;;
+	mgba)
+		if [ -n "$NETPLAY_SESSION" ] &&
+		   [ "$NETPLAY_DUAL_DISABLE" != "1" ] &&
+		   grep -q '^instanced_mgba=1$' "$NETPLAY_SESSION" 2>/dev/null &&
+		   [ -f "$DUAL_MGBA_CORE" ]; then
+			REAL_CORE="$DUAL_MGBA_CORE"
+			NETPLAY_DUAL_CORE=1
+			export NETPLAY_DUAL_CORE
+			CORE_NOTICE=paired
 		fi
 		;;
 esac

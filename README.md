@@ -20,12 +20,18 @@ True multiplayer for GameBoy Advance/Game Boy Color/Game Boy. Each player has th
 - Works for GBC/GB games that support Game Link. 
 - Linked games do not have to be the same — Red/Blue, Seasons/Ages all work
 
-### Instanced cores (experimental, Game Boy only)
+### Instanced cores (experimental, Game Boy and Game Boy Advance)
 
 Turn on **Use instanced cores** in Settings and each device emulates *both* Game Boys,
 keeping the link cable inside the device and sending only controller inputs over
 WiFi. It removes a WiFi round trip from every cable exchange, which is what makes
 trading and battling feel responsive instead of sluggish.
+
+The core picker is a submenu with separate Gambatte and mGBA choices. mGBA is
+off by default. Enabling it installs Netplay's matched ordinary MGBA.pak on each
+supported platform represented on the card while keeping the paired core inside
+Netplay.pak. Existing paks, saves and states are backed up first, and disabling
+it offers an independent restore for each category.
 
 Both devices have to have it switched on, and both have to have *both* cartridges
 installed — no game files are ever sent between devices. If either condition

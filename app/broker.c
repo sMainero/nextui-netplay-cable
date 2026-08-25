@@ -2,7 +2,7 @@
  * Session-lifetime host services.
  *
  * This process is deliberately independent of the setup UI. It owns the
- * lightweight discovery beacon and compatibility listener until state/session
+ * lightweight discovery beacon and compatibility listener until the shared session
  * disappears or it receives SIGTERM, and publishes a small status snapshot for
  * any newly opened Netplay.pak process.
  */
@@ -67,8 +67,8 @@ int main(void) {
 	NS_init();
 
 	char pid_path[512], status_path[512];
-	snprintf(pid_path, sizeof(pid_path), "%s/state/broker.pid", NS_pakPath());
-	snprintf(status_path, sizeof(status_path), "%s/state/broker.status", NS_pakPath());
+	snprintf(pid_path, sizeof(pid_path), "%s/broker.pid", NS_statePath());
+	snprintf(status_path, sizeof(status_path), "%s/broker.status", NS_statePath());
 	if (!write_pid(pid_path)) {
 		fprintf(stderr, "netplay broker already owned: %s\n", strerror(errno));
 		return 1;

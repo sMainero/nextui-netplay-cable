@@ -248,7 +248,7 @@ peer=192.168.1.42    # clients only
 session_id=<generated hex> # namespaces host recovery data in /tmp
 ```
 
-`launcher/minarch.elf` finds it at `<pak>/state/session` and exports
+`launcher/minarch.elf` finds it at `.userdata/shared/Netplay/session` and exports
 `NETPLAY_SESSION`. It has to discover the file rather than read an environment
 variable, because games launched from the game list are started by NextUI and
 there is no point in that path where anyone could set one.

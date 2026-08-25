@@ -326,12 +326,15 @@ def device_addresses(args):
     return [("host", args.host), ("client", args.client)]
 
 
+NETPLAY_STATE = "/mnt/SDCARD/.userdata/shared/Netplay"
+HARNESS_STATE = f"{NETPLAY_STATE}/netplay-harness"
+
+
 def host_reported_guest(remote, args):
-    pak = f"/mnt/SDCARD/Tools/{args.platform}/Netplay.pak"
     command = (
         "if pidof hostapd >/dev/null 2>&1 && "
         "ip -4 addr 2>/dev/null | grep -q '10[.]0[.]0[.]1/24'; then "
-        f"cat {shlex.quote(pak + '/state/broker.status')} 2>/dev/null; "
+        f"cat {shlex.quote(NETPLAY_STATE + '/broker.status')} 2>/dev/null; "
         "awk '$1 ~ /^10[.]0[.]0[.]/ && $1 != \"10.0.0.1\" {print $1; exit}' "
         "/proc/net/arp 2>/dev/null; fi"
     )
@@ -407,7 +410,7 @@ def probe_script(platform):
     netplay = f"/mnt/SDCARD/Tools/{platform}/Netplay.pak"
     mgba = f"/mnt/SDCARD/Emus/{platform}/MGBA.pak"
     nds = f"/mnt/SDCARD/Emus/{platform}/NDS.pak"
-    session = f"{netplay}/state/session"
+    session = f"{NETPLAY_STATE}/session"
     mgba_log = f"/mnt/SDCARD/.userdata/{platform}/logs/MGBA.txt"
     return "; ".join([
         "printf 'firmware='; cat /etc/version 2>/dev/null || printf unknown; echo",
@@ -511,13 +514,17 @@ def command_session(args):
             if remote.run(address, f"test -f {shlex.quote(pak + '/pak.json')}",
                           check=False, jump=jump).returncode:
                 raise HarnessError(f"{address}: Netplay.pak is not installed")
-            state = f"{pak}/state"
-            backup = f"{state}/harness-backup"
-            remote.run(address, f"mkdir -p {shlex.quote(backup)}; "
-                       f"for f in {shlex.quote(pak + '/session.conf')} {shlex.quote(state + '/session')}; do "
+            state = NETPLAY_STATE
+            backup = f"{HARNESS_STATE}/session-backups"
+            legacy_backup = f"{pak}/state/harness-backup"
+            remote.run(address, f"mkdir -p {shlex.quote(str(Path(backup).parent))}; "
+                       f"test ! -d {shlex.quote(legacy_backup)} || "
+                       f"test -e {shlex.quote(backup)} || mv {shlex.quote(legacy_backup)} {shlex.quote(backup)}; "
+                       f"mkdir -p {shlex.quote(backup)}; "
+                       f"for f in {shlex.quote(state + '/session.conf')} {shlex.quote(state + '/session')}; do "
                        f"test ! -f \"$f\" || cp -p \"$f\" {shlex.quote(backup)}/; done",
                        jump=jump)
-            atomic_remote_file(remote, address, rendered[role], f"{pak}/session.conf", jump)
+            atomic_remote_file(remote, address, rendered[role], f"{state}/session.conf", jump)
             atomic_remote_file(remote, address, rendered[role], f"{state}/session", jump)
             print(f"{role} ({route_label(address, jump)}): armed session {session_id}")
     print(session_id)
@@ -545,9 +552,14 @@ def command_deploy(args):
             uploaded = f"/tmp/netplay-artifact-{uuid.uuid4().hex}"
             remote.upload(address, source, uploaded, jump=jump)
             parent = str(Path(destination).parent)
-            backup = f"/mnt/SDCARD/.userdata/{args.platform}/netplay-harness/backups/{stamp}/{args.artifact}"
+            backup = f"{HARNESS_STATE}/backups/{stamp}/{args.artifact}"
+            legacy = f"/mnt/SDCARD/.userdata/{args.platform}/netplay-harness"
             command = (
-                f"set -e; mkdir -p {shlex.quote(parent)} {shlex.quote(str(Path(backup).parent))}; "
+                f"set -e; mkdir -p {shlex.quote(HARNESS_STATE)}; "
+                f"if test -d {shlex.quote(legacy)}; then "
+                f"cp -Rp {shlex.quote(legacy)}/. {shlex.quote(HARNESS_STATE)}/ && "
+                f"rm -rf {shlex.quote(legacy)}; fi; "
+                f"mkdir -p {shlex.quote(parent)} {shlex.quote(str(Path(backup).parent))}; "
                 f"test ! -e {shlex.quote(destination)} || cp -p {shlex.quote(destination)} {shlex.quote(backup)}; "
                 f"chmod {mode} {shlex.quote(uploaded)}; mv {shlex.quote(uploaded)} {shlex.quote(destination)}; "
                 f"sync; sha256sum {shlex.quote(destination)}"
@@ -609,7 +621,7 @@ def command_collect(args):
                 f"/mnt/SDCARD/.userdata/{args.platform}/logs/MGBA.txt",
                 f"/mnt/SDCARD/.userdata/{args.platform}/logs/NDS.txt",
                 f"/mnt/SDCARD/.userdata/{args.platform}/logs/NDS-wifi-*.txt",
-                f"/mnt/SDCARD/Tools/{args.platform}/Netplay.pak/state/broker.log",
+                f"{NETPLAY_STATE}/broker.log",
             ]
             copied = []
             for source in sources:

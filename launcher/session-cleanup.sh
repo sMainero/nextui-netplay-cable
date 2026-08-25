@@ -12,7 +12,9 @@
 : "${NETPLAY_PAK:=$SDCARD_PATH/Tools/$PLATFORM/Netplay.pak}"
 : "${NETPLAY_BOOT_ID_PATH:=/proc/sys/kernel/random/boot_id}"
 
-STATE="$NETPLAY_PAK/state"
+NP="$NETPLAY_PAK"
+. "$NETPLAY_PAK/launcher/state-path.sh"
+STATE="$NETPLAY_STATE"
 SESSION="$STATE/session"
 [ -f "$SESSION" ] || exit 0
 
@@ -32,7 +34,7 @@ printf '%s stale session removed (boot %s -> %s)\n' \
 rm -f "$SESSION" "$STATE/broker.pid" "$STATE/broker.status" \
 	"$STATE/wifi_restore" "$STATE/wifi_powersave"
 
-# The bindings remain installed by design; without state/session they are pure
+# The bindings remain installed by design; without a shared session they are pure
 # passthrough. Only the armed Game Switcher view is derived session state.
 if [ -x "$NETPLAY_PAK/launcher/gameswitcher.sh" ]; then
 	SDCARD_PATH="$SDCARD_PATH" PLATFORM="$PLATFORM" NETPLAY_PAK="$NETPLAY_PAK" \

@@ -13,6 +13,15 @@ SPEC.loader.exec_module(HARNESS)
 
 
 class HarnessTests(unittest.TestCase):
+    def test_shared_state_layout(self):
+        self.assertEqual(HARNESS.NETPLAY_STATE,
+                         "/mnt/SDCARD/.userdata/shared/Netplay")
+        self.assertEqual(HARNESS.HARNESS_STATE,
+                         "/mnt/SDCARD/.userdata/shared/Netplay/netplay-harness")
+        probe = HARNESS.probe_script("tg5040")
+        self.assertIn(".userdata/shared/Netplay/session", probe)
+        self.assertNotIn("Netplay.pak/state/session", probe)
+
     def test_parse_beacon(self):
         fields = HARNESS.parse_beacon(b"devbridge host=brick ip=192.168.0.180 port=22 sftp=yes\n")
         self.assertEqual(fields["ip"], "192.168.0.180")

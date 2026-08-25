@@ -3305,8 +3305,11 @@ static bool locate_peer_rom(const uint8_t sha256[32], uint32_t size, uint32_t cr
 			if (!slash) break;
 			*slash = '\0';
 		}
-		if (trimmed == 4 && pak[0])
-			snprintf(cache_path, sizeof(cache_path), "%s/state/romscan.cache", pak);
+		if (trimmed == 4 && pak[0]) {
+			const char* state = getenv("NETPLAY_STATE");
+			if (state && state[0]) snprintf(cache_path, sizeof(cache_path), "%s/romscan.cache", state);
+			else snprintf(cache_path, sizeof(cache_path), "%s/state/romscan.cache", pak);
+		}
 	}
 	/* Without a usable pak directory the cache simply does not persist; the
 	 * search still works, it is only slower. */

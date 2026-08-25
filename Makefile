@@ -312,17 +312,11 @@ MGBA_ROM_DIR     := $(MGBA_PAK_STAGE)/Roms/Game Boy Advance (MGBA)
 
 mgba-pak:
 	@$(MAKE) --no-print-directory cores-mgba PLATFORMS=$(MGBA_PAK_PLATFORM)
-	@$(MAKE) --no-print-directory cores-mgba-dual PLATFORMS=$(MGBA_PAK_PLATFORM)
-	@$(MAKE) --no-print-directory shim PLATFORMS=$(MGBA_PAK_PLATFORM)
 	@rm -rf "$(MGBA_PAK_STAGE)"
 	@mkdir -p "$(MGBA_PAK_DIR)" "$(MGBA_ROM_DIR)"
 	@cp testing/MGBA.pak/launch.sh testing/MGBA.pak/default.cfg \
 		testing/MGBA.pak/README.txt "$(MGBA_PAK_DIR)/"
 	@cp dist/cores/$(MGBA_PAK_PLATFORM)/mgba_libretro.so "$(MGBA_PAK_DIR)/"
-	@cp dist/cores-experimental/$(MGBA_PAK_PLATFORM)/mgba_dual_libretro.so "$(MGBA_PAK_DIR)/"
-	@cp bin/$(MGBA_PAK_PLATFORM)/netplay_shim.so \
-		"$(MGBA_PAK_DIR)/netplay_shim.$(MGBA_PAK_PLATFORM).so"
-	@cp testing/frametime.sh testing/threadtime.sh "$(MGBA_PAK_DIR)/"
 	@cp testing/roms/README-mgba.txt "$(MGBA_ROM_DIR)/README.txt"
 	@chmod +x "$(MGBA_PAK_DIR)"/*.sh
 	@rm -f "$(MGBA_PAK_ARCHIVE)"
@@ -409,13 +403,13 @@ dist: dist-base dist-compatibility dist-full
 
 dist-base: $(BASE_DIST_CHECKS)
 	@rm -rf "$(BASE_STAGE)" "$(BASE_ARCHIVE)"
-	@mkdir -p "$(BASE_STAGE)/$(PAK)/launcher" "$(BASE_STAGE)/$(PAK)/state" dist
+	@mkdir -p "$(BASE_STAGE)/$(PAK)/launcher" dist
 
 	@cp pak.json "$(BASE_STAGE)/$(PAK)/"
 	@cp launcher/pak-launch.sh "$(BASE_STAGE)/$(PAK)/launch.sh"
 	@cp launcher/minarch.elf launcher/launch-stub.sh launcher/adhoc-join.sh launcher/wifi-watchdog.sh launcher/session-cleanup.sh \
 	    launcher/install-stubs.sh launcher/wrap-pak.sh launcher/bind-mount.sh launcher/pre-launch.sh \
-	    launcher/mount-common.sh launcher/gameswitcher.sh launcher/gameswitcher-launch.sh \
+	    launcher/mount-common.sh launcher/state-path.sh launcher/gameswitcher.sh launcher/gameswitcher-launch.sh launcher/mgba-manage.sh \
 	    "$(BASE_STAGE)/$(PAK)/launcher/"
 	@cp launcher/session.conf.example "$(BASE_STAGE)/$(PAK)/"
 	@mkdir -p "$(BASE_STAGE)/$(PAK)/cores/override"
@@ -424,6 +418,16 @@ dist-base: $(BASE_DIST_CHECKS)
 		cp dist/cores/$$p/gambatte_libretro.so dist/cores/$$p/gpsp_libretro.so \
 		   "$(BASE_STAGE)/$(PAK)/cores/override/$$p/"; \
 		cp dist/cores-experimental/$$p/gambatte_dual_libretro.so \
+		   "$(BASE_STAGE)/$(PAK)/cores/override/$$p/"; \
+	done
+	@for p in $(MGBA_PLATFORMS); do \
+		mkdir -p "$(BASE_STAGE)/$(PAK)/cores/mgba/$$p/MGBA.pak" \
+		             "$(BASE_STAGE)/$(PAK)/cores/override/$$p"; \
+		cp testing/MGBA.pak/launch.sh testing/MGBA.pak/default.cfg testing/MGBA.pak/README.txt \
+		   "$(BASE_STAGE)/$(PAK)/cores/mgba/$$p/MGBA.pak/"; \
+		cp dist/cores/$$p/mgba_libretro.so \
+		   "$(BASE_STAGE)/$(PAK)/cores/mgba/$$p/MGBA.pak/"; \
+		cp dist/cores-experimental/$$p/mgba_dual_libretro.so \
 		   "$(BASE_STAGE)/$(PAK)/cores/override/$$p/"; \
 	done
 	@for p in $(PLATFORMS); do \
@@ -460,6 +464,10 @@ check-netplay-cores:
 	done; \
 	test -f dist/cores-experimental/$$p/gambatte_dual_libretro.so || { \
 		echo "missing netplay core $$p/gambatte_dual - run 'make cores' first"; exit 1; }; \
+	done
+	@for p in $(MGBA_PLATFORMS); do \
+		test -f dist/cores/$$p/mgba_libretro.so || { echo "missing mGBA core $$p"; exit 1; }; \
+		test -f dist/cores-experimental/$$p/mgba_dual_libretro.so || { echo "missing mGBA dual core $$p"; exit 1; }; \
 	done
 
 check-shim-%:

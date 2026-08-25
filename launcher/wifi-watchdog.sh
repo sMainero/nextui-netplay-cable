@@ -12,7 +12,7 @@
 #
 #   * Started when a join succeeds, not at boot. A device that never uses ad hoc
 #     never runs this, so it costs nothing to have.
-#   * Exits as soon as state/wifi_restore is gone. That file is written when we
+#   * Exits as soon as the shared wifi_restore record is gone. It is written when we
 #     take the client stack down and removed when we put it back, so the
 #     watchdog's lifetime is exactly the window where stranding is possible.
 #   * Exits if we are already back on a normal network, cleaning up the record.
@@ -32,8 +32,9 @@ else
 	: "${PLATFORM:=tg5040}"
 	NP="$SDCARD_PATH/Tools/$PLATFORM/Netplay.pak"
 fi
+. "$NP/launcher/state-path.sh"
 
-RESTORE="$NP/state/wifi_restore"
+RESTORE="$NETPLAY_STATE/wifi_restore"
 LOCK="/tmp/netplay_watchdog.pid"
 RESTORE_LOCK="/tmp/netplay_wifi_restore.lock"
 HOST=10.0.0.1
@@ -45,7 +46,7 @@ MAX_CHECKS=${NETPLAY_WATCHDOG_MAX_CHECKS:-1440} # ~8h backstop
 
 # Own our output. Callers used to redirect, which forced them to know where the
 # log lives and left us tied to their descriptors.
-exec >>"$NP/state/watchdog.log" 2>&1
+exec >>"$NETPLAY_STATE/watchdog.log" 2>&1
 
 # Same HH:MM:SS.mmm shape as the C loggers so the three logs can be read
 # side by side. busybox date has no %N, so milliseconds come from
@@ -138,15 +139,15 @@ restore_wifi() {
 	# longer exist. End only that guest's session; bindings remain installed and
 	# therefore become passthrough. The role check is deliberately made after
 	# recovery so this detached process cannot tear down a host session.
-	_sess="$NP/state/session"
+	_sess="$NETPLAY_STATE/session"
 	if [ -f "$_sess" ] && grep -q '^role=client$' "$_sess" 2>/dev/null &&
 	   grep -q '^adhoc_ssid=' "$_sess" 2>/dev/null; then
-		rm -f "$_sess" "$NP/state/broker.pid" "$NP/state/broker.status"
+		rm -f "$_sess" "$NETPLAY_STATE/broker.pid" "$NETPLAY_STATE/broker.status"
 		if [ -x "$NP/launcher/gameswitcher.sh" ]; then
 			SDCARD_PATH="${SDCARD_PATH:-/mnt/SDCARD}" PLATFORM="${PLATFORM:-tg5040}" \
 			NETPLAY_PAK="$NP" sh "$NP/launcher/gameswitcher.sh" idle >/dev/null 2>&1
 		fi
-		_ps="$NP/state/wifi_powersave"
+		_ps="$NETPLAY_STATE/wifi_powersave"
 		[ "$(head -1 "$_ps" 2>/dev/null)" = on ] &&
 			iw dev wlan0 set power_save on >/dev/null 2>&1
 		rm -f "$_ps"

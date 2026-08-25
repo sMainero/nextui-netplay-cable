@@ -65,6 +65,21 @@ ROM, requested and selected core paths, role, process id, and normal exit
 status. A missing exit trailer indicates that the process or its wrapper was
 terminated without completing its normal shutdown path.
 
+### Durable state
+
+All mutable Netplay state lives outside the replaceable pak at:
+
+```
+/mnt/SDCARD/.userdata/shared/Netplay/
+```
+
+This includes settings, the session template and active session, broker status
+and logs, Wi-Fi recovery records, mount/stub ownership, Game Switcher backups,
+and the ROM scan cache. The test harness owns the nested `netplay-harness/`
+directory. On first use, the app and launcher migrate files from the historical
+`Netplay.pak/state/` location without replacing newer shared files; harness
+artifact backups likewise move from the old platform-specific userdata path.
+
 ### Also working on hardware
 
 - **Ad hoc networking**, end to end and in play. The Brick hosts on `wlan1`
