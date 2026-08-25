@@ -236,6 +236,14 @@ static void stage_instanced(void) {
 		                  (c->instanced == NS_INST_SELECTED && c->inst_core[i]);
 }
 
+/* Whether the mgba instanced core (inst_core[1]) is enabled by a settings
+ * snapshot. Single source of truth so the startup check, the staged-toggle
+ * check, and stage_instanced() cannot silently drift apart. */
+static bool mgba_instanced_enabled(const NS_Settings* c) {
+	return c->instanced == NS_INST_ALL ||
+	       (c->instanced == NS_INST_SELECTED && c->inst_core[1]);
+}
+
 static void setting_row(char* out, int len, int item) {
 	NS_Settings* c = NS_settings();
 	switch (item) {
@@ -748,8 +756,7 @@ int main(int argc, char* argv[]) {
 	 * enabled. Check once per setup-app launch; an ignored verdict is keyed to
 	 * both hashes, so it stays quiet only until either binary changes. */
 	NS_Settings* startup_settings = NS_settings();
-	bool startup_mgba = startup_settings->instanced == NS_INST_ALL ||
-	                    (startup_settings->instanced == NS_INST_SELECTED && startup_settings->inst_core[1]);
+	bool startup_mgba = mgba_instanced_enabled(startup_settings);
 	if (startup_mgba && NS_mgbaStatus(&mgba_status) &&
 	    mgba_status.mismatch && !mgba_status.mismatch_ignored) {
 		stage_instanced();
@@ -913,7 +920,9 @@ int main(int argc, char* argv[]) {
 					break;
 
 				case TOOL_OFF:
-					if (NS_mgbaStatus(&mgba_status) && mgba_status.managed) {
+					if (!NS_mgbaStatus(&mgba_status)) {
+						snprintf(status, sizeof(status), "Could not check mGBA status - try again.");
+					} else if (mgba_status.managed) {
 						restore_choice[0] = restore_choice[1] = restore_choice[2] = true;
 						restore_sel = 0;
 						restore_then_off = true;
@@ -943,10 +952,13 @@ int main(int argc, char* argv[]) {
 					stage_instanced();
 					inst_sel = 0;
 					screen = SCREEN_INSTANCED;
-					if (inst_staged[1] && NS_mgbaStatus(&mgba_status) &&
-					    mgba_status.mismatch && !mgba_status.mismatch_ignored) {
-						prompt_sel = 0;
-						screen = SCREEN_MGBA_MISMATCH;
+					if (inst_staged[1]) {
+						if (!NS_mgbaStatus(&mgba_status)) {
+							snprintf(status, sizeof(status), "Could not check mGBA status - try again.");
+						} else if (mgba_status.mismatch && !mgba_status.mismatch_ignored) {
+							prompt_sel = 0;
+							screen = SCREEN_MGBA_MISMATCH;
+						}
 					}
 					break;
 				}
@@ -993,10 +1005,10 @@ int main(int argc, char* argv[]) {
 				} else if (inst_sel < NS_INST_CORES) {
 					snprintf(status, sizeof(status), "%s is not installed.", NS_INST_CORE[inst_sel]);
 				} else {
-					bool old_mgba = NS_settings()->instanced != NS_INST_OFF &&
-					                (NS_settings()->instanced == NS_INST_ALL || NS_settings()->inst_core[1]);
-					NS_mgbaStatus(&mgba_status);
-					if (!old_mgba && inst_staged[1] &&
+					bool old_mgba = mgba_instanced_enabled(NS_settings());
+					if (!NS_mgbaStatus(&mgba_status)) {
+						snprintf(status, sizeof(status), "Could not check mGBA status - try again.");
+					} else if (!old_mgba && inst_staged[1] &&
 					    (!mgba_status.managed || mgba_status.missing || mgba_status.mismatch)) {
 						prompt_sel = 0; screen = SCREEN_MGBA_INSTALL;
 					} else if (old_mgba && !inst_staged[1] && mgba_status.managed) {

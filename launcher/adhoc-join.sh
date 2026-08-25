@@ -185,6 +185,13 @@ elif [ -f "$RESTORE" ]; then
 	# which is the same portable fallback used by the app and watchdog.
 	OLD_SUPPLICANT=$(head -1 "$RESTORE" 2>/dev/null)
 	if [ -n "$OLD_SUPPLICANT" ]; then
+		# Captured service commands are not guaranteed to daemonise themselves. A
+		# foreground supplicant here would block this script (and pre-launch.sh
+		# waiting on it) forever instead of returning.
+		case " $OLD_SUPPLICANT " in
+			*" -B "*) ;;
+			*) OLD_SUPPLICANT="$OLD_SUPPLICANT -B" ;;
+		esac
 		sh -c "$OLD_SUPPLICANT" >/dev/null 2>&1
 		w=1
 		while [ $w -le 10 ]; do

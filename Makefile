@@ -147,7 +147,7 @@ $(GPSP_STAMP): $(GPSP_PATCHES)
 	@patch -d "$(GPSP_SRC)" -p1 < cores/patches/gpsp-003-netplay-version.patch
 	@touch "$@"
 
-$(MGBA_STAMP): $(MGBA_PATCHES) $(MGBA_DUAL_FRONTEND)
+$(MGBA_STAMP): $(MGBA_PATCHES) $(MGBA_DUAL_FRONTEND) shim/include/gambatte_dual.h
 	@rm -rf "$(MGBA_SRC)"
 	@mkdir -p "$(CORE_SRC_ROOT)"
 	@git clone -q "$(MGBA_REPO)" "$(MGBA_SRC)"
@@ -155,6 +155,7 @@ $(MGBA_STAMP): $(MGBA_PATCHES) $(MGBA_DUAL_FRONTEND)
 	@patch -d "$(MGBA_SRC)" -p1 < cores/patches/mgba-platforms.patch
 	@patch -d "$(MGBA_SRC)" -p1 < cores/patches/mgba-001-build-lockstep-drivers.patch
 	@cp "$(MGBA_DUAL_FRONTEND)" "$(MGBA_SRC)/src/platform/libretro/libretro_dual.c"
+	@cp "shim/include/gambatte_dual.h" "$(MGBA_SRC)/src/platform/libretro/gambatte_dual.h"
 	@patch -d "$(MGBA_SRC)" -p1 < cores/patches/mgba-002-dual-frontend.patch
 	@touch "$@"
 
@@ -372,6 +373,7 @@ test:
 	@./cores/tests/mgbalockstep.sh
 	@./cores/tests/mgbadual.sh
 	@./testing/test-mgba-launch.sh
+	@./testing/test-mgba-manage.sh
 	@./testing/test-instanced-ui.sh
 	@./launcher/test.sh
 	@PYTHONDONTWRITEBYTECODE=1 python3 tools/test-netplay-harness.py
@@ -403,7 +405,7 @@ dist: dist-base dist-compatibility dist-full
 
 dist-base: $(BASE_DIST_CHECKS)
 	@rm -rf "$(BASE_STAGE)" "$(BASE_ARCHIVE)"
-	@mkdir -p "$(BASE_STAGE)/$(PAK)/launcher" dist
+	@mkdir -p "$(BASE_STAGE)/$(PAK)/launcher" "$(BASE_STAGE)/$(PAK)/state" dist
 
 	@cp pak.json "$(BASE_STAGE)/$(PAK)/"
 	@cp launcher/pak-launch.sh "$(BASE_STAGE)/$(PAK)/launch.sh"

@@ -433,6 +433,18 @@ static const char* cpufreq_root(void) {
 	return root && root[0] ? root : "/sys/devices/system/cpu";
 }
 
+static bool cpu_policy_path(char* out, size_t out_size,
+                            const char* policy, const char* leaf) {
+	size_t base_len = strnlen(policy, sizeof(cpu_saved[0].path));
+	size_t leaf_len = strlen(leaf);
+	if (base_len == sizeof(cpu_saved[0].path) || base_len + 1 + leaf_len + 1 > out_size)
+		return false;
+	memcpy(out, policy, base_len);
+	out[base_len] = '/';
+	memcpy(out + base_len + 1, leaf, leaf_len + 1);
+	return true;
+}
+
 static bool read_line_file(const char* path, char* out, size_t len) {
 	FILE* f = fopen(path, "r");
 	if (!f) return false;
@@ -511,16 +523,21 @@ static void cpu_pin_performance(void) {
 }
 
 static void cpu_restore(void) {
-	for (int i = 0; i < cpu_saved_count; i++) {
+	/* Keep the array bound explicit here. cpu_saved_count is populated by the
+	 * bounded discovery loop, but stating that invariant in this consumer also
+	 * prevents a corrupted count from walking adjacent saved paths. */
+	int restore_count = cpu_saved_count;
+	if (restore_count > CPU_MAX_POLICIES) restore_count = CPU_MAX_POLICIES;
+	for (int i = 0; i < restore_count; i++) {
 		char path[192];
-		snprintf(path, sizeof(path), "%s/scaling_governor", cpu_saved[i].path);
-		write_line_file(path, cpu_saved[i].governor);
+		if (cpu_policy_path(path, sizeof(path), cpu_saved[i].path, "scaling_governor"))
+			write_line_file(path, cpu_saved[i].governor);
 		if (cpu_saved[i].min_freq[0]) {
-			snprintf(path, sizeof(path), "%s/scaling_min_freq", cpu_saved[i].path);
-			write_line_file(path, cpu_saved[i].min_freq);
+			if (cpu_policy_path(path, sizeof(path), cpu_saved[i].path, "scaling_min_freq"))
+				write_line_file(path, cpu_saved[i].min_freq);
 		}
 	}
-	if (cpu_saved_count)
+	if (restore_count)
 		shim_log("restored CPU scaling to '%s'\n", cpu_saved[0].governor);
 	cpu_saved_count = 0;
 }

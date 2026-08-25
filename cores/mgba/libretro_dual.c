@@ -8,6 +8,7 @@
  * core.
  */
 #include "libretro.h"
+#include "gambatte_dual.h"
 
 #include <mgba/core/config.h>
 #include <mgba/core/core.h>
@@ -31,17 +32,21 @@
 #include <string.h>
 #include <time.h>
 
-#define DUAL_ABI_VERSION 2u
-#define DUAL_SUBSYSTEM_ID 0x47424c43u
+/* Sourced from the shared shim/include/gambatte_dual.h (copied alongside this
+ * file into the mgba source tree by the Makefile) so the ABI version and
+ * capability bits cannot drift from what shim.c's core_has_dual_contract()
+ * checks against. */
+#define DUAL_ABI_VERSION GAMBATTE_DUAL_ABI_VERSION
+#define DUAL_SUBSYSTEM_ID GAMBATTE_DUAL_SUBSYSTEM_ID
 #define DUAL_MAGIC 0x4d474244u /* MGBD */
 #define DUAL_STATE_VERSION 1u
 
-#define DUAL_CAP_TWO_CONTENTS      (1u << 0)
-#define DUAL_CAP_CONSOLE_MEMORY    (1u << 1)
-#define DUAL_CAP_VISIBLE_CONSOLE   (1u << 2)
-#define DUAL_CAP_PAIRED_CHECKPOINT (1u << 3)
-#define DUAL_CAP_TARGETED_RESET    (1u << 4)
-#define DUAL_CAP_CLOCK_EPOCHS      (1u << 5)
+#define DUAL_CAP_TWO_CONTENTS      GAMBATTE_DUAL_CAP_TWO_CONTENTS
+#define DUAL_CAP_CONSOLE_MEMORY    GAMBATTE_DUAL_CAP_CONSOLE_MEMORY
+#define DUAL_CAP_VISIBLE_CONSOLE   GAMBATTE_DUAL_CAP_VISIBLE_CONSOLE
+#define DUAL_CAP_PAIRED_CHECKPOINT GAMBATTE_DUAL_CAP_PAIRED_CHECKPOINT
+#define DUAL_CAP_TARGETED_RESET    GAMBATTE_DUAL_CAP_TARGETED_RESET
+#define DUAL_CAP_CLOCK_EPOCHS      GAMBATTE_DUAL_CAP_CLOCK_EPOCHS
 
 #define NCONSOLES 2
 #define VIDEO_STRIDE 256
@@ -66,6 +71,7 @@ struct DualConsole {
 	struct mLockstepUser user;
 	struct mAudioBuffer resample_buffer;
 	struct mAudioResampler resampler;
+	unsigned resampler_source_rate;
 	mColor* video;
 	void* rom_data;
 	size_t rom_size;
@@ -330,13 +336,19 @@ static void drain_audio(unsigned visible) {
 	unsigned i;
 	for (i = 0; i < NCONSOLES; ++i) {
 		struct mAudioBuffer* buffer = consoles[i].core->getAudioBuffer(consoles[i].core);
-		if (i == visible && consoles[i].core->audioSampleRate(consoles[i].core) !=
-		    audio_output_rate) {
-			mAudioResamplerSetSource(&consoles[i].resampler, buffer,
-			                         consoles[i].core->audioSampleRate(consoles[i].core),
-			                         true);
-			mAudioResamplerProcess(&consoles[i].resampler);
-			buffer = &consoles[i].resample_buffer;
+		if (i == visible) {
+			unsigned source_rate = consoles[i].core->audioSampleRate(consoles[i].core);
+			if (source_rate != audio_output_rate) {
+				/* Reconfiguring the resampler source is not free; only do it when
+				 * the core's rate actually changed instead of on every frame. */
+				if (source_rate != consoles[i].resampler_source_rate) {
+					mAudioResamplerSetSource(&consoles[i].resampler, buffer,
+					                         source_rate, true);
+					consoles[i].resampler_source_rate = source_rate;
+				}
+				mAudioResamplerProcess(&consoles[i].resampler);
+				buffer = &consoles[i].resample_buffer;
+			}
 		}
 		size_t available;
 		while ((available = mAudioBufferAvailable(buffer)) != 0) {

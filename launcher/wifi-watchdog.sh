@@ -142,11 +142,7 @@ restore_wifi() {
 	_sess="$NETPLAY_STATE/session"
 	if [ -f "$_sess" ] && grep -q '^role=client$' "$_sess" 2>/dev/null &&
 	   grep -q '^adhoc_ssid=' "$_sess" 2>/dev/null; then
-		rm -f "$_sess" "$NETPLAY_STATE/broker.pid" "$NETPLAY_STATE/broker.status"
-		if [ -x "$NP/launcher/gameswitcher.sh" ]; then
-			SDCARD_PATH="${SDCARD_PATH:-/mnt/SDCARD}" PLATFORM="${PLATFORM:-tg5040}" \
-			NETPLAY_PAK="$NP" sh "$NP/launcher/gameswitcher.sh" idle >/dev/null 2>&1
-		fi
+		netplay_end_session "$_sess"
 		_ps="$NETPLAY_STATE/wifi_powersave"
 		[ "$(head -1 "$_ps" 2>/dev/null)" = on ] &&
 			iw dev wlan0 set power_save on >/dev/null 2>&1

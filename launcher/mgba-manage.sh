@@ -9,7 +9,7 @@ set -u
 
 SDCARD_PATH=${SDCARD_PATH:-/mnt/SDCARD}
 NETPLAY_PAK=${NETPLAY_PAK:-"$SDCARD_PATH/Tools/${PLATFORM:-tg5040}/Netplay.pak"}
-NETPLAY_STATE=${NETPLAY_STATE:-"$SDCARD_PATH/.userdata/shared/Netplay"}
+. "$NETPLAY_PAK/launcher/state-path.sh"
 MGBA_STATE="$NETPLAY_STATE/mgba"
 MANIFEST="$MGBA_STATE/install.manifest"
 IGNORE_DIR="$MGBA_STATE/ignored-hashes"
@@ -154,7 +154,7 @@ install() {
 			say "installed_at=$_human"
 		} > "$_tmp/.netplay-installed" || exit 1
 		mv "$_tmp" "$_dst" || exit 1
-		if [ "$_reinstall" = 0 ]; then
+		if [ "$_reinstall" = 0 ] || ! grep -q "^platform=$_p\$" "$_tmp_manifest"; then
 			say "platform=$_p" >> "$_tmp_manifest"
 			say "backup.$_p=$_backup" >> "$_tmp_manifest"
 			say "installed_sha.$_p=$_actual" >> "$_tmp_manifest"
@@ -201,11 +201,14 @@ restore() {
 	_restore_pak=${2:-1}; _restore_saves=${3:-1}; _restore_states=${4:-1}
 	[ -f "$MANIFEST" ] || { say "ok=1"; return 0; }
 	_stamp=$(date '+%Y-%m-%d_%H-%M-%S')
-	_snapshot=$(manifest_value snapshot)
+	# Read once: backup_path_for()/manifest_value() would otherwise re-open and
+	# re-sed the whole file for every platform below.
+	_manifest_content=$(cat "$MANIFEST" 2>/dev/null)
+	_snapshot=$(printf '%s\n' "$_manifest_content" | sed -n 's/^snapshot=//p' | tail -n 1)
 	if [ "$_restore_pak" = 1 ]; then
-		for _p in $(managed_platforms); do
+		for _p in $(printf '%s\n' "$_manifest_content" | sed -n 's/^platform=//p'); do
 			_dst="$SDCARD_PATH/Emus/$_p/MGBA.pak"
-			_backup=$(backup_path_for "$_p" 2>/dev/null || true)
+			_backup=$(printf '%s\n' "$_manifest_content" | sed -n "s/^backup.$_p=//p" | tail -n 1)
 			# Only remove a pak that carries our ownership marker. A user replacing
 			# it after installation is never treated as disposable.
 			if [ -f "$_dst/.netplay-installed" ] &&

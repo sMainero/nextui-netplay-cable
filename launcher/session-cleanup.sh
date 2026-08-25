@@ -31,15 +31,11 @@ printf '%s stale session removed (boot %s -> %s)\n' \
 	"$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$recorded" "$current" \
 	>> "$STATE/cleanup.log"
 
-rm -f "$SESSION" "$STATE/broker.pid" "$STATE/broker.status" \
-	"$STATE/wifi_restore" "$STATE/wifi_powersave"
+rm -f "$STATE/wifi_restore" "$STATE/wifi_powersave"
 
 # The bindings remain installed by design; without a shared session they are pure
 # passthrough. Only the armed Game Switcher view is derived session state.
-if [ -x "$NETPLAY_PAK/launcher/gameswitcher.sh" ]; then
-	SDCARD_PATH="$SDCARD_PATH" PLATFORM="$PLATFORM" NETPLAY_PAK="$NETPLAY_PAK" \
-		sh "$NETPLAY_PAK/launcher/gameswitcher.sh" idle >/dev/null 2>&1
-fi
+netplay_end_session "$SESSION"
 
 # Distinct from failure so the UI can report that cleanup occurred.
 exit 10

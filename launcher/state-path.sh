@@ -26,3 +26,15 @@ if [ -n "$NETPLAY_PAK" ] && [ -f "$NETPLAY_PAK/session.conf" ] &&
 	mv "$NETPLAY_PAK/session.conf" "$NETPLAY_STATE/session.conf" 2>/dev/null || :
 fi
 export NETPLAY_STATE
+
+# Remove a session file and its broker bookkeeping, then idle Game Switcher.
+# Shared by session-cleanup.sh and wifi-watchdog.sh so the set of files that
+# make up "session ended" state cannot go out of sync between the two.
+netplay_end_session() {
+	rm -f "$1" "$NETPLAY_STATE/broker.pid" "$NETPLAY_STATE/broker.status"
+	if [ -x "$NETPLAY_PAK/launcher/gameswitcher.sh" ]; then
+		SDCARD_PATH="${SDCARD_PATH:-/mnt/SDCARD}" PLATFORM="${PLATFORM:-tg5040}" \
+			NETPLAY_PAK="$NETPLAY_PAK" \
+			sh "$NETPLAY_PAK/launcher/gameswitcher.sh" idle >/dev/null 2>&1
+	fi
+}
