@@ -49,7 +49,7 @@ WSL -> host LAN address -> guest ad-hoc address:22
 
 The host stays directly reachable because Netplay leaves its station interface
 on the house LAN while a second interface serves `10.0.0.1/24`. The guest
-address comes from `state/broker.status`, with `/proc/net/arp` as a fallback.
+address comes from `.userdata/shared/Netplay/broker.status`, with `/proc/net/arp` as a fallback.
 No IP forwarding, subnet route, or relayed guest beacon is required.
 
 Inspect the selected path at any time:
@@ -84,8 +84,8 @@ python3 tools/netplay-harness.py session \
   --host 192.168.0.180 --client 192.168.0.144 --mode link
 ```
 
-The command prints the ID. Existing `session.conf` and `state/session` files
-are copied to `state/harness-backup/` before replacement. Extra experimental
+The command prints the ID. Existing `session.conf` and shared `Netplay/session` files
+are copied to `.userdata/shared/Netplay/netplay-harness/session-backups/` before replacement. Extra experimental
 keys can be supplied with repeatable `--set key=value` options.
 
 ## Artifact deployment
@@ -103,7 +103,7 @@ python3 tools/netplay-harness.py deploy \
 ```
 
 The old file is backed up below
-`.userdata/<platform>/netplay-harness/backups/<timestamp>/`, replacement is an
+`.userdata/shared/Netplay/netplay-harness/backups/<timestamp>/`, replacement is an
 atomic rename, and the remote SHA-256 must equal the local digest. Available
 artifact names are shown by `deploy --help`.
 

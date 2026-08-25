@@ -28,6 +28,9 @@ typedef enum {
 	SCREEN_SETTINGS,
 	SCREEN_DEBUG,
 	SCREEN_INSTANCED,
+	SCREEN_MGBA_INSTALL,
+	SCREEN_MGBA_MISMATCH,
+	SCREEN_MGBA_RESTORE,
 	SCREEN_CHECKS,
 	SCREEN_JOINING,
 } Screen;
@@ -197,6 +200,41 @@ static const char* tool_label(int item) {
 static int settings_sel = 0;
 static int debug_sel = 0;
 static int inst_sel = 0;
+static bool inst_staged[NS_INST_CORES];
+static int prompt_sel = 0;
+static int restore_sel = 0;
+static bool restore_choice[3] = { true, true, true };
+static bool restore_then_off = false;
+static NS_MgbaStatus mgba_status;
+
+static void commit_instanced(void) {
+	NS_Settings* c = NS_settings();
+	int enabled = 0;
+	for (int i = 0; i < NS_INST_CORES; i++) {
+		c->inst_core[i] = inst_staged[i];
+		if (inst_staged[i]) enabled++;
+	}
+	c->instanced = enabled ? NS_INST_SELECTED : NS_INST_OFF;
+	NS_settingsSave();
+}
+
+static void disable_mgba_setting(void) {
+	NS_Settings* c = NS_settings();
+	if (c->instanced == NS_INST_ALL) {
+		c->instanced = NS_INST_SELECTED;
+		c->inst_core[0] = true;
+	}
+	c->inst_core[1] = false;
+	if (!c->inst_core[0]) c->instanced = NS_INST_OFF;
+	NS_settingsSave();
+}
+
+static void stage_instanced(void) {
+	NS_Settings* c = NS_settings();
+	for (int i = 0; i < NS_INST_CORES; i++)
+		inst_staged[i] = c->instanced == NS_INST_ALL ||
+		                  (c->instanced == NS_INST_SELECTED && c->inst_core[i]);
+}
 
 static void setting_row(char* out, int len, int item) {
 	NS_Settings* c = NS_settings();
@@ -208,16 +246,10 @@ static void setting_row(char* out, int len, int item) {
 		snprintf(out, len, "Use compatibility cores:  %s", c->compatibility_cores ? "Yes" : "No");
 		break;
 	case SET_INSTANCED:
-		switch (c->instanced) {
-		case NS_INST_OFF:      snprintf(out, len, "Use instanced cores:  No"); break;
-		case NS_INST_ALL:      snprintf(out, len, "Use instanced cores:  Yes (supported)"); break;
-		case NS_INST_SELECTED: {
-			int n = 0;
+		{ int n = c->instanced == NS_INST_ALL ? NS_INST_CORES : 0;
+		  if (c->instanced == NS_INST_SELECTED)
 			for (int i = 0; i < NS_INST_CORES; i++) if (c->inst_core[i]) n++;
-			snprintf(out, len, "Use instanced cores:  %d selected  >", n);
-			break;
-		}
-		}
+		  snprintf(out, len, "Use instanced cores:  %d  >", n); }
 		break;
 	case SET_GAMESWITCHER:
 		snprintf(out, len, "Add Netplay to GameSwitcher:  %s", c->add_gameswitcher ? "Yes" : "No");
@@ -293,6 +325,17 @@ static const char* progress_note  = "This can take up to a minute.";
 static void set_progress(const char* title, const char* note) {
 	progress_title = title;
 	progress_note  = note;
+}
+
+static void turn_off_now(void) {
+	set_progress("Turning off", "Putting WiFi back.");
+	NS_disarm();
+	set_progress("Joining", "This can take up to a minute.");
+	NS_announceStop();
+	NS_hotspotStop();
+	hosting_hotspot = 0;
+	snprintf(status, sizeof(status), "Netplay off. Launches are stock again.");
+	screen = SCREEN_MENU;
 }
 
 static void draw_progress(const char* stage, int step, int steps) {
@@ -448,20 +491,65 @@ static void render(SDL_Surface* s) {
 	case SCREEN_INSTANCED: {
 		draw_title(s, "Instanced cores");
 		int y = SCALE1(PADDING + 44);
-		NS_Settings* c = NS_settings();
 		for (int i = 0; i < NS_INST_CORES; i++) {
 			char row[128];
 			bool have = NS_coreInstalled(NS_INST_CORE[i]);
-			snprintf(row, sizeof(row), "[%s] %s%s%s",
-			         c->inst_core[i] ? "x" : " ", NS_INST_CORE[i],
-			         have ? "" : "  (not installed)",
-			         NS_INST_IMPLEMENTED[i] ? "" : "  (planned)");
+			snprintf(row, sizeof(row), "[%s] %s%s",
+			         inst_staged[i] ? "x" : " ", NS_INST_CORE[i],
+			         have ? "" : "  (not installed)");
 			y = draw_row(s, row, y, i == inst_sel);
 		}
+		y = draw_row(s, "Save", y, inst_sel == NS_INST_CORES);
 		y += SCALE1(6);
-		y = draw_line(s, "Only link-cable cores can be instanced -", y, COLOR_GRAY, true);
-		draw_line(s, "a shared-screen core is already one instance.", y, COLOR_GRAY, true);
-		GFX_blitButtonGroup((char*[]){"B", "BACK", "A", "TOGGLE", NULL}, 1, s, 1);
+		y = draw_line(s, "Changes take effect only after Save.", y, COLOR_GRAY, true);
+		GFX_blitButtonGroup((char*[]){"B", "CANCEL", "A", "SELECT", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_MGBA_INSTALL: {
+		draw_title(s, "Install instanced mGBA?");
+		int y = SCALE1(PADDING + 44);
+		y = draw_line(s, "Instanced MGBA requires installation.", y, COLOR_WHITE, true);
+		if (mgba_status.installed) {
+			y = draw_line(s, "Your current MGBA.pak, saves and savestates", y, COLOR_WHITE, true);
+			y = draw_line(s, "will be backed up.", y, COLOR_WHITE, true);
+		}
+		y = draw_line(s, "MGBA will be installed for every platform", y, COLOR_WHITE, true);
+		y = draw_line(s, "on your device. Continue?", y, COLOR_WHITE, true);
+		y += SCALE1(5);
+		y = draw_row(s, "Continue", y, prompt_sel == 0);
+		draw_row(s, "Cancel", y, prompt_sel == 1);
+		GFX_blitButtonGroup((char*[]){"B", "CANCEL", "A", "SELECT", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_MGBA_MISMATCH: {
+		draw_title(s, "mGBA build changed");
+		int y = SCALE1(PADDING + 44);
+		y = draw_line(s, "The installed mgba_libretro.so does not match", y, COLOR_WHITE, true);
+		y = draw_line(s, "the paired build supplied by Netplay.", y, COLOR_WHITE, true);
+		y = draw_line(s, "Reinstall instanced MGBA?", y, COLOR_WHITE, true);
+		y += SCALE1(5);
+		y = draw_row(s, "Reinstall", y, prompt_sel == 0);
+		draw_row(s, "Ignore this build", y, prompt_sel == 1);
+		GFX_blitButtonGroup((char*[]){"B", "IGNORE", "A", "SELECT", NULL}, 1, s, 1);
+		break;
+	}
+	case SCREEN_MGBA_RESTORE: {
+		draw_title(s, "Restore mGBA backup?");
+		int y = SCALE1(PADDING + 42);
+		char line[128];
+		snprintf(line, sizeof(line), "Backup created: %s",
+		         mgba_status.backup_date[0] ? mgba_status.backup_date : "unknown date");
+		y = draw_line(s, line, y, COLOR_GRAY, true);
+		const char* names[3] = { "Restore MGBA from backup?", "Restore saves from backup?", "Restore save states from backup?" };
+		for (int i = 0; i < 3; i++) {
+			snprintf(line, sizeof(line), "%s  %s", names[i], restore_choice[i] ? "Yes" : "No");
+			y = draw_row(s, line, y, restore_sel == i);
+		}
+		y = draw_row(s, "Apply", y, restore_sel == 3);
+		y = draw_row(s, "Keep installed MGBA", y, restore_sel == 4);
+		y = draw_line(s, "Restoring saves/save states may overwrite progress.", y + SCALE1(3), COLOR_GRAY, true);
+		draw_line(s, "Overwritten files move to .userdata/shared/Netplay.", y, COLOR_GRAY, true);
+		GFX_blitButtonGroup((char*[]){"B", "CANCEL", "A", "SELECT", NULL}, 1, s, 1);
 		break;
 	}
 	case SCREEN_CHECKS: {
@@ -620,8 +708,8 @@ int main(int argc, char* argv[]) {
 	PWR_init();
 	/* NextUI launches every pak at the performance ceiling. This setup UI and
 	 * its detached broker are low-duty control-plane work; use the platform's
-	 * normal menu profile instead (schedutil on tg5040, conservative on A30).
-	 * The game shim still pins performance only while an armed game runs. */
+	 * normal menu profile instead. Gameplay still pins performance only while
+	 * an armed emulator process is running. */
 	PWR_setCPUSpeed(CPU_SPEED_MENU);
 	InitSettings();
 
@@ -655,6 +743,18 @@ int main(int argc, char* argv[]) {
 		} else {
 			snprintf(status, sizeof(status), "A session is already set up.");
 		}
+	}
+	/* An installed pak can be replaced by an updater while the setting remains
+	 * enabled. Check once per setup-app launch; an ignored verdict is keyed to
+	 * both hashes, so it stays quiet only until either binary changes. */
+	NS_Settings* startup_settings = NS_settings();
+	bool startup_mgba = startup_settings->instanced == NS_INST_ALL ||
+	                    (startup_settings->instanced == NS_INST_SELECTED && startup_settings->inst_core[1]);
+	if (startup_mgba && NS_mgbaStatus(&mgba_status) &&
+	    mgba_status.mismatch && !mgba_status.mismatch_ignored) {
+		stage_instanced();
+		prompt_sel = 0;
+		screen = SCREEN_MGBA_MISMATCH;
 	}
 
 	int dirty = 1;
@@ -813,14 +913,12 @@ int main(int argc, char* argv[]) {
 					break;
 
 				case TOOL_OFF:
-					set_progress("Turning off", "Putting WiFi back.");
-					NS_disarm();
-					set_progress("Joining", "This can take up to a minute.");
-					NS_announceStop();
-					NS_hotspotStop();
-					hosting_hotspot = 0;
-					snprintf(status, sizeof(status), "Netplay off. Launches are stock again.");
-					screen = SCREEN_MENU;
+					if (NS_mgbaStatus(&mgba_status) && mgba_status.managed) {
+						restore_choice[0] = restore_choice[1] = restore_choice[2] = true;
+						restore_sel = 0;
+						restore_then_off = true;
+						screen = SCREEN_MGBA_RESTORE;
+					} else turn_off_now();
 					break;
 				}
 				dirty = 1;
@@ -842,17 +940,17 @@ int main(int argc, char* argv[]) {
 					break;
 				case SET_GAMESWITCHER: c->add_gameswitcher = !c->add_gameswitcher; break;
 				case SET_INSTANCED:
-					/* Cycles No -> Yes (all) -> pick, and the third state opens
-					 * the picker rather than being a dead label. */
-					switch (c->instanced) {
-					case NS_INST_OFF:      c->instanced = NS_INST_ALL; break;
-					case NS_INST_ALL:      c->instanced = NS_INST_SELECTED;
-					                       screen = SCREEN_INSTANCED; inst_sel = 0; break;
-					case NS_INST_SELECTED: c->instanced = NS_INST_OFF; break;
+					stage_instanced();
+					inst_sel = 0;
+					screen = SCREEN_INSTANCED;
+					if (inst_staged[1] && NS_mgbaStatus(&mgba_status) &&
+					    mgba_status.mismatch && !mgba_status.mismatch_ignored) {
+						prompt_sel = 0;
+						screen = SCREEN_MGBA_MISMATCH;
 					}
 					break;
 				}
-				NS_settingsSave();
+				if (settings_sel != SET_INSTANCED) NS_settingsSave();
 				dirty = 1;
 			}
 			break;
@@ -886,24 +984,86 @@ int main(int argc, char* argv[]) {
 		}
 
 		case SCREEN_INSTANCED: {
-			NS_Settings* c = NS_settings();
-			if (PAD_justPressed(BTN_UP))   { inst_sel = (inst_sel + NS_INST_CORES - 1) % NS_INST_CORES; dirty = 1; }
-			if (PAD_justPressed(BTN_DOWN)) { inst_sel = (inst_sel + 1) % NS_INST_CORES; dirty = 1; }
+			if (PAD_justPressed(BTN_UP))   { inst_sel = (inst_sel + NS_INST_CORES) % (NS_INST_CORES + 1); dirty = 1; }
+			if (PAD_justPressed(BTN_DOWN)) { inst_sel = (inst_sel + 1) % (NS_INST_CORES + 1); dirty = 1; }
 			if (PAD_justPressed(BTN_B))    { screen = SCREEN_SETTINGS; dirty = 1; }
 			if (PAD_justPressed(BTN_A)) {
-				if (!NS_INST_IMPLEMENTED[inst_sel]) {
-					snprintf(status, sizeof(status), "%s instancing is not implemented yet.",
-					         NS_INST_CORE[inst_sel]);
-				} else if (NS_coreInstalled(NS_INST_CORE[inst_sel])) {
-					c->inst_core[inst_sel] = !c->inst_core[inst_sel];
-					NS_settingsSave();
-				} else {
+				if (inst_sel < NS_INST_CORES && NS_coreInstalled(NS_INST_CORE[inst_sel])) {
+					inst_staged[inst_sel] = !inst_staged[inst_sel];
+				} else if (inst_sel < NS_INST_CORES) {
 					snprintf(status, sizeof(status), "%s is not installed.", NS_INST_CORE[inst_sel]);
+				} else {
+					bool old_mgba = NS_settings()->instanced != NS_INST_OFF &&
+					                (NS_settings()->instanced == NS_INST_ALL || NS_settings()->inst_core[1]);
+					NS_mgbaStatus(&mgba_status);
+					if (!old_mgba && inst_staged[1] &&
+					    (!mgba_status.managed || mgba_status.missing || mgba_status.mismatch)) {
+						prompt_sel = 0; screen = SCREEN_MGBA_INSTALL;
+					} else if (old_mgba && !inst_staged[1] && mgba_status.managed) {
+						restore_choice[0] = restore_choice[1] = restore_choice[2] = true;
+						restore_sel = 0; restore_then_off = false;
+						screen = SCREEN_MGBA_RESTORE;
+					} else {
+						commit_instanced(); screen = SCREEN_SETTINGS;
+					}
 				}
 				dirty = 1;
 			}
 			break;
 		}
+
+		case SCREEN_MGBA_INSTALL:
+			if (PAD_justPressed(BTN_UP) || PAD_justPressed(BTN_DOWN)) { prompt_sel = !prompt_sel; dirty = 1; }
+			if (PAD_justPressed(BTN_B)) { screen = SCREEN_INSTANCED; dirty = 1; }
+			if (PAD_justPressed(BTN_A)) {
+				if (prompt_sel == 0) {
+					set_progress("Installing mGBA", "Backing up files and verifying cores.");
+					if (NS_mgbaInstall(status, sizeof(status))) {
+						commit_instanced(); snprintf(status, sizeof(status), "Instanced mGBA installed.");
+						screen = SCREEN_SETTINGS;
+					} else screen = SCREEN_INSTANCED;
+				} else screen = SCREEN_INSTANCED;
+				dirty = 1;
+			}
+			break;
+
+		case SCREEN_MGBA_MISMATCH:
+			if (PAD_justPressed(BTN_UP) || PAD_justPressed(BTN_DOWN)) { prompt_sel = !prompt_sel; dirty = 1; }
+			if (PAD_justPressed(BTN_B)) {
+				NS_mgbaIgnoreMismatch(status, sizeof(status)); screen = SCREEN_INSTANCED; dirty = 1;
+			}
+			if (PAD_justPressed(BTN_A)) {
+				if (prompt_sel == 0) {
+					set_progress("Reinstalling mGBA", "Preserving your original backup.");
+					if (!NS_mgbaInstall(status, sizeof(status))) screen = SCREEN_INSTANCED;
+					else { snprintf(status, sizeof(status), "Instanced mGBA reinstalled."); screen = SCREEN_INSTANCED; }
+				} else { NS_mgbaIgnoreMismatch(status, sizeof(status)); screen = SCREEN_INSTANCED; }
+				dirty = 1;
+			}
+			break;
+
+		case SCREEN_MGBA_RESTORE:
+			if (PAD_justPressed(BTN_UP))   { restore_sel = (restore_sel + 4) % 5; dirty = 1; }
+			if (PAD_justPressed(BTN_DOWN)) { restore_sel = (restore_sel + 1) % 5; dirty = 1; }
+			if (PAD_justPressed(BTN_B)) {
+				if (restore_then_off) turn_off_now(); else screen = SCREEN_INSTANCED;
+				dirty = 1;
+			}
+			if (PAD_justPressed(BTN_A)) {
+				if (restore_sel < 3) restore_choice[restore_sel] = !restore_choice[restore_sel];
+				else if (restore_sel == 3) {
+					set_progress("Restoring mGBA", "Preserving files that would be overwritten.");
+					if (NS_mgbaRestore(restore_choice[0], restore_choice[1], restore_choice[2], status, sizeof(status))) {
+						if (!restore_then_off) { inst_staged[1] = false; commit_instanced(); screen = SCREEN_SETTINGS; }
+						else { if (restore_choice[0]) disable_mgba_setting(); turn_off_now(); }
+					} else screen = SCREEN_MGBA_RESTORE;
+				} else {
+					if (!restore_then_off) { inst_staged[1] = false; commit_instanced(); screen = SCREEN_SETTINGS; }
+					else turn_off_now();
+				}
+				dirty = 1;
+			}
+			break;
 
 		case SCREEN_CHECKS:
 			/* This screen had no input case at all: it drew "B BACK" and

@@ -24,10 +24,12 @@ SESSION="$1"
 ROLE=$(sed -n 's/^role=//p' "$SESSION" | head -1)
 [ "$ROLE" = "client" ] || exit 0
 
-# Derive our own paths. launch-stub.sh sets NETPLAY_PAK but does not export it,
-# and this runs as a separate process - so taking it from the session path is
-# the only thing guaranteed to be right.
-NETPLAY_PAK=$(dirname "$(dirname "$SESSION")")
+# The session now lives in shared userdata, so it no longer identifies a
+# platform pak. Callers export NETPLAY_PAK; retain defaults for manual use.
+: "${SDCARD_PATH:=/mnt/SDCARD}"
+: "${PLATFORM:=tg5040}"
+: "${NETPLAY_PAK:=$SDCARD_PATH/Tools/$PLATFORM/Netplay.pak}"
+. "$NETPLAY_PAK/launcher/state-path.sh"
 
 SSID=$(sed -n 's/^adhoc_ssid=//p' "$SESSION" | head -1)
 PSK=$(sed -n 's/^adhoc_psk=//p' "$SESSION" | head -1)
@@ -96,7 +98,7 @@ EOF
 # whose joining was done by the stub had no recovery breadcrumb at all and no
 # watchdog: the two mechanisms meant to prevent stranding were simply never
 # armed. That is exactly what happened in testing.
-RESTORE="$NETPLAY_PAK/state/wifi_restore"
+RESTORE="$NETPLAY_STATE/wifi_restore"
 if [ ! -f "$RESTORE" ]; then
 	for d in /proc/[0-9]*; do
 		a0=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | head -1)

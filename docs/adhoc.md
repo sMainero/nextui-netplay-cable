@@ -219,7 +219,7 @@ only. Guessing this is not viable: the original code assumed
 tearing the stack down there left the device with nothing that knew how to
 undo it.
 
-The captured command is persisted to `state/wifi_restore`. Holding it only in
+The captured command is persisted to `.userdata/shared/Netplay/wifi_restore`. Holding it only in
 memory meant it vanished the moment the app exited — which is exactly when a
 device is stranded and needs it.
 
@@ -269,7 +269,7 @@ replay of the identical command succeeded. The ending-session UI names the
 recovery is continuing rather than looking like a reconnect to ad hoc.
 
 **The breadcrumb is removed only on success.** `NS_wifiRecoverIfStranded` and
-`NS_wifiRestore` both used to `remove(state/wifi_restore)` unconditionally after
+`NS_wifiRestore` both used to remove the shared `wifi_restore` record unconditionally after
 restoring. A restore that timed out therefore deleted the sole record telling the
 watchdog and the next app launch that a restore was still owed — permanent
 stranding, arriving exactly when recovery matters most. Whatever else changes
@@ -342,7 +342,7 @@ present.
 | Client joins, then is back on the house network by the time the game runs | The platform re-establishes its Wi-Fi when the app exits | Re-join from the launch stub |
 | Device left with no network and no way back | Restore assumed `wifi_init.sh`, absent on my282 | Capture and replay the real supplicant command |
 | Restore replays garbage | The `/proc` scan matched `wpa_supplicant` anywhere in the command line — including the shell running the scan | Match `argv[0]` only |
-| Device stranded after the app exits | The captured command lived only in memory | Persist to `state/wifi_restore` |
+| Device stranded after the app exits | The captured command lived only in memory | Persist to `.userdata/shared/Netplay/wifi_restore` |
 | Client stranded on a network that no longer exists | Host tore down a working AP to rebuild it, and the rebuild failed | Make `NS_hotspotStart` idempotent |
 | Turn off takes the device off Wi-Fi entirely | `NS_hotspotStop` ran unconditionally, tearing down the client stack even when no hotspot existed | No-op unless something is actually running |
 | House network degrades, SSH times out mid-command | An AP left running shares one radio and one channel with the client interface | Tear the AP down when hosting without ad hoc, and on End session / Turn off |
@@ -439,9 +439,9 @@ with the reason shown in its place.
 Settings are toggles drawn in place (`Name: value`) rather than destinations - a
 submenu per boolean would be three presses to flip one flag. *Instanced cores*
 is the exception: its third state opens a picker over the cores that can be
-instanced (gambatte, gpsp, mgba), marking any not installed rather than offering
+instanced (gambatte and mgba), marking any not installed rather than offering
 something that cannot run. Debug-only toggles and checks live in the separate
-*Debug* submenu. Settings are stored in `state/settings`, written with
+*Debug* submenu. Settings are stored in `.userdata/shared/Netplay/settings`, written with
 write-then-rename so a power cut cannot leave a half-written file that silently
 reads back as defaults.
 

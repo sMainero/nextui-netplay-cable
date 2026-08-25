@@ -87,7 +87,9 @@ are merged into one Join list without losing the visible SSID.
 
 The implementation captures the original supplicant command before moving the
 guest radio, persists a recovery breadcrumb, restores original Wi-Fi on session
-end/failure, and runs a detached watchdog if the AP disappears. A reopened app
+end/failure, and runs a detached watchdog if the AP disappears. After its
+failure grace period, a recovered guest session ends automatically once the
+original WiFi is back; persistent host/hot-seat sessions remain armed. A reopened app
 and the broker reconstruct the active AP interface and SSID from durable session
 metadata and hostapd configuration. Static guest addressing may eventually
 remove the `udhcpd` dependency.
@@ -121,10 +123,10 @@ Game offers/replies, authenticated pairing, authorization tied to gameplay
 sockets remain. A future NextUI/MinArch integration can consume the same status
 file rather than owning another network listener.
 
-The setup UI returns the CPU to NextUI's platform Auto profile instead of
-remaining at the blanket performance setting used to launch paks. Gameplay is
-separate: the shim still pins performance for the lifetime of an armed emulator
-process and restores the previous policy at teardown.
+The setup UI uses NextUI's normal menu CPU profile instead of retaining the
+performance setting used to launch paks. Gameplay remains separate: the shim
+pins performance only for the lifetime of an armed emulator process and restores
+the prior policy at teardown.
 
 ### 6. Compatibility cores — Implemented
 
@@ -261,7 +263,7 @@ barrier. The host remains authoritative; this is not host migration.
 
 ## Local multi-instance mode
 
-### 13. Instanced cores — Partial; Gambatte implemented
+### 14. Instanced cores — Partial; Gambatte and mGBA implemented
 
 For Gambatte, each handheld runs a paired core (`gambatte_dual_libretro.so`)
 holding both logical consoles and the cable between them. One core call per
@@ -288,9 +290,30 @@ shared-screen sessions, with a reconnect re-pairing from scratch rather than
 resuming a timeline the peer cannot vouch for. Continue solo keeps the paired
 core and leaves the abandoned console on neutral input.
 
-gpSP and mGBA remain planned. This is core-specific orchestration, not a generic
-toggle over the existing one-core shim; their entries are visibly marked
-planned and cannot currently be enabled.
+mGBA uses the same mirrored-replica protocol and dual ABI, but its paired core
+drives two GBA `mCore`s cooperatively through mGBA's own cycle-based SIO
+lockstep coordinator. Builds cover tg5040, my282 and h700; paired hardware play
+is validated on tg5040. Testing found that my282 cannot sustain the current
+same-thread dual implementation, and h700 remains compile-tested only. Two
+Bricks completed Mario Kart: Super Circuit races with
+audio over both ad hoc and ordinary Wi-Fi. Phase profiling shows roughly 5ms of
+real frame headroom; the enclosing 16.2ms call includes presentation pacing. gpSP stays
+on its existing Wi-Fi link implementation: its multiplayer protocols are
+latency-tolerant enough that duplicating the core locally has no useful payoff.
+This is core-specific orchestration, not a generic toggle over the existing
+one-core shim.
+
+mGBA is disabled by default and managed as an optional installation. Netplay
+bundles an ordinary `MGBA.pak` for tg5040, h700 and my282 under
+`cores/mgba/<platform>/MGBA.pak`, while the paired core remains under
+`cores/override/<platform>`. Enabling it backs up any installed pak with a
+collision-free `.bak` name and copies saves/states into shared Netplay userdata
+before installing matched paks for every supported platform directory on the
+card. A per-platform SHA-256 check detects later core replacement; declining a
+reinstall is remembered only for that exact installed/expected hash pair.
+Disabling it—or turning off Netplay—offers independent pak, save and state
+restoration, preserving every overwritten destination file in a timestamped
+collision directory.
 
 ## Saves, reset, and authority
 

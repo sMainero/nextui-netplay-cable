@@ -40,6 +40,7 @@ typedef struct {
 void NS_init(void);                  /* resolve pak path, platform, sd root */
 const char* NS_platform(void);
 const char* NS_pakPath(void);
+const char* NS_statePath(void); /* durable state in .userdata/shared/Netplay */
 bool NS_localIP(char* out, int len);
 
 /* --- assumption checks -------------------------------------------------
@@ -69,7 +70,7 @@ int NS_runChecks(NS_Check* out, int max, NS_CheckResult* worst);
 
 typedef enum { NS_ROLE_HOST, NS_ROLE_CLIENT } NS_Role;
 
-/* Write session.conf + state/session, and install launch stubs.
+/* Write session.conf + shared Netplay/session, and install launch stubs.
  * Writes no mode= line - the shim picks the mode from the core. */
 bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen);
 
@@ -125,7 +126,7 @@ void NS_brokerStop(void);
 
 /* --- settings -----------------------------------------------------------
  *
- * Persisted to state/settings as key=value. Read once at startup; written on
+ * Persisted to .userdata/shared/Netplay/settings as key=value. Read once at startup; written on
  * every change, because a handheld can lose power at any moment and a setting
  * that survives only until a clean exit is worse than no setting at all.
  */
@@ -135,9 +136,8 @@ void NS_brokerStop(void);
  * systems, where each player has their own screen. A shared-screen system is
  * already one instance by definition and instancing it would be pure overhead -
  * hence a fixed, short compatibility list rather than "any core". */
-#define NS_INST_CORES 3
-extern const char* const NS_INST_CORE[NS_INST_CORES];   /* gambatte, gpsp, mgba */
-extern const bool NS_INST_IMPLEMENTED[NS_INST_CORES];   /* yes, no, yes */
+#define NS_INST_CORES 2
+extern const char* const NS_INST_CORE[NS_INST_CORES];   /* gambatte, mgba */
 
 typedef enum {
 	NS_INST_OFF = 0,     /* never */
@@ -163,6 +163,20 @@ void NS_settingsSave(void);
 /* Is this core present anywhere we would load it from? Used to grey out an
  * instanced-core choice rather than offer something that cannot run. */
 bool NS_coreInstalled(const char* core);
+
+typedef struct {
+	bool installed;
+	bool managed;
+	bool missing;
+	bool mismatch;
+	bool mismatch_ignored;
+	char backup_date[32];
+} NS_MgbaStatus;
+
+bool NS_mgbaStatus(NS_MgbaStatus* out);
+bool NS_mgbaInstall(char* err, int errlen);
+bool NS_mgbaIgnoreMismatch(char* err, int errlen);
+bool NS_mgbaRestore(bool pak, bool saves, bool states, char* err, int errlen);
 
 /* --- core manifest ------------------------------------------------------
  *

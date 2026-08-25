@@ -65,6 +65,21 @@ ROM, requested and selected core paths, role, process id, and normal exit
 status. A missing exit trailer indicates that the process or its wrapper was
 terminated without completing its normal shutdown path.
 
+### Durable state
+
+All mutable Netplay state lives outside the replaceable pak at:
+
+```
+/mnt/SDCARD/.userdata/shared/Netplay/
+```
+
+This includes settings, the session template and active session, broker status
+and logs, Wi-Fi recovery records, mount/stub ownership, Game Switcher backups,
+and the ROM scan cache. The test harness owns the nested `netplay-harness/`
+directory. On first use, the app and launcher migrate files from the historical
+`Netplay.pak/state/` location without replacing newer shared files; harness
+artifact backups likewise move from the old platform-specific userdata path.
+
 ### Also working on hardware
 
 - **Ad hoc networking**, end to end and in play. The Brick hosts on `wlan1`
@@ -630,12 +645,19 @@ gpSP does not emulate the link cable. From `serial_proto.c`:
 - `rfu` - generic wireless-adapter emulation, any adapter-aware game
 
 Auto-detection matches the ROM header and covers **only the Pokémon family**.
-Games using raw multi-player SIO - Mario Kart Super Circuit - cannot work.
+Games using raw multi-player SIO - Mario Kart Super Circuit, for example -
+cannot work through gpSP's link implementation.
 
-mGBA has real cycle-accurate SIO for every mode in `src/gba/sio/lockstep.c`
-(1,100 lines, shipping in its Qt and SDL frontends as "local link cable"), but
-its libretro adapter exposes **none** of it - zero references. Its README lists
-networked link as a *planned* feature.
+mGBA has real cycle-accurate SIO for every mode in `src/gba/sio/lockstep.c`.
+The stock libretro adapter exposes none of it, so Netplay's separately named
+paired frontend builds the driver, owns two local GBA cores, and presents the
+same dual ABI as paired Gambatte. Wi-Fi synchronizes inputs between mirrored
+replicas rather than carrying individual SIO transfers. Host tests exercise raw
+multiplayer SIO, and a two-Brick Mario Kart: Super Circuit race completed with
+audio over both ad hoc and ordinary Wi-Fi. The enclosing paired call measures
+16.25-16.29 ms because it includes presentation pacing; direct phase profiling
+shows about 5 ms of actual headroom on Brick. It remains experimental because
+game coverage is narrow and my282/h700 paired hardware validation is incomplete.
 
 ## Dual instance
 
