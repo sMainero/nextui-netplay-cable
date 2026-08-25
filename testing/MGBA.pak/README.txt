@@ -1,11 +1,16 @@
-mGBA measurement and experimental paired-link pak
-==================================================
+mGBA paired-link public beta
+============================
 
 What this is
 ------------
-A standalone emulator pak that carries stock mGBA plus an experimental paired
+A standalone emulator pak that carries stock mGBA plus a beta paired
 GBA frontend. NextUI builds mGBA (pinned at 925f0f0b) but does not ship it on the
 card, so without this there is no way to run it at all.
+
+Builds are provided for tg5040 (TrimUI Brick), my282 (Miyoo A30) and h700.
+Paired play has been validated on two Bricks. The A30 build is awaiting device
+testing and the h700 build is compile-tested but currently has no hardware
+tester; report the platform with every log from either build.
 
 It carries its own copy of the core. It does not touch the system cores, the GBA
 pak, or anything else; deleting the directory removes it completely.
@@ -48,13 +53,14 @@ frame budget. Core-side phase profiling later showed that figure includes the
 frontend's presentation wait: two-console emulation plus the cable peaked near
 10.8ms, audio near 0.9ms, and input below 0.1ms, leaving roughly 5ms of real
 headroom. The remaining chop followed matching network-input stalls on both
-devices rather than changes in core execution time. For the next ordinary-WiFi
-test, current Netplay builds retain the ten-frame transport floor instead of
-letting a couple of quiet startup RTT probes lower it. Ad hoc retains a
-three-frame floor.
+devices rather than changes in core execution time. A subsequent ordinary-WiFi
+race used Netplay's ten-frame transport floor and held effectively 60 FPS with
+near-zero input stalls. Ad hoc retains a three-frame floor.
 
-The race proves the implementation is playable, not yet that every long run is
-bit-identical: retain logs containing periodic paired-state hashes when testing.
+The race proves the implementation is playable, not that every GBA link mode or
+long run is correct. Only Mario Kart: Super Circuit and the synthetic lockstep
+ROM have substantial coverage so far. Retain both devices' MGBA.txt logs when
+reporting a result; periodic paired-state agreement is especially important.
 
 Measuring
 ---------
@@ -88,12 +94,12 @@ Changing it only takes effect on the next launch - the rate is fixed when the
 core loads. frametime.sh prints the rate the running instance actually
 negotiated, so a stale arm cannot be mistaken for a null result.
 
-The launcher logs which arm is active as "rate=0" or "rate=default".
+The launcher logs which arm is active as "rate=32768" or "rate=default".
 
 What to look at
 ---------------
-The debug HUD is on by default, but it cannot answer the cost question and you
-should not try to read one off it. Its A: field is wall-clock flip-to-flip and
+The debug HUD is off by default because it cannot answer the cost question and
+adds visual clutter. If enabled, its A: field is wall-clock flip-to-flip and
 spans minarch's own pacing sleep, so it pins at ~16.7ms whenever the core keeps
 up; and perf.cpu_usage has no my282 implementation, so the CPU percentage is
 always 0 here. Use testing/frametime.sh, which measures process CPU time.
@@ -116,9 +122,24 @@ docs/multi-instance.md. So the core-only costs are roughly:
   mGBA GB/GBC ~2.1-3.1 ms      paired serial ~10-11 ms   fits
   gambatte    ~1.3-2.2 ms      paired serial   ~8 ms     fits
 
-Because the frontend is paid once but the core is paid twice, the real bar for a
-serially-paired core is not 8ms -- it is about (16.74 - frontend) / 2, or roughly
-5.5ms per console. mGBA's GBA core misses that; its Game Boy core clears it.
+These early single-core estimates were deliberately conservative. Direct phase
+profiling of the completed paired core supersedes them: two-console emulation
+plus the local cable averaged roughly 5.3-9.8ms during a Brick race. The apparent
+16.2ms paired call included the frontend's presentation pacing rather than 16.2ms
+of CPU work, leaving about 5ms of real headroom.
+
+Known beta limitations
+----------------------
+The paired core supports GBA cartridges only. BIOS selection, cheats, sensors,
+rumble and the stock mGBA option surface are not implemented in the paired
+wrapper. User save states are disabled during netplay; each device persists only
+its locally visible console's SRAM. Games requiring solar, tilt, rumble or other
+special peripherals are outside this beta's supported scope.
+
+Ordinary Wi-Fi and ad hoc both work on the tested Bricks. Wi-Fi uses a ten-frame
+input-delay floor and ad hoc uses three. A guest that loses an ad hoc host waits
+through the recovery grace period, rejoins its original Wi-Fi and ends only its
+own session; the host lobby remains persistent.
 
 For comparison, the paired Gambatte core costs 2.43ms for *both* consoles
 together on this device (docs/multi-instance.md, A30 column) -- not per console,

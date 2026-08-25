@@ -221,7 +221,10 @@ the same dual ABI used by paired Gambatte, so Wi-Fi carries controller inputs an
 checkpoints rather than SIO exchanges. Synthetic tests complete hundreds of raw
 multiplayer transfers without a lockstep assertion, and two Bricks completed a
 Mario Kart: Super Circuit race with audio. This is currently a tg5040
-experimental implementation, not a replacement for the stock mGBA core.
+experimental implementation, not a replacement for the stock mGBA core. Beta
+artifacts build for tg5040, my282 and h700. Only tg5040 has completed paired
+hardware testing so far; my282 is next and h700 is compile-tested without an
+available hardware tester.
 
 **Shared screen requires the same core build on both devices.** Every `netplay`
 row above assumes it. `NO_ARM_ASM=1` is necessary and sufficient for picodrive,

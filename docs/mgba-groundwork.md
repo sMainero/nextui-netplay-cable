@@ -150,9 +150,12 @@ Early per-thread measurements predicted at most 12.66 ms for a serially paired
 GBA on Brick and at least 23.42 ms on A30. The first live Brick race corrected
 the useful number: the shim surrounds the complete paired libretro call,
 including the frontend's blocking audio callback, and measured 16.25-16.29 ms.
-Serial pairing still fits on Brick, but narrowly rather than comfortably. The
-A30 conclusion is unchanged: serial GBA is out of reach there, while GB/GBC may
-fit. See `testing/MGBA.pak/README.txt` for the component measurements.
+Direct phase profiling later showed that the enclosing paired call includes the
+frontend's presentation wait: emulation plus cable averaged roughly 5.3-9.8ms
+and left about 5ms of real headroom on Brick. The old conclusion that serial GBA
+was intrinsically out of reach on A30 was therefore based on the wrong boundary;
+the my282 build needs device measurement rather than rejection from an estimate.
+See `testing/MGBA.pak/README.txt` for the component measurements.
 
 So the A30 would eventually want a *threaded* paired core while the Brick runs a
 *serial* one. Those two can interoperate, because the only policy surface is
@@ -264,7 +267,7 @@ Roughly in order, each step verifiable before the next:
    `cores/tests/mgbadual.sh` drives 120 frames of real multiplayer transfers,
    verifies independent-process state hashes, and proves that resets of A, B and
    both return to checkpoint-safe frames.
-5. ~~**Then the pak.**~~ **Done for tg5040 integration.** Manifest word five is
+5. ~~**Then the pak.**~~ **Done for tg5040, my282 and h700 builds.** Manifest word five is
    now a capability mask (bit 0 Gambatte, bit 1 mGBA), so both devices must have
    enabled settings and local artifacts before `instanced_mgba=1` is written.
    `testing/MGBA.pak/launch.sh` selects the paired artifact only for that agreed
@@ -285,25 +288,26 @@ and logs the active path once:
 mGBA Dual audio active: output=65536 source=65536
 ```
 
-Audio was present on both Bricks after that change. It did not materially alter
-the measured paired-core cost: the host averaged about 16.29 ms per paired call
-and the client about 16.25 ms, versus roughly 16.2 ms before the audio fix. This
-is just within the 16.74 ms frame budget and leaves little scheduling margin.
+Audio was present on both Bricks after that change. The host averaged about
+16.29 ms per enclosing paired call and the client about 16.25 ms. Later phase
+profiling established that this includes presentation pacing: emulation plus
+cable varied roughly 5.3-9.8 ms, audio stayed near 0.9 ms and input below 0.1 ms,
+leaving about 5 ms of actual headroom.
 
 The remaining visible chop correlated with synchronized missing-input stalls,
 not a spike in emulator work. Both peers showed the same bad ten-second windows,
 sometimes near 49.5 FPS with stall shares up to 17%. At the time, automatic RTT
 negotiation had reduced the session to a three-frame delay. Subsequent Netplay
 work treats the transport-specific value as a floor: ordinary Wi-Fi retains ten
-frames, ad hoc retains three, and measured RTT may only raise it. The next mGBA
-test should therefore compare another race over ordinary Wi-Fi with the agreed
-ten-frame window, accepting its extra input latency in exchange for fewer
-stalls.
+frames, ad hoc retains three, and measured RTT may only raise it. A subsequent
+ordinary-Wi-Fi race used that ten-frame floor and held essentially 60 FPS with
+near-zero input stalls. More games and longer sessions still need beta coverage.
 
-One diagnostics gap remains: later logs only carried the frame-zero paired-state
-hash. Long-session hash checkpoints must be retained before the first field run
-can be called a complete determinism proof, even though the observed race did
-not report a desync.
+One diagnostics question remains for beta logs: the shim schedules paired-state
+comparisons every 300 frames, but the latest retained device logs visibly showed
+only the frame-zero agreement. Preserve both MGBA.txt files so the periodic
+exchange can be confirmed across more sessions; a mismatch already stops play
+with an explicit paired-desync error.
 
 ## What not to repeat
 

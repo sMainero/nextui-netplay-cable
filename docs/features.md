@@ -301,9 +301,11 @@ core and leaves the abandoned console on neutral input.
 
 mGBA uses the same mirrored-replica protocol and dual ABI, but its paired core
 drives two GBA `mCore`s cooperatively through mGBA's own cycle-based SIO
-lockstep coordinator. It is implemented for tg5040 and has completed a Mario
-Kart: Super Circuit race with audio. Its paired call is close to the Brick's
-frame budget, and ordinary-Wi-Fi pacing still needs broader testing. gpSP stays
+lockstep coordinator. Builds cover tg5040, my282 and h700; paired hardware play
+is validated on tg5040, with my282 awaiting testing and h700 currently
+compile-tested only. Two Bricks completed Mario Kart: Super Circuit races with
+audio over both ad hoc and ordinary Wi-Fi. Phase profiling shows roughly 5ms of
+real frame headroom; the enclosing 16.2ms call includes presentation pacing. gpSP stays
 on its existing Wi-Fi link implementation: its multiplayer protocols are
 latency-tolerant enough that duplicating the core locally has no useful payoff.
 This is core-specific orchestration, not a generic toggle over the existing

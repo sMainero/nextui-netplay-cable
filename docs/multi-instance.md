@@ -128,9 +128,11 @@ whenever mGBA's lockstep user marks one asleep. That preserves the coordinator's
 4096-cycle quanta and avoids running a sleeping console to the next video frame.
 Host tests complete 597 transfers over 600 frames with reproducible state hashes
 and zero lockstep assertions. On two Bricks, Mario Kart: Super Circuit completed
-a multiplayer race with audio; paired calls averaged about 16.25-16.29 ms, so
-network-input stalls and the narrow remaining frame margin are the current
-performance concerns.
+a multiplayer race with audio over ad hoc and ordinary Wi-Fi. The enclosing
+paired calls averaged about 16.2 ms, but phase profiling showed that presentation
+pacing consumes the unused portion: emulation plus cable leaves about 5 ms of
+real headroom on Brick. Broader game and platform coverage, rather than raw CPU
+time there, is the current beta concern.
 
 ## Gambatte replacement design
 

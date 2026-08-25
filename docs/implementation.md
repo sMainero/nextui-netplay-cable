@@ -639,8 +639,10 @@ paired frontend builds the driver, owns two local GBA cores, and presents the
 same dual ABI as paired Gambatte. Wi-Fi synchronizes inputs between mirrored
 replicas rather than carrying individual SIO transfers. Host tests exercise raw
 multiplayer SIO, and a two-Brick Mario Kart: Super Circuit race completed with
-audio. The implementation remains experimental because its 16.25-16.29 ms
-paired calls leave little margin inside a 16.74 ms frame.
+audio over both ad hoc and ordinary Wi-Fi. The enclosing paired call measures
+16.25-16.29 ms because it includes presentation pacing; direct phase profiling
+shows about 5 ms of actual headroom on Brick. It remains experimental because
+game coverage is narrow and my282/h700 paired hardware validation is incomplete.
 
 ## Dual instance
 
