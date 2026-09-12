@@ -31,7 +31,7 @@ printf '%s stale session removed (boot %s -> %s)\n' \
 	"$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$recorded" "$current" \
 	>> "$STATE/cleanup.log"
 
-rm -f "$STATE/wifi_restore" "$STATE/wifi_powersave"
+rm -f "$STATE/wifi_restore" "$STATE/wifi_restore_hook" "$STATE/wifi_powersave"
 
 # The bindings remain installed by design; without a shared session they are pure
 # passthrough. Only the armed Game Switcher view is derived session state.

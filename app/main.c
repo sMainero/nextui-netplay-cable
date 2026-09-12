@@ -733,8 +733,12 @@ int main(int argc, char* argv[]) {
 	// A join that failed - or an AP that vanished after a successful one - used
 	// to leave the device associated to nothing, with no way back except the
 	// system WiFi menu. Check on every launch, before anything else.
-	if (NS_wifiRecoverIfStranded()) {
+	NS_Recovery recovered = NS_wifiRecoverIfStranded();
+	if (recovered == NS_RECOVERY_DONE) {
 		snprintf(status, sizeof(status), "Reconnected to WiFi after an ad hoc session.");
+	} else if (recovered == NS_RECOVERY_FAILED) {
+		snprintf(status, sizeof(status),
+		         "Could not reconnect to WiFi - use Restore WiFi, or reboot.");
 	} else if (cleaned_leftover) {
 		snprintf(status, sizeof(status), "Cleaned up a session left by a previous boot.");
 	}

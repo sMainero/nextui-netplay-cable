@@ -8,6 +8,7 @@ BIN="$ROOT/bin"
 STATE="$ROOT/.userdata/shared/Netplay"
 mkdir -p "$STATE" "$NP/launcher" "$BIN"
 cp "$(dirname "$0")/../launcher/wifi-watchdog.sh" \
+	"$(dirname "$0")/../launcher/wifi-platform.sh" \
 	"$(dirname "$0")/../launcher/state-path.sh" "$NP/launcher/"
 
 cat > "$BIN/iw" <<EOF

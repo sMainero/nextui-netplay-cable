@@ -83,10 +83,21 @@ void NS_disarm(void);
 void NS_wifiPowerSaveDisable(void);
 void NS_wifiPowerSaveRestore(void);
 
-/* Put the platform's own WiFi back. Safe to call at any time; returns true if
- * it actually did something. The stranded check runs at startup, this is the
- * manual escape hatch for when it does not fire. */
-bool NS_wifiRecoverIfStranded(void);
+/* Put the platform's own WiFi back. Safe to call at any time. The stranded
+ * check runs at startup, NS_wifiRestore is the manual escape hatch for when it
+ * does not fire.
+ *
+ * Three outcomes, not two. This returned a bare "we tried" and the caller read
+ * it as "we succeeded", so a device whose restore had just failed - and logged
+ * that it failed - was told on screen that it had reconnected. A failure the
+ * user is not shown is a failure they cannot act on. */
+typedef enum {
+	NS_RECOVERY_NONE = 0,   /* nothing was owed */
+	NS_RECOVERY_DONE,       /* the client stack is back, with an address */
+	NS_RECOVERY_FAILED,     /* attempted; the record is retained for a retry */
+} NS_Recovery;
+
+NS_Recovery NS_wifiRecoverIfStranded(void);
 void NS_wifiRestore(void);
 
 /* Drop the session, keep the launch stubs. Games launch stock (the shim is a
@@ -260,6 +271,11 @@ int NS_compatSync(const char* host_ip, char* err, int errlen);
 #define NS_JOIN_ATTEMPTS 5
 #define NS_JOIN_GAP_S    3
 #define NS_JOIN_ASSOC_S  8
+/* Seconds to wait for a lease, per request, of which two are made per attempt.
+ * Polled rather than delegated to the client's own retry budget: `udhcpc -t 6`
+ * multiplies its -T pause straight into wall clock (~18s a call, 36s an
+ * attempt) and a client that is not installed at all returns instantly. */
+#define NS_JOIN_DHCP_S   6
 
 /* Frames of input lag traded for tolerance of a late peer. Written into both
  * session files from here rather than left to the shim's default, because the

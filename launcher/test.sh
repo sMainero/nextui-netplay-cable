@@ -25,7 +25,7 @@ check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (got '$2', want '$3')"; 
 mkdir -p "$USERDATA_PATH" "$STATE" "$SYSTEM_PATH/bin" "$SYSTEM_PATH/cores" "$NP/launcher" "$NP/bin/$PLATFORM"
 cp "$HERE/launch-stub.sh" "$HERE/install-stubs.sh" "$HERE/minarch.elf" "$HERE/wrap-pak.sh" \
 	   "$HERE/bind-mount.sh" "$HERE/mount-common.sh" "$HERE/pre-launch.sh" \
-	   "$HERE/adhoc-join.sh" "$HERE/session-cleanup.sh" \
+	   "$HERE/adhoc-join.sh" "$HERE/session-cleanup.sh" "$HERE/wifi-platform.sh" \
 	   "$HERE/state-path.sh" "$HERE/gameswitcher.sh" "$HERE/gameswitcher-launch.sh" "$NP/launcher/"
 chmod 755 "$NP/launcher"/*
 : > "$NP/bin/$PLATFORM/netplay_shim.so"

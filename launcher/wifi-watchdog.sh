@@ -33,8 +33,10 @@ else
 	NP="$SDCARD_PATH/Tools/$PLATFORM/Netplay.pak"
 fi
 . "$NP/launcher/state-path.sh"
+. "$NP/launcher/wifi-platform.sh"
 
 RESTORE="$NETPLAY_STATE/wifi_restore"
+RESTORE_HOOK="$NETPLAY_STATE/wifi_restore_hook"
 LOCK="/tmp/netplay_watchdog.pid"
 RESTORE_LOCK="/tmp/netplay_wifi_restore.lock"
 HOST=10.0.0.1
@@ -46,7 +48,18 @@ MAX_CHECKS=${NETPLAY_WATCHDOG_MAX_CHECKS:-1440} # ~8h backstop
 
 # Own our output. Callers used to redirect, which forced them to know where the
 # log lives and left us tied to their descriptors.
-exec >>"$NETPLAY_STATE/watchdog.log" 2>&1
+#
+# Appended across runs, because the interesting sequence spans several: a join,
+# a host that disappears an hour later, the recovery. Capped so that appending
+# forever cannot quietly grow a file on the card - one backup generation is
+# enough to keep the run before this one.
+WATCHDOG_LOG="$NETPLAY_STATE/watchdog.log"
+: "${NETPLAY_WATCHDOG_LOG_MAX:=65536}"
+_size=$(wc -c < "$WATCHDOG_LOG" 2>/dev/null) || _size=0
+case "$_size" in ''|*[!0-9]*) _size=0 ;; esac
+[ "$_size" -gt "$NETPLAY_WATCHDOG_LOG_MAX" ] &&
+	mv "$WATCHDOG_LOG" "$WATCHDOG_LOG.1" 2>/dev/null
+exec >>"$WATCHDOG_LOG" 2>&1
 
 # Same HH:MM:SS.mmm shape as the C loggers so the three logs can be read
 # side by side. busybox date has no %N, so milliseconds come from
@@ -71,11 +84,14 @@ echo $$ > "$LOCK"          # the app reads this one
 trap 'rm -rf "$LOCKDIR"; rm -f "$LOCK"' EXIT
 
 link_up() {
-	iw dev wlan0 link 2>/dev/null | grep -q "Connected to"
+	np_assoc
 }
 
 on_adhoc() {
-	iw dev wlan0 link 2>/dev/null | grep -q "SSID: $PREFIX-"
+	case "$(np_assoc_ssid)" in
+	"$PREFIX"-*) return 0 ;;
+	*)           return 1 ;;
+	esac
 }
 
 restore_wifi() {
@@ -106,6 +122,7 @@ restore_wifi() {
 	fi
 
 	killall -q wpa_supplicant 2>/dev/null
+	np_dhcp_stop
 	ip addr flush dev wlan0 2>/dev/null
 	ip link set wlan0 up 2>/dev/null
 	# Captured service commands are not guaranteed to daemonise themselves. A
@@ -116,23 +133,33 @@ restore_wifi() {
 		*) _cmd="$_cmd -B" ;;
 	esac
 	sh -c "$_cmd" >/dev/null 2>&1
+	# Platforms that run DHCP from a `wpa_cli -a` hook need that process back
+	# too; without it the radio reassociates forever and never gets an address.
+	np_hook_replay "$RESTORE_HOOK"
 
 	_w=1
 	while [ $_w -le 10 ]; do
-		iw dev wlan0 link 2>/dev/null | grep -q "Connected to" && break
+		np_assoc && break
 		sleep 1
 		_w=$((_w + 1))
 	done
-	udhcpc -i wlan0 -n -q -t 8 >/dev/null 2>&1
+	# Persistent: nobody is coming back to renew this one.
+	np_dhcp_start persistent
+	_w=1
+	while [ $_w -le 10 ]; do
+		np_has_ip && break
+		sleep 1
+		_w=$((_w + 1))
+	done
 
-	_ip=$(ip -4 addr show wlan0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
+	_ip=$(np_ip)
 	if [ -z "$_ip" ]; then
 		log "restore attempt did not get an address - keeping recovery record"
 		rm -f "$RESTORE_LOCK/pid"; rmdir "$RESTORE_LOCK" 2>/dev/null
 		return 1
 	fi
 	log "recovered, back on wifi as $_ip"
-	rm -f "$RESTORE"
+	rm -f "$RESTORE" "$RESTORE_HOOK"
 
 	# The ad hoc network is gone. A host lobby is persistent by design, but a
 	# guest cannot continue a session whose transport and ad-hoc peer address no
@@ -144,8 +171,7 @@ restore_wifi() {
 	   grep -q '^adhoc_ssid=' "$_sess" 2>/dev/null; then
 		netplay_end_session "$_sess"
 		_ps="$NETPLAY_STATE/wifi_powersave"
-		[ "$(head -1 "$_ps" 2>/dev/null)" = on ] &&
-			iw dev wlan0 set power_save on >/dev/null 2>&1
+		[ "$(head -1 "$_ps" 2>/dev/null)" = on ] && np_powersave on
 		rm -f "$_ps"
 		log "original wifi restored - ended guest session"
 	elif [ -f "$_sess" ] && grep -q '^adhoc_ssid=' "$_sess" 2>/dev/null; then

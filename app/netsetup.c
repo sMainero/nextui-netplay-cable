@@ -52,6 +52,64 @@ static char joined_psk[NS_PSK_LEN];    /* launch stub can rejoin per game */
 static NS_ProgressFn ns_progress;      /* lets the UI animate a blocking join */
 static bool file_exists(const char* p);
 
+/* Everything that differs per platform lives in launcher/wifi-platform.sh, and
+ * this is how the app reaches it.
+ *
+ * A second copy of that table here would be the obvious alternative and is the
+ * wrong one: the launcher scripts need identical answers on every launch, and
+ * two tables in two languages drift silently - which is the class of bug this
+ * whole change exists to remove. What stays inline below is only what does not
+ * vary: `ip addr/link`, `killall wpa_supplicant`, and the AP-side `iw` calls,
+ * which are meaningful exactly on the platforms that can host at all.
+ *
+ * Cost is one short-lived shell per call, against `system()` calls this code
+ * already makes everywhere; the hottest caller polls once per second. */
+static int wifi_plat(const char* fmt, ...) {
+	char args[320];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(args, sizeof(args), fmt, ap);
+	va_end(ap);
+
+	char cmd[1024];
+	snprintf(cmd, sizeof(cmd),
+	         "SDCARD_PATH='%s' PLATFORM='%s' SYSTEM_PATH='%s/.system/%s' "
+	         "sh '%s/launcher/wifi-platform.sh' %s",
+	         ns_sd, ns_platform, ns_sd, ns_platform, ns_pak, args);
+	return system(cmd);
+}
+
+/* First line of the helper's output, trimmed. Empty string when it says
+ * nothing, which every caller treats as "no answer" rather than an error. */
+static void wifi_plat_out(char* out, int len, const char* fmt, ...) {
+	out[0] = '\0';
+
+	char args[320];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(args, sizeof(args), fmt, ap);
+	va_end(ap);
+
+	char cmd[1024];
+	snprintf(cmd, sizeof(cmd),
+	         "SDCARD_PATH='%s' PLATFORM='%s' SYSTEM_PATH='%s/.system/%s' "
+	         "sh '%s/launcher/wifi-platform.sh' %s 2>/dev/null",
+	         ns_sd, ns_platform, ns_sd, ns_platform, ns_pak, args);
+	FILE* f = popen(cmd, "r");
+	if (!f) return;
+	if (fgets(out, len, f)) {
+		char* nl = strpbrk(out, "\r\n");
+		if (nl) *nl = '\0';
+	}
+	pclose(f);
+}
+
+/* Associated to this SSID, or to anything when ssid is NULL. */
+static bool wifi_associated(const char* ssid) {
+	if (ssid && ssid[0]) return wifi_plat("assoc '%s'", ssid) == 0;
+	return wifi_plat("assoc") == 0;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // environment
 //////////////////////////////////////////////////////////////////////////////
@@ -241,19 +299,11 @@ static void ps_state_path(char* out, int len) {
 	snprintf(out, len, "%s/wifi_powersave", ns_state);
 }
 
-/* "on" / "off", as `iw` reports it. */
+/* "on" / "off". Empty where the platform has no power-save control at all
+ * (H700 has no `iw`), in which case there is nothing to record or restore. */
 static bool wifi_powerSaveGet(char* out, int len) {
-	FILE* f = popen("iw dev wlan0 get power_save 2>/dev/null "
-	                "| sed -n 's/.*Power save: *//p' | head -1", "r");
-	if (!f) return false;
-	bool ok = false;
-	if (fgets(out, len, f)) {
-		char* nl = strpbrk(out, "\r\n");
-		if (nl) *nl = '\0';
-		ok = out[0] != '\0';
-	}
-	pclose(f);
-	return ok;
+	wifi_plat_out(out, len, "powersave-get");
+	return out[0] != '\0';
 }
 
 void NS_wifiPowerSaveDisable(void) {
@@ -267,7 +317,7 @@ void NS_wifiPowerSaveDisable(void) {
 		FILE* f = fopen(path, "w");
 		if (f) { fprintf(f, "%s\n", prior); fclose(f); }
 	}
-	system("iw dev wlan0 set power_save off >/dev/null 2>&1");
+	wifi_plat("powersave off");
 }
 
 void NS_wifiPowerSaveRestore(void) {
@@ -280,7 +330,7 @@ void NS_wifiPowerSaveRestore(void) {
 		if (fgets(prior, sizeof(prior), f)) {
 			char* nl = strpbrk(prior, "\r\n");
 			if (nl) *nl = '\0';
-			if (!strcmp(prior, "on")) system("iw dev wlan0 set power_save on >/dev/null 2>&1");
+			if (!strcmp(prior, "on")) wifi_plat("powersave on");
 		}
 		fclose(f);
 		remove(path);
@@ -650,6 +700,11 @@ int NS_coreManifest(NS_CoreInfo* out, int max) {
 #define CORE_MAGIC 0x4E504333u   /* 'NPC3': metadata-only compatibility protocol */
 #define CORE_BUSY  0x42555359u   /* 'BUSY': this session already admitted a peer */
 #define CORE_IO_MS   30000
+/* The host serves this from its render loop, so its budget is a frozen UI, not
+ * merely a slow transfer. The exchange is a few KB on a LAN: a healthy peer is
+ * done in well under a second, and anything approaching this is already a peer
+ * that is not coming back. */
+#define CORE_SERVE_IO_MS 8000
 
 typedef struct __attribute__((packed)) {
 	char     core[32];
@@ -667,8 +722,17 @@ static int core_listen_fd = -1;
 static char core_last_peer[NS_IP_LEN];
 
 /* Bounded, so neither side can be parked forever by a peer that stops talking
- * mid-transfer - the failure that has bitten this codebase repeatedly. */
-static bool io_all(int fd, void* buf, size_t len, bool writing) {
+ * mid-transfer - the failure that has bitten this codebase repeatedly.
+ *
+ * The deadline only bounds anything if the socket can return control. It is
+ * checked between calls, so on a *blocking* socket recv() simply never comes
+ * back and none of this runs - which is what the host's accepted socket was:
+ * the listener is non-blocking, but accept() does not pass O_NONBLOCK to the
+ * connection on Linux, and unlike the client path nothing set a timeout on it.
+ * A peer that completed the TCP handshake and then went silent parked the
+ * host's render loop indefinitely. Every caller must give its socket a receive
+ * timeout; see core_socket_deadline. */
+static bool io_all_to(int fd, void* buf, size_t len, bool writing, long budget_ms) {
 	uint8_t* p = buf;
 	size_t done = 0;
 	struct timeval start, now;
@@ -677,7 +741,7 @@ static bool io_all(int fd, void* buf, size_t len, bool writing) {
 	while (done < len) {
 		gettimeofday(&now, NULL);
 		long ms = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_usec - start.tv_usec) / 1000L;
-		if (ms > CORE_IO_MS) return false;
+		if (ms > budget_ms) return false;
 
 		ssize_t n = writing ? send(fd, p + done, len - done, MSG_NOSIGNAL)
 		                    : recv(fd, p + done, len - done, 0);
@@ -690,17 +754,38 @@ static bool io_all(int fd, void* buf, size_t len, bool writing) {
 	return true;
 }
 
+/* Retained for the frozen core-sharing block below, which is `#if 0` and so
+ * has no live caller - keeping it means that code still compiles unchanged if
+ * the setting ever returns. */
+__attribute__((unused))
+static bool io_all(int fd, void* buf, size_t len, bool writing) {
+	return io_all_to(fd, buf, len, writing, CORE_IO_MS);
+}
+
+/* Give a socket a send/receive timeout, so a silent peer surfaces as EAGAIN and
+ * the deadline above is reachable. Well under the caller's budget, so the
+ * budget is what actually decides when to give up. */
+static void core_socket_deadline(int fd, long budget_ms) {
+	struct timeval tv = {
+		.tv_sec  = (budget_ms / 4) / 1000,
+		.tv_usec = ((budget_ms / 4) % 1000) * 1000,
+	};
+	if (!tv.tv_sec && !tv.tv_usec) tv.tv_usec = 250 * 1000;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 #define INST_CAP_GAMBATTE (1u << 0)
 #define INST_CAP_MGBA     (1u << 1)
 
 static uint32_t instanced_available_mask(void);
 
-static bool send_manifest(int fd, NS_CoreInfo* m, int n) {
+static bool send_manifest_to(int fd, NS_CoreInfo* m, int n, long budget_ms) {
 	uint32_t hdr[5] = { htonl(CORE_MAGIC), htonl((uint32_t)n),
 	                    htonl(NS_settings()->compatibility_cores ? 1u : 0u),
 	                    htonl(NS_settings()->force_compatibility ? 1u : 0u),
 	                    htonl(instanced_available_mask()) };
-	if (!io_all(fd, hdr, sizeof(hdr), true)) return false;
+	if (!io_all_to(fd, hdr, sizeof(hdr), true, budget_ms)) return false;
 	for (int i = 0; i < n; i++) {
 		CoreWire w;
 		memset(&w, 0, sizeof(w));
@@ -713,16 +798,16 @@ static bool send_manifest(int fd, NS_CoreInfo* m, int n) {
 		w.machine = htons(m[i].machine);
 		w.installed = m[i].installed ? 1 : 0;
 		w.compat_available = m[i].compat_available ? 1 : 0;
-		if (!io_all(fd, &w, sizeof(w), true)) return false;
+		if (!io_all_to(fd, &w, sizeof(w), true, budget_ms)) return false;
 	}
 	return true;
 }
 
-static int recv_manifest(int fd, NS_CoreInfo* out, int max,
+static int recv_manifest_to(int fd, NS_CoreInfo* out, int max, long budget_ms,
                          bool* peer_compat_enabled, bool* peer_force_compatibility,
                          uint32_t* peer_instanced) {
 	uint32_t hdr[5];
-	if (!io_all(fd, hdr, sizeof(hdr), false)) return -1;
+	if (!io_all_to(fd, hdr, sizeof(hdr), false, budget_ms)) return -1;
 	if (ntohl(hdr[0]) == CORE_BUSY) return -2;
 	if (ntohl(hdr[0]) != CORE_MAGIC) return -1;
 	int n = (int)ntohl(hdr[1]);
@@ -734,7 +819,7 @@ static int recv_manifest(int fd, NS_CoreInfo* out, int max,
 	int kept = 0;
 	for (int i = 0; i < n; i++) {
 		CoreWire w;
-		if (!io_all(fd, &w, sizeof(w), false)) return -1;
+		if (!io_all_to(fd, &w, sizeof(w), false, budget_ms)) return -1;
 		if (kept >= max) continue;
 		w.core[sizeof(w.core) - 1] = '\0';
 		w.version[sizeof(w.version) - 1] = '\0';
@@ -940,11 +1025,15 @@ void NS_compatServeTick(void) {
 	socklen_t peer_len = sizeof(peer);
 	int fd = accept(core_listen_fd, (struct sockaddr*)&peer, &peer_len);
 	if (fd < 0) return;                       /* nothing waiting - normal */
+	/* accept() does not inherit the listener's O_NONBLOCK on Linux, so without
+	 * this the connection is fully blocking and every deadline below is
+	 * unreachable. This is the whole of the fix; the rest is bookkeeping. */
+	core_socket_deadline(fd, CORE_SERVE_IO_MS);
 	char peer_ip[NS_IP_LEN] = "";
 	inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
 	if (core_last_peer[0] && strcmp(core_last_peer, peer_ip)) {
 		uint32_t busy[5] = { htonl(CORE_BUSY), 0, 0, 0, 0 };
-		io_all(fd, busy, sizeof(busy), true);
+		io_all_to(fd, busy, sizeof(busy), true, CORE_SERVE_IO_MS);
 		ns_log("core compatibility negotiation: %s rejected BUSY; admitted peer is %s\n",
 		       peer_ip, core_last_peer);
 		close(fd);
@@ -958,12 +1047,13 @@ void NS_compatServeTick(void) {
 	bool peer_compat_enabled = false;
 	bool peer_force_compatibility = false;
 	uint32_t peer_instanced = 0;
-	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST,
-	                       &peer_compat_enabled, &peer_force_compatibility,
-	                       &peer_instanced);
+	int tn = recv_manifest_to(fd, theirs, NS_MAX_MANIFEST, CORE_SERVE_IO_MS,
+	                          &peer_compat_enabled, &peer_force_compatibility,
+	                          &peer_instanced);
 	if (tn < 0 ||
-	    !send_manifest(fd, mine, n)) {
-		ns_log("core compatibility negotiation: manifest failed\n");
+	    !send_manifest_to(fd, mine, n, CORE_SERVE_IO_MS)) {
+		ns_log("core compatibility negotiation: manifest failed "
+		       "(peer %s went quiet or spoke nonsense)\n", peer_ip);
 		close(fd);
 		return;
 	}
@@ -1058,9 +1148,7 @@ int NS_compatSync(const char* host_ip, char* err, int errlen) {
 		return -1;
 	}
 
-	struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
-	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	core_socket_deadline(fd, CORE_IO_MS);
 
 	if (connect(fd, (struct sockaddr*)&a, sizeof(a)) != 0) {
 		close(fd);
@@ -1072,12 +1160,12 @@ int NS_compatSync(const char* host_ip, char* err, int errlen) {
 	bool peer_compat_enabled = false;
 	bool peer_force_compatibility = false;
 	uint32_t peer_instanced = 0;
-	if (!send_manifest(fd, mine, n)) {
+	if (!send_manifest_to(fd, mine, n, CORE_IO_MS)) {
 		close(fd);
 		snprintf(err, errlen, "manifest exchange failed");
 		return -1;
 	}
-	int tn = recv_manifest(fd, theirs, NS_MAX_MANIFEST,
+	int tn = recv_manifest_to(fd, theirs, NS_MAX_MANIFEST, CORE_IO_MS,
 	                       &peer_compat_enabled, &peer_force_compatibility,
 	                       &peer_instanced);
 	if (tn == -2) {
@@ -1292,6 +1380,43 @@ int NS_runChecks(NS_Check* out, int max, NS_CheckResult* worst) {
 		bool ok = file_exists(shim);
 		add(out, &n, max, ok ? NS_CHECK_OK : NS_CHECK_FAIL, "Shim for this device",
 		    ok ? ns_platform : "missing - unsupported platform");
+	}
+
+	/* 5. This device can tell whether it is associated, and can get an address.
+	 *
+	 * Both were assumed rather than checked, and on the H700 both assumptions
+	 * were false: no `iw`, no `udhcpc`. Nothing said so. A missing association
+	 * probe is indistinguishable from "not associated", so the join loop ran
+	 * its full budget and reported that it could not find the host; a missing
+	 * DHCP client meant the restore path could never produce an address and
+	 * left WiFi needing a reboot after every session. Two silent absences cost
+	 * two rounds of field debugging, which is what this check is for.
+	 *
+	 * A warning, not a failure. Shared-screen play over an existing network
+	 * touches none of this - it is only ad hoc that moves the client stack -
+	 * so refusing to arm would be wrong. */
+	{
+		/* Short tokens: "iw", "wpa_cli", "dhclient", "dhcpcd", "none". Sized
+		 * so both fit in a detail line with room to spare. */
+		char assoc[24] = "", dhcp[24] = "";
+		wifi_plat_out(assoc, sizeof(assoc), "assoc-kind");
+		wifi_plat_out(dhcp,  sizeof(dhcp),  "dhcp-kind");
+
+		bool no_assoc = !assoc[0] || !strcmp(assoc, "none");
+		bool no_dhcp  = !dhcp[0]  || !strcmp(dhcp,  "none");
+
+		char detail[96];
+		if (no_assoc && no_dhcp)
+			snprintf(detail, sizeof(detail), "no association probe and no DHCP client");
+		else if (no_assoc)
+			snprintf(detail, sizeof(detail), "no association probe (%s for DHCP)", dhcp);
+		else if (no_dhcp)
+			snprintf(detail, sizeof(detail), "%s works, but no DHCP client", assoc);
+		else
+			snprintf(detail, sizeof(detail), "%s + %s", assoc, dhcp);
+
+		add(out, &n, max, (no_assoc || no_dhcp) ? NS_CHECK_WARN : NS_CHECK_OK,
+		    "WiFi tools for ad hoc", detail);
 	}
 
 	for (int i = 0; i < n; i++) if (out[i].result > w) w = out[i].result;
@@ -1773,6 +1898,8 @@ int NS_scanAdhoc(NS_Peer* out, int max) {
 	 * The frontend polls the same way, so the cache is kept warm for us. */
 	char ctrl[256];
 	char cmd[600];
+	struct scan_ctx c = { out, max, 0 };
+
 	if (platform_ctrl_dir(ctrl, sizeof(ctrl))) {
 		/* Ask for a refresh but do not wait on it - this returns at once. */
 		snprintf(cmd, sizeof(cmd), "wpa_cli -p %s -i wlan0 scan >/dev/null 2>&1", ctrl);
@@ -1781,14 +1908,21 @@ int NS_scanAdhoc(NS_Peer* out, int max) {
 		         "wpa_cli -p %s -i wlan0 scan_results 2>/dev/null "
 		         "| awk -F'\t' 'NR>1 && NF>=5 {print $5}' "
 		         "| grep -i '^%s-' | sort -u", ctrl, NS_ADHOC_PREFIX);
-	} else {
+		popen_bounded(cmd, 6000, scan_line, &c);
+	}
+
+	/* The control directory now resolves to the platform's own socket even when
+	 * no supplicant is running, which is right for everything else that uses it
+	 * but would have quietly retired this fallback: an empty cache and a dead
+	 * supplicant both read as "no networks". Asking the radio directly is the
+	 * slower answer and stays the second one, not the abandoned one. */
+	if (c.n == 0) {
 		snprintf(cmd, sizeof(cmd),
 		         "iw dev wlan0 scan 2>/dev/null | sed -n 's/^[[:space:]]*SSID: //p' "
 		         "| grep -i '^%s-' | sort -u", NS_ADHOC_PREFIX);
+		popen_bounded(cmd, 6000, scan_line, &c);
 	}
 
-	struct scan_ctx c = { out, max, 0 };
-	popen_bounded(cmd, 6000, scan_line, &c);
 	ns_log("scan found %d ad hoc network(s)\n", c.n);
 	return c.n;
 }
@@ -2044,8 +2178,19 @@ static void wifi_client_stack_down(void) {
 		if (w) { fprintf(w, "%s\n", saved_supplicant); fclose(w); }
 	}
 
+	/* The supplicant command line is not the whole client stack. H700 runs a
+	 * `wpa_cli -a <script>` alongside it and that action script is the only
+	 * thing on the device that ever starts a DHCP client; killing the
+	 * supplicant takes the hook with it. Restoring one without the other is
+	 * what left that platform associating forever with no address - not just
+	 * for our session, but for every reassociation until the next reboot.
+	 *
+	 * A no-op wherever no such process exists, which is every other platform. */
+	if (wifi_plat("hook-capture '%s/wifi_restore_hook'", ns_state) == 0)
+		ns_log("recorded the platform's supplicant DHCP hook\n");
+
 	system("killall -q wpa_supplicant 2>/dev/null");
-	system("killall -q udhcpc 2>/dev/null");
+	wifi_plat("dhcp-stop");
 	system("ip addr flush dev wlan0 2>/dev/null");
 	system("ip route flush dev wlan0 2>/dev/null");
 }
@@ -2094,7 +2239,7 @@ static bool load_saved_supplicant(void) {
 #define WIFI_RESTORE_LOCK "/tmp/netplay_wifi_restore.lock"
 
 static bool wifi_link_up(void) {
-	return system("iw dev wlan0 link 2>/dev/null | grep -q 'Connected to'") == 0;
+	return wifi_associated(NULL);
 }
 
 static bool wifi_has_ip(void) {
@@ -2158,7 +2303,7 @@ static bool wifi_client_stack_up(void) {
 	if (!wifi_restore_lock_acquire()) return false;
 
 	system("killall -q wpa_supplicant 2>/dev/null");
-	system("killall -q udhcpc 2>/dev/null");
+	wifi_plat("dhcp-stop");
 	/* Do not race a daemon which has accepted SIGTERM but has not released its
 	 * control socket yet. The A30 log showed precisely that first-start loss. */
 	for (int i = 0; i < 10 && supplicant_running(); i++) usleep(100000);
@@ -2181,14 +2326,19 @@ static bool wifi_client_stack_up(void) {
 		snprintf(cmd, sizeof(cmd), "%s%s >/dev/null 2>&1", saved_supplicant,
 		         already_backgrounds ? "" : " -B");
 		system(cmd);
+		wifi_plat("hook-replay '%s/wifi_restore_hook'", ns_state);
 		can_retry_saved = true;
 		used_saved = true;
 		ns_log("started saved supplicant command\n");
-	} else if (file_exists("/etc/wifi/wifi_init.sh")) {
+	} else if (wifi_plat("wifi-init start") == 0) {
 		/* The stack was already stopped above; start is sufficient and avoids
-		 * a second service/rfkill teardown. */
-		system("/etc/wifi/wifi_init.sh start >/dev/null 2>&1");
-		ns_log("started wifi restoration via wifi_init.sh fallback\n");
+		 * a second service/rfkill teardown.
+		 *
+		 * The path is resolved per platform now. Hardcoding /etc/wifi here was
+		 * correct only on tg50xx; my282, my355 and h700 all keep their script
+		 * under SYSTEM_PATH, so this entire recovery route was dead code on
+		 * three of the five platforms that reach it. */
+		ns_log("started wifi restoration via the platform wifi_init.sh\n");
 	} else {
 		ns_log("WARNING: nothing recorded to restore wifi with\n");
 		wifi_restore_lock_release();
@@ -2213,6 +2363,20 @@ static bool wifi_client_stack_up(void) {
 			            i + 1, RESTORE_TOTAL_S);
 		sleep(1);
 
+		/* Checked every second regardless of what the association probe thinks.
+		 *
+		 * This used to sit behind the `continue` below, so an address could
+		 * only ever be noticed on a second where we had already decided we were
+		 * associated. On a platform whose DHCP is driven by the supplicant's
+		 * own hook the address can arrive without this loop doing anything at
+		 * all - and on one where the association probe is simply unavailable it
+		 * never became observable, so a restore that had in fact succeeded was
+		 * reported as a failure and the recovery breadcrumb was kept forever.
+		 * The answer we actually want is "does wlan0 have an address"; asking
+		 * it directly costs one `ip` call a second. */
+		got_ip = wifi_has_ip();
+		if (got_ip) break;
+
 		if (!assoc) {
 			assoc = wifi_link_up();
 			if (!assoc) {
@@ -2222,6 +2386,7 @@ static bool wifi_client_stack_up(void) {
 					system("killall -q wpa_supplicant 2>/dev/null");
 					for (int n = 0; n < 10 && supplicant_running(); n++) usleep(100000);
 					system(cmd);
+					wifi_plat("hook-replay '%s/wifi_restore_hook'", ns_state);
 				}
 				continue;
 			}
@@ -2229,14 +2394,14 @@ static bool wifi_client_stack_up(void) {
 		}
 
 		/* Ask on the first second we are associated, and again if nothing has
-		 * arrived - never leaving a request unretried inside the deadline. */
+		 * arrived - never leaving a request unretried inside the deadline.
+		 * Persistent, because we are handing the radio back to the user and
+		 * will not be here when the lease expires. */
 		if (dhcp_at < 0 || i - dhcp_at >= RESTORE_DHCP_RETRY_S) {
-			system("killall -q udhcpc 2>/dev/null");
-			system("udhcpc -i wlan0 -n -q -t 3 -T 2 >/dev/null 2>&1 &");
+			wifi_plat("dhcp-stop");
+			wifi_plat("dhcp-start persistent");
 			dhcp_at = i;
 		}
-
-		got_ip = wifi_has_ip();
 	}
 
 	if (got_ip) {
@@ -2276,18 +2441,17 @@ static bool watchdog_running(void) {
  * Two ways in: a join that failed partway, and a join that worked whose host
  * then tore its AP down. Both end with the radio associated to nothing, and
  * neither used to leave anything behind that knew how to undo it. */
-bool NS_wifiRecoverIfStranded(void) {
+NS_Recovery NS_wifiRecoverIfStranded(void) {
 	char path[512];
 	snprintf(path, sizeof(path), "%s/wifi_restore", ns_state);
-	if (!file_exists(path)) return false;   /* never moved the client stack */
+	if (!file_exists(path)) return NS_RECOVERY_NONE;   /* never moved the stack */
 
-	bool connected = system("iw dev wlan0 link 2>/dev/null | grep -q 'Connected to'") == 0;
-	bool has_ip    = system("ip -4 addr show wlan0 2>/dev/null | grep -q 'inet '") == 0;
+	bool connected = wifi_associated(NULL);
+	bool has_ip    = wifi_has_ip();
 
-	char cmd[256];
-	snprintf(cmd, sizeof(cmd),
-	         "iw dev wlan0 link 2>/dev/null | grep -q 'SSID: %s-'", NS_ADHOC_PREFIX);
-	bool on_adhoc = system(cmd) == 0;
+	char cur_ssid[NS_SSID_LEN + 40] = "";
+	wifi_plat_out(cur_ssid, sizeof(cur_ssid), "assoc-ssid");
+	bool on_adhoc = !strncmp(cur_ssid, NS_ADHOC_PREFIX "-", sizeof(NS_ADHOC_PREFIX));
 
 	/* Healthy on some other network: nothing to do, and the record is stale.
 	 *
@@ -2297,11 +2461,11 @@ bool NS_wifiRecoverIfStranded(void) {
 	 * strikes. Whoever finishes gets to clean up. */
 	if (connected && has_ip && !on_adhoc) {
 		if (!watchdog_running()) remove(path);
-		return false;
+		return NS_RECOVERY_NONE;
 	}
 
 	/* Still usefully on the ad hoc network with a session armed - leave it. */
-	if (on_adhoc && has_ip && NS_isArmed()) return false;
+	if (on_adhoc && has_ip && NS_isArmed()) return NS_RECOVERY_NONE;
 
 	ns_log("stranded (connected=%d ip=%d adhoc=%d) - restoring wifi\n",
 	       connected, has_ip, on_adhoc);
@@ -2311,8 +2475,13 @@ bool NS_wifiRecoverIfStranded(void) {
 	 * app launch use to know a restore is still owed - stranding the device for
 	 * good, which is the exact failure this whole mechanism exists to stop. */
 	bool back = wifi_client_stack_up();
-	if (back) remove(path);
-	return true;
+	if (back) {
+		remove(path);
+		char hook[512];
+		snprintf(hook, sizeof(hook), "%s/wifi_restore_hook", ns_state);
+		remove(hook);
+	}
+	return back ? NS_RECOVERY_DONE : NS_RECOVERY_FAILED;
 }
 
 /* Are we currently sitting on one of our own ad hoc networks?
@@ -2323,10 +2492,9 @@ bool NS_wifiRecoverIfStranded(void) {
  * restore on it meant ending a session left the device on a network that was
  * about to be torn down. */
 static bool on_own_adhoc(void) {
-	char cmd[256];
-	snprintf(cmd, sizeof(cmd),
-	         "iw dev wlan0 link 2>/dev/null | grep -q 'SSID: %s-'", NS_ADHOC_PREFIX);
-	return system(cmd) == 0;
+	char ssid[NS_SSID_LEN + 40] = "";
+	wifi_plat_out(ssid, sizeof(ssid), "assoc-ssid");
+	return !strncmp(ssid, NS_ADHOC_PREFIX "-", sizeof(NS_ADHOC_PREFIX));
 }
 
 static void wifi_client_leave_adhoc(void) {
@@ -2498,55 +2666,7 @@ bool NS_hotspotStart(const char* ssid, const char* psk, char* err, int errlen) {
  * Taken from -O on the running command line if present (tg5040), otherwise from
  * ctrl_interface= in the config it was given (my282). */
 static bool platform_ctrl_dir(char* out, int len) {
-	out[0] = '\0';
-
-	FILE* p = popen(
-		"for d in /proc/[0-9]*; do "
-		"  a0=$(tr '\\0' '\\n' < $d/cmdline 2>/dev/null | head -1); "
-		"  case \"$a0\" in */wpa_supplicant|wpa_supplicant) "
-		"    tr '\\0' '\\n' < $d/cmdline 2>/dev/null; break;; "
-		"  esac; "
-		"done 2>/dev/null", "r");
-	if (!p) return false;
-
-	char line[512];
-	char conf[512] = "";
-	int want = 0;   /* 'O' or 'c' when the value is the next argument */
-	while (fgets(line, sizeof(line), p)) {
-		char* nl = strpbrk(line, "\r\n");
-		if (nl) *nl = '\0';
-
-		/* Both spellings occur: tg5040 runs `-O/etc/wifi/sockets` joined, my282
-		 * runs `-c /path` as two arguments. Handling only the joined form found
-		 * nothing on my282 and silently fell back to a directory the frontend
-		 * does not watch - which is the whole bug this function exists to fix. */
-		if (want) {
-			if (want == 'O') snprintf(out, len, "%s", line);
-			else             snprintf(conf, sizeof(conf), "%s", line);
-			want = 0;
-			continue;
-		}
-		if (!strcmp(line, "-O")) { want = 'O'; continue; }
-		if (!strcmp(line, "-c")) { want = 'c'; continue; }
-		if (!strncmp(line, "-O", 2) && line[2]) snprintf(out, len, "%s", line + 2);
-		if (!strncmp(line, "-c", 2) && line[2]) snprintf(conf, sizeof(conf), "%s", line + 2);
-	}
-	pclose(p);
-
-	if (!out[0] && conf[0]) {
-		char cmd[600];
-		snprintf(cmd, sizeof(cmd),
-		         "sed -n 's/^ctrl_interface=\\(DIR=\\)\\?//p' '%s' 2>/dev/null "
-		         "| sed 's/ .*//' | head -1", conf);
-		FILE* c = popen(cmd, "r");
-		if (c) {
-			if (fgets(out, len, c)) {
-				char* nl = strpbrk(out, "\r\n");
-				if (nl) *nl = '\0';
-			}
-			pclose(c);
-		}
-	}
+	wifi_plat_out(out, len, "ctrl-dir");
 	return out[0] != '\0';
 }
 
@@ -2572,18 +2692,16 @@ bool NS_hotspotJoin(const char* ssid, const char* psk, char* err, int errlen) {
 	wifi_client_stack_down();
 	joined_hotspot = true;   /* set before the first failure path can return */
 
-	char cmd[256];
 	for (int attempt = 1; attempt <= NS_JOIN_ATTEMPTS; attempt++) {
 		system("ip link set wlan0 up 2>/dev/null");
 		system("wpa_supplicant -B -D nl80211 -i wlan0 -c /tmp/netplay_wpa.conf >/dev/null 2>&1");
 
 		/* Bounded per attempt: five unbounded tries is minutes of black screen. */
 		bool assoc = false;
-		snprintf(cmd, sizeof(cmd), "iw dev wlan0 link 2>/dev/null | grep -q '%s'", ssid);
 		for (int i = 0; i < NS_JOIN_ASSOC_S && !assoc; i++) {
 			if (ns_progress) ns_progress("Connecting", attempt, NS_JOIN_ATTEMPTS);
 			sleep(1);
-			assoc = system(cmd) == 0;
+			assoc = wifi_associated(ssid);
 		}
 
 		if (assoc) {
@@ -2592,9 +2710,20 @@ bool NS_hotspotJoin(const char* ssid, const char* psk, char* err, int errlen) {
 			 * simply dropped. */
 			if (ns_progress) ns_progress("Getting an address", attempt, NS_JOIN_ATTEMPTS);
 			sleep(1);
+			/* Poll for the address rather than trusting the client's exit
+			 * status: a platform whose DHCP is driven by the supplicant hook
+			 * has no exit status to read, and a client that is simply not
+			 * installed returns 127, which is not "no lease". */
 			for (int j = 0; j < 2; j++) {
-				if (system("udhcpc -i wlan0 -n -q -t 6 >/dev/null 2>&1") == 0
-				    && system("ip -4 addr show wlan0 2>/dev/null | grep -q 'inet '") == 0) {
+				wifi_plat("dhcp-start");
+				bool leased = false;
+				for (int w = 0; w < NS_JOIN_DHCP_S && !leased; w++) {
+					if (ns_progress)
+						ns_progress("Getting an address", attempt, NS_JOIN_ATTEMPTS);
+					sleep(1);
+					leased = wifi_has_ip();
+				}
+				if (leased) {
 					snprintf(joined_ssid, sizeof(joined_ssid), "%s", ssid);
 					snprintf(joined_psk,  sizeof(joined_psk),  "%s", psk);
 
@@ -2727,7 +2856,12 @@ void NS_wifiRestore(void) {
 	if (hotspot_running || hotspot_processes_alive()) NS_hotspotStop();
 
 	joined_hotspot = false;
-	if (wifi_client_stack_up()) remove(path);   /* see NS_wifiRecoverIfStranded */
+	if (wifi_client_stack_up()) {              /* see NS_wifiRecoverIfStranded */
+		remove(path);
+		char hook[512];
+		snprintf(hook, sizeof(hook), "%s/wifi_restore_hook", ns_state);
+		remove(hook);
+	}
 }
 
 /* Who is actually on our network.

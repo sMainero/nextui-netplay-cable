@@ -82,11 +82,53 @@ checks for both, refusing with a specific reason rather than half-working, and
 the UI omits the option entirely where it cannot succeed.
 
 This matters because the pak targets my282, tg5040, tg5050, my355 and h700, and
-only two of those have been measured. Treat the table above as two samples, not
-as the shape of the fleet - and note that the DHCP requirement is removable:
-the client already knows the host is at `10.0.0.1`, so a static `10.0.0.2` would
-drop `udhcpd` from the design and widen hosting to any device that can raise an
-AP. Not yet done.
+only two of those had been measured - and note that the DHCP requirement is
+removable: the client already knows the host is at `10.0.0.1`, so a static
+`10.0.0.2` would drop `udhcpd` from the design and widen hosting to any device
+that can raise an AP. Not yet done.
+
+### The client stack differs on every platform
+
+Building the client side from those two samples is what broke the H700. Every
+association check went through `iw` and every DHCP request through `udhcpc`, and
+the H700's Ubuntu rootfs has neither. Nothing failed loudly: `iw dev wlan0 link`
+on a device with no `iw` prints nothing and exits non-zero, which is exactly
+what "not associated" looks like. The join loop ran its full 5 x 11s and gave
+up; the restore path then "restored" WiFi into a state with no DHCP client at
+all, kept its recovery breadcrumb, and re-ran the same teardown on every
+subsequent launch - so WiFi needed a reboot after each session.
+
+`launcher/wifi-platform.sh` now owns this, as a table rather than a probe. The
+app reaches the same implementations through it rather than carrying a second
+copy that can drift.
+
+| | tg5040 / tg5050 | my282 | my355 | h700 |
+|---|---|---|---|---|
+| association | `iw` | `iw` | auto | **`wpa_cli status`** |
+| DHCP client | `udhcpc` | `udhcpc -s <script>` | **`dhcpcd`** | **`dhclient`** |
+| `wifi_init.sh` | `/etc/wifi/` | `$SYSTEM_PATH/etc/wifi/` | `$SYSTEM_PATH/etc/wifi/` | `$SYSTEM_PATH/etc/wifi/` |
+| supplicant ctrl dir | `/etc/wifi/sockets` | `/tmp/nextui-wifi` | `/var/run/wpa_supplicant` | `/tmp/wifi/sockets` |
+| ctrl dir spelling | `-O<dir>` joined | `-c <conf>` | `-O <dir>` | **`-C <dir>`** |
+| DHCP driven by | the pak | the pak | the pak | **`wpa_cli -a` hook** |
+
+Three consequences worth stating on their own:
+
+- **Hardcoding `/etc/wifi/wifi_init.sh` made that recovery route dead code on
+  three of the five platforms.** It is the only one of the four that keeps its
+  script outside `SYSTEM_PATH`.
+- **`udhcpc` exists on the Flip but must not be used there.** my355 runs
+  `dhcpcd`, and its own bring-up carries a comment about the two fighting over
+  `wlan0`'s address. Selection is by platform, not by what is first on `PATH`.
+- **H700 drives DHCP entirely from a `wpa_cli -a` action script.** Replaying the
+  supplicant without that hook leaves an interface that associates and never
+  gets an address again - for every future reassociation, not only ours. The
+  hook is captured alongside the supplicant command line and replayed with it.
+
+Anything unverified stays `auto` in that table, which degrades to the old
+probe-and-hope behaviour. That is the right default for an unmeasured platform,
+and it is visible there as a gap rather than hidden as an assumption.
+`testing/test-wifi-platform.sh` exercises each branch against stub rootfs trees
+containing only the tools that platform actually has.
 
 ### The driver constraint that shapes everything
 

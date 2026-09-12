@@ -21,6 +21,7 @@
 # Exported for the minarch shadow and any launcher helpers it invokes.
 export NETPLAY_PAK
 . "$NETPLAY_PAK/launcher/state-path.sh"
+. "$NETPLAY_PAK/launcher/wifi-platform.sh"
 
 # A session cannot retain process or network ownership across a reboot. Clean
 # that unambiguous leftover before deciding whether this launch is armed.
@@ -35,7 +36,7 @@ if [ -f "$NETPLAY_STATE/session" ]; then
 	# jitter on traffic as sparse as a few input bytes per frame. Re-applied
 	# here rather than only at arm time because it comes back whenever the
 	# interface reassociates. The app puts the prior value back on Turn off.
-	iw dev wlan0 set power_save off >/dev/null 2>&1
+	np_powersave off
 
 	# The app joins the ad hoc network when you pick a peer, but the platform
 	# re-establishes its own WiFi once the app exits, so by the time a game
