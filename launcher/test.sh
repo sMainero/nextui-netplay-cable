@@ -30,6 +30,17 @@ cp "$HERE/launch-stub.sh" "$HERE/install-stubs.sh" "$HERE/minarch.elf" "$HERE/wr
 chmod 755 "$NP/launcher"/*
 : > "$NP/bin/$PLATFORM/netplay_shim.so"
 
+# The cable guards at the bottom of this file run the real pre-launch.sh, which
+# under the `set -e` the launch routes inherit aborts if a WiFi step fails. A stub
+# bin of its own, so nothing from the host leaks in and the calls can be counted.
+STUB_BIN="$ROOT/stub-bin"
+mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/iw" <<EOF
+#!/bin/sh
+echo "iw \$*" >> "$ROOT/iw-calls"
+EOF
+chmod 755 "$STUB_BIN/iw"
+
 echo "== shared state migration"
 mkdir -p "$NP/state"
 printf 'legacy\n' > "$NP/state/migration-probe"
@@ -549,6 +560,113 @@ grep -q '^/Roms/.Netplay (NETPLAY)/Netplay' "$RECENTS" \
 [ ! -e "$ROOT/Emus/$PLATFORM/NETPLAY.pak/launch.sh" ] \
 	&& ok "disabled redirect removed" || bad "disabled redirect remains"
 
+echo
+echo "== link kind: the session is authoritative, and the fallback is the app's"
+printf 'role=host\nlink=cable\n' > "$ROOT/s-cable"
+printf 'role=host\nadhoc_ssid=nextui-TEST\n' > "$ROOT/s-legacy"
+printf 'role=host\nlink=bogus\n' > "$ROOT/s-bogus"
+. "$NP/launcher/state-path.sh"
+check "the session's own key is the answer" "$(netplay_link_kind "$ROOT/s-cable")" "cable"
+check "the previous build's ad-hoc session still reads as ad hoc" \
+	"$(netplay_link_kind "$ROOT/s-legacy")" "adhoc"
+check "an unrecognised token falls back to the same inference" \
+	"$(netplay_link_kind "$ROOT/s-bogus")" "wifi"
+check "no session at all is its own answer" "$(netplay_link_kind "$ROOT/none")" "none"
+
+echo
+echo "== the set of files an ended session removes"
+# The daemon's pid and status go with the broker's, because one left behind makes
+# the next session believe a daemon is already running. Its repair record and its
+# log deliberately do not: the record is a repair this device still owes, and a
+# log is not session state.
+REMOVAL=$(grep -A2 'rm -f "$1"' "$NP/launcher/state-path.sh")
+echo "$REMOVAL" | grep -q 'cable\.pid' \
+	&& ok "cable.pid is in the removal set" || bad "cable.pid is not in the removal set"
+echo "$REMOVAL" | grep -q 'cable\.status' \
+	&& ok "cable.status is in the removal set" || bad "cable.status is not in the removal set"
+echo "$REMOVAL" | grep -q 'usb_restore' \
+	&& bad "the repair record is removed with the session" || ok "the repair record is not"
+echo "$REMOVAL" | grep -q 'cable\.log' \
+	&& bad "the log is removed with the session" || ok "the log is not"
+
+printf 'role=host\nlink=cable\n' > "$STATE/session"
+: > "$STATE/broker.pid"; : > "$STATE/broker.status"
+: > "$STATE/cable.pid";  : > "$STATE/cable.status"
+: > "$STATE/usb_restore"; : > "$STATE/cable.log"
+netplay_end_session "$STATE/session"
+for f in session broker.pid broker.status cable.pid cable.status; do
+	[ -e "$STATE/$f" ] && bad "an ended session left $f behind" || ok "an ended session removed $f"
+done
+for f in usb_restore cable.log; do
+	[ -e "$STATE/$f" ] && ok "an ended session kept $f" || bad "an ended session removed $f"
+done
+rm -f "$STATE/usb_restore" "$STATE/cable.log"
+
+echo
+echo "== the repair record a reboot makes moot"
+# configfs is a RAM filesystem and the port's role is a register, so a reboot puts
+# the firmware's own gadget and its own port mode back by itself: a record that
+# outlived its boot names a repair that no longer exists. Both calls are guarded,
+# because the previous-boot path exits 10 - and this suite is under the same
+# `set -e` every launch route inherits.
+rc=0
+printf 'boot-now\n' > "$ROOT/boot-id"
+printf 'gadget=fw\nudc=abc\nrole_node=otg_role\nrole_value=device\n' > "$STATE/usb_restore"
+printf 'role=host\nboot_id=boot-now\n' > "$STATE/session"
+NETPLAY_BOOT_ID_PATH="$ROOT/boot-id" "$NP/launcher/session-cleanup.sh" >/dev/null 2>&1 || rc=$?
+check "a session from this boot is left alone" "$rc" "0"
+[ -e "$STATE/usb_restore" ] \
+	&& ok "and the record it owns is still there" \
+	|| bad "a live session's own repair record was dropped"
+rc=0
+printf 'role=host\nboot_id=boot-old\n' > "$STATE/session"
+NETPLAY_BOOT_ID_PATH="$ROOT/boot-id" "$NP/launcher/session-cleanup.sh" >/dev/null 2>&1 || rc=$?
+check "a previous boot exits 10, the code the UI reports" "$rc" "10"
+[ -e "$STATE/usb_restore" ] \
+	&& bad "a previous boot's repair record survived cleanup" \
+	|| ok "a previous boot's repair record was dropped"
+rm -f "$STATE/session" "$STATE/cleanup.log" "$STATE/cable.pid" "$STATE/cable.status"
+
+echo
+echo "== the WiFi work a cable launch does not do"
+# pre-launch.sh is sourced by the launch routes, so `set -e` is in force exactly
+# as it is at launch. The ad-hoc rejoin is spied on rather than run - the real one
+# would reach for a radio.
+mv "$NP/launcher/adhoc-join.sh" "$NP/launcher/adhoc-join.real"
+cat > "$NP/launcher/adhoc-join.sh" <<EOF
+#!/bin/sh
+echo "adhoc-join \$*" >> "$ROOT/adhoc-calls"
+EOF
+chmod 755 "$NP/launcher/adhoc-join.sh"
+prelaunch() { PATH="$STUB_BIN:$PATH" . "$NP/launcher/pre-launch.sh"; }
+
+: > "$ROOT/iw-calls"; : > "$ROOT/adhoc-calls"
+printf 'role=host\nlink=cable\n' > "$STATE/session"
+( prelaunch )
+[ -s "$ROOT/iw-calls" ] \
+	&& bad "a cable launch touched WiFi power-save" || ok "a cable launch left power-save alone"
+[ -s "$ROOT/adhoc-calls" ] \
+	&& bad "a cable launch ran the ad-hoc rejoin" || ok "a cable launch did not rejoin an ad-hoc network"
+
+: > "$ROOT/iw-calls"; : > "$ROOT/adhoc-calls"
+printf 'role=host\nlink=adhoc\nadhoc_ssid=nextui-TEST\n' > "$STATE/session"
+( prelaunch )
+[ -s "$ROOT/iw-calls" ] \
+	&& ok "an ad-hoc launch reapplied power-save" || bad "an ad-hoc launch skipped power-save"
+[ -s "$ROOT/adhoc-calls" ] \
+	&& ok "an ad-hoc launch rejoined the network" || bad "an ad-hoc launch skipped the rejoin"
+
+: > "$ROOT/adhoc-calls"
+printf 'role=host\nadhoc_ssid=nextui-TEST\n' > "$STATE/session"
+( prelaunch )
+[ -s "$ROOT/adhoc-calls" ] \
+	&& ok "a previous build's ad-hoc session still rejoins" \
+	|| bad "the fallback stopped an armed ad-hoc session rejoining"
+
+rm -f "$STATE/session"
+mv "$NP/launcher/adhoc-join.real" "$NP/launcher/adhoc-join.sh"
+
+echo
 echo
 [ "$fail" -eq 0 ] && echo "PASS" || echo "FAIL"
 exit $fail

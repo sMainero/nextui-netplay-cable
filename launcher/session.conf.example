@@ -12,6 +12,25 @@ port=55437
 #port=55437
 #peer=192.168.1.42
 
+# --- link kind -------------------------------------------------------------
+# Which medium this session runs over. Written by the setup app at arm time;
+# the launcher guards, the status line and the input-delay floor all read it
+# back, so it is the one place the transport is decided.
+#
+#   wifi   both devices already on a network; nothing was moved
+#   adhoc  this device serves the network, or joined the peer's
+#   cable  point-to-point over USB; no WiFi involvement at all
+#
+# A cable session draws input_delay from the cable floor, names the other end's
+# fixed address in peer=, and writes no adhoc_ssid/adhoc_psk - which is what
+# keeps adhoc-join.sh and the WiFi watchdog out of it. The USB gadget and the
+# point-to-point interface belong to a detached daemon, not to the launch.
+#
+# Absent (a session written by an older build), or unrecognised: the launcher
+# and the app both fall back to "ad hoc when adhoc_ssid is present, otherwise
+# wifi".
+link=wifi
+
 # The setup app generates these after comparing both devices. Installed cores
 # remain first choice; do not add compat_core.* by hand unless both devices have
 # the matching local fallback.

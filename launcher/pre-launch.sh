@@ -32,19 +32,32 @@ fi
 # Nothing below costs anything without a session, so a stock launch is
 # untouched - which is the whole point of leaving the mounts up permanently.
 if [ -f "$NETPLAY_STATE/session" ]; then
-	# Wi-Fi power save parks the radio between beacons: tens of milliseconds of
-	# jitter on traffic as sparse as a few input bytes per frame. Re-applied
-	# here rather than only at arm time because it comes back whenever the
-	# interface reassociates. The app puts the prior value back on Turn off.
-	np_powersave off
+	# Both steps below are WiFi work, and a cable link is not WiFi. It never
+	# moved the radio, so there is nothing to put back and nothing to
+	# re-assert: the cable daemon owns the gadget and its point-to-point
+	# interface, and both outlive this launch because the daemon is detached.
+	# Asking netplay_link_kind rather than testing for adhoc_ssid keeps one
+	# answer for "what is this link", shared with the app and with
+	# state-path.sh's end-session set.
+	if [ "$(netplay_link_kind "$NETPLAY_STATE/session")" = cable ]; then
+		:
+	else
+		# Wi-Fi power save parks the radio between beacons: tens of
+		# milliseconds of jitter on traffic as sparse as a few input bytes per
+		# frame. Re-applied here rather than only at arm time because it comes
+		# back whenever the interface reassociates. The app puts the prior value
+		# back on Turn off.
+		np_powersave off
 
-	# The app joins the ad hoc network when you pick a peer, but the platform
-	# re-establishes its own WiFi once the app exits, so by the time a game
-	# launches the device is back on the house network with the session still
-	# pointing at the host's ad hoc address. Re-join here; a no-op when the
-	# session is not ad hoc, or when we are already associated.
-	if [ -x "$NETPLAY_PAK/launcher/adhoc-join.sh" ]; then
-		"$NETPLAY_PAK/launcher/adhoc-join.sh" "$NETPLAY_STATE/session"
+		# The app joins the ad hoc network when you pick a peer, but the
+		# platform re-establishes its own WiFi once the app exits, so by the
+		# time a game launches the device is back on the house network with the
+		# session still pointing at the host's ad hoc address. Re-join here; a
+		# no-op when the session is not ad hoc, or when we are already
+		# associated.
+		if [ -x "$NETPLAY_PAK/launcher/adhoc-join.sh" ]; then
+			"$NETPLAY_PAK/launcher/adhoc-join.sh" "$NETPLAY_STATE/session"
+		fi
 	fi
 fi
 

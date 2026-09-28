@@ -17,6 +17,24 @@ Status vocabulary:
 
 ## Core play modes
 
+### Transports
+
+The play modes below are about *what the two devices agree on*. Orthogonally,
+they run over one of three transports, and the session file names which:
+
+| transport | `link=` | what it moves |
+|---|---|---|
+| same network | `wifi` | nothing; both devices were already associated |
+| ad hoc | `adhoc` | the radio — the host serves a network, the guest joins it |
+| USB-C cable | `cable` | nothing on the radio; a point-to-point USB link and a TUN interface on each end |
+
+A cable session writes no `adhoc_ssid`, which is what keeps the ad-hoc rejoin
+and the WiFi watchdog out of it; it takes the USB controller from the
+firmware's own `adb` gadget for the life of the session and gives it back
+afterwards, which is why it leaves a repair record behind if it is killed. See
+[cable.md](cable.md). Transport and mode are independent: an instanced-core
+session and a link-cable session both run over any of the three.
+
 ### 1. Shared-screen netplay — Implemented, hardening in progress
 
 Both devices run the same ROM and compatible core. The host and guest exchange

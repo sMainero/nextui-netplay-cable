@@ -35,6 +35,7 @@ ARTIFACTS = {
     "drastic-adapter": ("Emus/{platform}/NDS.pak/drastic/libs/libadvdrastic.so", "0644"),
     "netplay-shim": ("Tools/{platform}/Netplay.pak/bin/{platform}/netplay_shim.so", "0755"),
     "netplay-app": ("Tools/{platform}/Netplay.pak/bin/{platform}/netplay.elf", "0755"),
+    "netplay-cable": ("Tools/{platform}/Netplay.pak/bin/{platform}/netplay-cable.elf", "0755"),
     "netplay-launcher": ("Tools/{platform}/Netplay.pak/launcher/minarch.elf", "0755"),
 }
 
@@ -154,6 +155,17 @@ def validate_setting(value: str) -> str:
 
 
 def session_text(role, session_id, host_address, mode, settings):
+    # The medium is written down rather than left to be inferred. The harness
+    # cannot be handed a cable's fixed peer - --host is also its SSH control
+    # endpoint - so the kind is derived from the address it was given: an ad-hoc
+    # host hands out 10.0.0.x, and anything else is the network both devices were
+    # already on. A caller that knows better says so with --set link=cable, and
+    # that one wins; it is written once, in place of the derived line rather than
+    # beside it, because the shell readers take the FIRST link= and the app takes
+    # the LAST, and a session carrying both would have the two disagree.
+    link = None if any(item.partition("=")[0] == "link" for item in settings) else (
+        "adhoc" if is_adhoc_address(host_address) else "wifi"
+    )
     lines = [
         f"session_id={session_id}",
         "input_delay=3",
@@ -164,6 +176,8 @@ def session_text(role, session_id, host_address, mode, settings):
         f"role={role}",
         f"port={NETPLAY_PORT}",
     ]
+    if link:
+        lines.append(f"link={link}")
     if role == "client":
         lines.append(f"peer={host_address}")
     if mode != "auto":
@@ -426,7 +440,7 @@ def probe_script(platform):
         f"test -x {shlex.quote(nds + '/drastic/drastic')} && echo drastic_binary=yes || echo drastic_binary=no",
         "netstat -ltn 2>/dev/null | grep -q ':22 ' && echo ssh=yes || echo ssh=no",
         "ps | grep -E '[m]inui-list|[m]inarch|[d]rastic|[n]etplay.elf' >/dev/null && echo ui=busy || echo ui=idle",
-        f"for key in session_id role mode instanced_mgba instanced_gambatte; do "
+        f"for key in session_id role link mode instanced_mgba instanced_gambatte; do "
         f"value=$(sed -n \"s/^$key=//p\" {shlex.quote(session)} 2>/dev/null | tail -1); "
         "echo active_$key=${value:-missing}; done",
         f"printf 'mgba_selection='; grep -E 'launcher: (paired mGBA selected|shim=)' "

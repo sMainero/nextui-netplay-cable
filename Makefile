@@ -362,7 +362,7 @@ app:
 		$(MAKE) -s -C "$(BUILDER)" build PLATFORM=$$p PROJECT="$$PWD" \
 			CMD='sh -c "cd app && make PLATFORM='$$p' NEXTUI=/opt/nextui-src"' || exit 1; \
 	done
-	@ls -la bin/*/netplay.elf bin/*/netplay-broker.elf | awk '{printf "   %-46s %s bytes\n", $$NF, $$5}'
+	@ls -la bin/*/netplay.elf bin/*/netplay-broker.elf bin/*/netplay-cable.elf | awk '{printf "   %-46s %s bytes\n", $$NF, $$5}'
 
 test:
 	@./shim/test/run.sh
@@ -378,6 +378,7 @@ test:
 	@./testing/test-wifi-platform.sh
 	@./testing/test-log-rotation.sh
 	@./testing/test-wifi-watchdog.sh
+	@./testing/test-cable.sh
 	@./launcher/test.sh
 	@PYTHONDONTWRITEBYTECODE=1 python3 tools/test-netplay-harness.py
 
@@ -441,6 +442,7 @@ dist-base: $(BASE_DIST_CHECKS)
 		cp bin/$$p/netplay_shim.so "$(BASE_STAGE)/$(PAK)/bin/$$p/"; \
 		cp bin/$$p/netplay.elf "$(BASE_STAGE)/$(PAK)/bin/$$p/"; \
 		cp bin/$$p/netplay-broker.elf "$(BASE_STAGE)/$(PAK)/bin/$$p/"; \
+		cp bin/$$p/netplay-cable.elf "$(BASE_STAGE)/$(PAK)/bin/$$p/"; \
 		done
 	@chmod 755 "$(BASE_STAGE)/$(PAK)/launch.sh" "$(BASE_STAGE)/$(PAK)/launcher"/*
 	@find "$(BASE_STAGE)" -name '.DS_Store' -delete
@@ -485,6 +487,8 @@ check-app-%:
 		echo "missing bin/$*/netplay.elf - run 'make app' first"; exit 1; }
 	@test -f bin/$*/netplay-broker.elf || { \
 		echo "missing bin/$*/netplay-broker.elf - run 'make app' first"; exit 1; }
+	@test -f bin/$*/netplay-cable.elf || { \
+		echo "missing bin/$*/netplay-cable.elf - run 'make app' first"; exit 1; }
 
 clean:
 	rm -rf dist
