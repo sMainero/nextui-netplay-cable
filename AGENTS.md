@@ -191,6 +191,44 @@ requires.
 **There is no "share the cable power" feature to build.** See §3 for what to do
 instead.
 
+### 2.9 Opening an unguarded usbfs node blocks forever
+
+`open()` on a `/dev/bus/usb/BBB/DDD` node runs a runtime-PM auto-resume of the
+device. Open the wrong one and it never returns. Measured, from a daemon left in
+state `D` that no signal could kill and which held `npc0` and its claimed
+interface until a reboot:
+
+```
+syscall: 56 (openat)
+  msleep -> ohci_rh_resume -> ohci_bus_resume -> hcd_bus_resume
+  -> usb_resume_both -> usb_runtime_resume -> usb_autoresume_device
+  -> usbdev_open -> chrdev_open -> do_sys_open
+fds: 4 -> /dev/bus/usb   5 -> /dev/bus/usb/004
+```
+
+It hung on a **root hub**, reached while scanning (it held a bus directory fd)
+and opening every node to ask its descriptors. `ohci_rh_resume` waits in `msleep`
+for a resume that cannot complete because the device is gone.
+
+**Consequence:** never open a usbfs node you have not already identified. The
+peer's ids are in **sysfs** (`/sys/bus/usb/devices/*/idVendor`, `idProduct`,
+`busnum`, `devnum`), so `cp_host_scan` matches there and opens only the node it
+built from those numbers. A root hub's ids are never ours, and sysfs lists a
+device only while it is enumerated — so a node left behind by an unplugged cable
+is never opened at all. `cp_usb_is_peer()` — the open-then-ask-the-descriptors
+version — is gone for this reason.
+
+### 2.10 An unplug is `ECONNRESET`, and it is not fatal
+
+The endpoint read returns `ECONNRESET` when a host goes away (`Connection reset
+by peer`), and the write returns `ESHUTDOWN` (`Cannot send after transport
+endpoint shutdown`). Both are the **normal** end of a cable session.
+`cp_rx_worker` treats `ESHUTDOWN`/`EPROTO`/`ENODEV`/`EIO`/`ECONNRESET`/`EPIPE` as
+a bounded pause — sleep a tick and read again, because the same descriptor is
+valid once a host configures the interface again — and only the remaining errnos
+are fatal. Missing `ECONNRESET` from that set is what made a bumped cable kill the
+gadget end while the host end of the same cable simply waited.
+
 ---
 
 ## 3. Power: the socket rule decides who pays
@@ -346,13 +384,27 @@ pre-existing, unrelated, and not yours to fix by accident.
 
 ## 7. Open problems
 
-1. **A game session hung on "waiting for core…" and needed a power cycle.** Not
-   diagnosed. The link was up (`peer found; the link is up`, interface claimed,
-   512-byte packets) and both ends reached `state=up`, so the fault is in the
-   handshake, the state transfer or the lockstep loop rather than the transport.
-   Both ends write plenty of log (`netplay.txt`, `cable.log`, and per-process
-   shim logs when `verbose_logs=1`), so it should be findable. **This is the
-   biggest open bug.**
+**Fixed since this document was first written** (kept here because the symptoms
+are worth recognising):
+
+- *A bumped cable killed the gadget end and required re-arming the session.*
+  Missing `ECONNRESET` in `cp_rx_worker`'s pause set — now §2.10.
+- *A bumped cable wedged the host daemon in state `D`.* The scan opened every
+  usbfs node including a root hub — now §2.9.
+- *Noticeable input lag.* `NS_INPUT_DELAY_CABLE` was 3 (50 ms), borrowed from the
+  ad-hoc jitter before the cable had been measured. Measured cable RTT is
+  **0.329 / 0.557 / 0.661 ms**, so the floor is now **1** (16.7 ms, the lowest the
+  shim's parser accepts). `docs/cable.md` carries the measurement.
+
+Still open:
+
+1. **A launch with an armed session and no link waits ~30 s and then reports
+   `Peer unavailable.`** The shim has a timeout, so it is not an infinite hang —
+   but the message reaches the player only after half a minute of a
+   "Starting instanced link…" overlay, and the state that produced it (an armed
+   session whose peer is gone) is silent until then. The earlier "waiting for
+   core…" report is almost certainly this same class. Worth a shorter path to the
+   same sentence.
 2. **The app's crash recovery has never been executed.** `NS_cableRecoverIfStranded`
    (its controller-release and unmount/rmdir ordering fixed, its role restore
    converted to node reads) has only ever been reasoned about. A deliberately

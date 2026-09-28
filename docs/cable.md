@@ -359,7 +359,7 @@ link=wifi | adhoc | cable
 It is the single place the transport is decided. Written by the app at arm time,
 and read back by the launcher guards, the status line and the input-delay floor.
 
-- A **cable** session writes `peer=10.77.0.1` and `input_delay=3`, and writes **no
+- A **cable** session writes `peer=10.77.0.1` and `input_delay=1`, and writes **no
   `adhoc_ssid`/`adhoc_psk`** — which is what keeps `adhoc-join.sh` and the WiFi
   watchdog out of it.
 - A cable session **must not** write `wifi_restore`. If it did,
@@ -370,12 +370,18 @@ and read back by the launcher guards, the status line and the input-delay floor.
   otherwise — so an update does not end an armed session.
 
 `input_delay` is a **floor**, not a guess, and it is its own constant:
-`NS_INPUT_DELAY_CABLE` is 3 frames (50 ms) for a single hop with
-millisecond-scale latency. The shim may raise it from measured RTT and never
-lower it, and both sides converge because each adopts the higher of the two
-proposals. Measuring the cable and re-deriving the constant is a follow-up; the
-ad-hoc measurements (1.7 / 4.3 / 21.5 ms min/avg/max) are the closest analogue and
-the reason 3 is the starting point rather than 10.
+`NS_INPUT_DELAY_CABLE` is **1 frame (16.7 ms)**. The shim may raise it from
+measured RTT and never lower it, and both sides converge because each adopts the
+higher of the two proposals.
+
+The design started at 3, borrowed from the ad-hoc measurements (1.7 / 4.3 /
+21.5 ms min/avg/max) because the cable had not been measured yet. It has now:
+`ping` across the cable between two Bricks, 4/4 packets both directions,
+**0.329 / 0.557 / 0.661 ms** — a tenth of the ad-hoc average, with no access
+point, no radio and no second hop, so the jitter that made 3 right there does not
+exist here. Three frames was ~50 ms of deliberate input lag on a link whose round
+trip is half a millisecond, and it was felt in play. The shim's parser accepts
+1..20, so 1 is the lowest the floor can be.
 
 ## The status file, and the log
 

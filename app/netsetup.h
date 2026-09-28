@@ -323,8 +323,20 @@ int NS_compatSync(const char* host_ip, char* err, int errlen);
  * than aliasing the ad-hoc value: the two are not the same link, and a value
  * tuned for one transport being reused for the other is exactly the mistake the
  * two constants above were split to fix. Floor only - the shim may raise it from
- * the measured round trip and never lowers it. */
-#define NS_INPUT_DELAY_CABLE 3
+ * the measured round trip and never lowers it.
+ *
+ * **One frame, not three.** The design chose 3 from the ad-hoc measurements
+ * (1.7 / 4.3 / 21.5 ms min/avg/max) as the closest available analogue, because
+ * the cable had not been measured yet. It has now: `ping` across the cable, two
+ * Bricks, 4/4 packets both directions, **0.329 / 0.557 / 0.661 ms**. One tenth of
+ * the ad-hoc average, with no access point and no second hop, so the jitter that
+ * made 3 right there does not exist here - and 3 frames is ~50 ms of deliberate
+ * input lag on a link whose round trip is half a millisecond, which is felt.
+ *
+ * 1 (16.7 ms) is the floor the shim can still raise if a measurement ever asks
+ * for more; it never lowers it, so this is the value that decides how the cable
+ * feels. The shim's own parser accepts 1..20, so 1 is the lowest this can be. */
+#define NS_INPUT_DELAY_CABLE 1
 
 /* --- link kind --------------------------------------------------------- */
 

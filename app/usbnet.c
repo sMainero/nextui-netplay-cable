@@ -286,12 +286,18 @@ typedef char cp_urb_is_56_bytes[sizeof(CP_Urb) == 56 ? 1 : -1];
 #define CP_ENV_TUN      "NP_CABLE_TUN"
 #define CP_ENV_ROLE_DIR "NP_CABLE_ROLE_DIR"
 #define CP_ENV_USB_DIR  "NP_CABLE_USB_DIR"
+#define CP_ENV_USB_SYSFS "NP_CABLE_USB_SYSFS"
 #define CP_ROLE_NONE    "none"
 
 /* Where the host role looks for the peer. A constant rather than a CP_Facts
  * entry: only this role needs it, it is the same path on every platform, and
  * the override below is what makes it testable off the device. */
 #define CP_USB_DIR "/dev/bus/usb"
+
+/* The same devices as the kernel lists them, which is where the identity is read
+ * from *before* any usbfs node is opened. See cp_host_scan: opening first is not
+ * survivable on this kernel. */
+#define CP_USB_SYSFS "/sys/bus/usb/devices"
 
 //////////////////////////////////////////////////////////////////////////////
 // state this process owns
@@ -355,6 +361,7 @@ static CP_Urb   cp_urb_in;
 static CP_Urb   cp_urb_out;
 static uint8_t  cp_urb_in_buffer[CP_READ_MAX];
 static const char* cp_usb_dir = CP_USB_DIR;
+static const char* cp_usb_sysfs = CP_USB_SYSFS;
 
 /* The role helper's result file. Named after this process so that two daemons
  * that somehow run at once cannot read each other's answer, and removed on the
@@ -501,6 +508,7 @@ static void cp_facts_init(void) {
 		cp_facts.role_dir = strcmp(env, CP_ROLE_NONE) ? env : NULL;
 
 	if ((env = getenv(CP_ENV_USB_DIR)) && env[0]) cp_usb_dir = env;
+	if ((env = getenv(CP_ENV_USB_SYSFS)) && env[0]) cp_usb_sysfs = env;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1845,8 +1853,15 @@ static void* cp_rx_worker(void* arg) {
 			 * same read is valid again as soon as a host configures the
 			 * interface, so this is a pause rather than the end of the link -
 			 * and the pause is bounded, because an endpoint that refuses every
-			 * read must not become a spin. */
-			if (errno == ESHUTDOWN || errno == EPROTO || errno == ENODEV || errno == EIO) {
+			 * read must not become a spin.
+			 *
+			 * ECONNRESET and EPIPE belong here and are the *common* case: they
+			 * are what a bumped cable produces, and treating them as fatal is
+			 * what made an unplug end the daemon while the host end of the same
+			 * cable simply waited. A session then had to be re-armed from
+			 * scratch, with nothing on screen to say why. */
+			if (errno == ESHUTDOWN || errno == EPROTO || errno == ENODEV ||
+			    errno == EIO || errno == ECONNRESET || errno == EPIPE) {
 				cp_log("receive endpoint reset: %s\n", strerror(errno));
 				usleep(CP_TICK_MS * 1000);
 				continue;
@@ -2251,21 +2266,6 @@ static int cp_usb_descriptor(uint8_t type, void* out, size_t cap) {
 	return (int)ioctl(cp_usb_fd, CP_USBDEVFS_CONTROL, &transfer);
 }
 
-/* Whether the device on this file is the peer. The vendor/product pair is the
- * only thing that says so, and it is read the same way the host controller read
- * it: out of the device descriptor. Nothing is assumed about the name the
- * controller gave the device - the name carries no identity. */
-static bool cp_usb_is_peer(void) {
-	uint8_t device[18];
-
-	if (cp_usb_descriptor(CP_DT_DEVICE, device, sizeof(device)) < (int)sizeof(device)) return false;
-	if (device[0] < (uint8_t)sizeof(device) || device[1] != (uint8_t)CP_DT_DEVICE) return false;
-
-	uint16_t vendor = (uint16_t)(device[8] | ((uint16_t)device[9] << 8));
-	uint16_t product = (uint16_t)(device[10] | ((uint16_t)device[11] << 8));
-	return vendor == CP_VID && product == CP_PID;
-}
-
 /* The interface and the two endpoints, out of the configuration descriptor.
  *
  * The check is not decoration. The interface's class, its endpoint count and the
@@ -2330,48 +2330,57 @@ static bool cp_usb_parse_config(const uint8_t* config, size_t total, unsigned* i
 	return false;
 }
 
-/* The usbfs node the peer is on, or false.
+/* The identity is read from *sysfs*, and only a node whose ids already match is
+ * opened. That is not an optimisation - it is the difference between a daemon
+ * that survives a bumped cable and one that has to be rebooted.
  *
- * The directory is walked rather than the device numbers assumed: which bus and
- * which device number the controller handed out is not knowable before it
- * enumerates, and a stale node from an unplugged device may still be listed.
- * Only the shape of the name is checked here - the identity comes from the
- * descriptors, which is also why this opens the root hub and any other device on
- * the bus and reads them like anything else. */
+ * Opening a usbfs node runs a runtime-PM auto-resume of the device, and on this
+ * kernel opening the wrong one blocks the caller forever. Measured, from a
+ * daemon left in state `D` that no signal could kill:
+ *
+ *     openat -> usbdev_open -> usb_autoresume_device -> usb_resume_both
+ *            -> hcd_bus_resume -> ohci_bus_resume -> ohci_rh_resume -> msleep
+ *
+ * The node it hung on was a **root hub**. A root hub's ids are never ours, so a
+ * walk that matches before it opens never touches one - and the previous version
+ * opened every node on every bus and asked the descriptors afterwards, which is
+ * exactly how it met one.
+ *
+ * Matching first also removes the guesswork the old comment apologised for: sysfs
+ * lists a device only while it is enumerated, so a node left behind by an
+ * unplugged cable is never opened at all. */
 static bool cp_host_scan(char* node_out, size_t cap) {
-	DIR* bus = opendir(cp_usb_dir);
-	if (!bus) return false;
+	DIR* devices = opendir(cp_usb_sysfs);
+	if (!devices) return false;
+
+	/* Both ids are four lowercase hex digits with no prefix, which is what
+	 * sysfs reports and what `%04x` produces. */
+	char want_vendor[8], want_product[8];
+	snprintf(want_vendor, sizeof(want_vendor), "%04x", CP_VID);
+	snprintf(want_product, sizeof(want_product), "%04x", CP_PID);
 
 	bool found = false;
-	struct dirent* busentry;
-	while (!found && (busentry = readdir(bus)) != NULL) {
-		if (busentry->d_name[0] < '0' || busentry->d_name[0] > '9') continue;
+	struct dirent* entry;
+	while (!found && (entry = readdir(devices)) != NULL) {
+		if (entry->d_name[0] == '.') continue;
 
-		char busdir[CP_LINE_MAX];
-		if (snprintf(busdir, sizeof(busdir), "%s/%s", cp_usb_dir, busentry->d_name) >= (int)sizeof(busdir)) continue;
+		char dir[CP_LINE_MAX], path[CP_LINE_MAX], value[16], bus[16], dev[16];
+		if (snprintf(dir, sizeof(dir), "%s/%s", cp_usb_sysfs, entry->d_name) >= (int)sizeof(dir)) continue;
 
-		DIR* devices = opendir(busdir);
-		if (!devices) continue;
+		if (snprintf(path, sizeof(path), "%s/idVendor", dir) >= (int)sizeof(path) ||
+		    !cp_read_attr(path, value, sizeof(value)) || strcmp(value, want_vendor)) continue;
+		if (snprintf(path, sizeof(path), "%s/idProduct", dir) >= (int)sizeof(path) ||
+		    !cp_read_attr(path, value, sizeof(value)) || strcmp(value, want_product)) continue;
 
-		struct dirent* deventry;
-		while (!found && (deventry = readdir(devices)) != NULL) {
-			if (deventry->d_name[0] < '0' || deventry->d_name[0] > '9') continue;
+		if (snprintf(path, sizeof(path), "%s/busnum", dir) >= (int)sizeof(path) ||
+		    !cp_read_attr(path, bus, sizeof(bus))) continue;
+		if (snprintf(path, sizeof(path), "%s/devnum", dir) >= (int)sizeof(path) ||
+		    !cp_read_attr(path, dev, sizeof(dev))) continue;
 
-			char node[CP_LINE_MAX];
-			if (snprintf(node, sizeof(node), "%s/%s", busdir, deventry->d_name) >= (int)sizeof(node)) continue;
-
-			cp_usb_fd = open(node, O_RDWR | O_NONBLOCK);
-			if (cp_usb_fd < 0) continue;
-
-			int n = 0;
-			if (cp_usb_is_peer()) n = snprintf(node_out, cap, "%s", node);
-			close(cp_usb_fd);
-			cp_usb_fd = -1;
-			if (n > 0 && (size_t)n < cap) found = true;
-		}
-		closedir(devices);
+		int n = snprintf(node_out, cap, "%s/%03d/%03d", cp_usb_dir, atoi(bus), atoi(dev));
+		if (n > 0 && (size_t)n < cap) found = true;
 	}
-	closedir(bus);
+	closedir(devices);
 	return found;
 }
 

@@ -2849,7 +2849,21 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	ns_link_note(link);
 	fprintf(f, "link=%s\n", NS_linkKindName(link));
 	fprintf(f, "input_delay=%d\n", NS_inputDelayForKind(link));
-	fprintf(f, "input_delay_auto=1\n");
+
+	/* `input_delay_auto=1` invites the shim to raise the delay from the round trip
+	 * it measures. For a cable that invitation is a cost and not a protection:
+	 * the shim's proposal is ceil(max_rtt / one frame) + 1 with a floor of 2, so
+	 * a link whose round trip is about a millisecond - a fifteenth of a frame -
+	 * still comes back as 2, and 2 is one frame (16.7 ms) more input lag than a
+	 * measured cable needs. The app's value is measured for this transport and
+	 * the shim can never lower it, so pinning it is what the cable wants. The
+	 * other two transports keep the invitation, where the jitter it guards
+	 * against is real and measured.
+	 *
+	 * Agreement between the two devices is unaffected: the shim adopts the higher
+	 * of the two peers' values however either side is pinned (adopt_peer_delay),
+	 * so a peer whose link really did need more still wins. */
+	if (link != NS_LINK_CABLE) fprintf(f, "input_delay_auto=1\n");
 
 	/* Kept in the session format while peer executable sharing is frozen. */
 	fprintf(f, "share_cores=%d\n", NS_settings()->share_cores ? 1 : 0);
