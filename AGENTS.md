@@ -258,6 +258,20 @@ powered, session or not.
 This is why `bottom ↔ bottom` is worse: it leaves neither charge socket free,
 and the end that would lose its charger is the end doing the sourcing.
 
+**The host end switches its port only when the peer is not otherwise visible.**
+Forcing the port to host is what brings up the bottom socket's controller, and in
+host mode that socket *sources* 5 V rather than accepting a charger — so an
+unconditional switch makes "cable in the top, charger in the bottom" ask one
+socket to be both. `cp_host_start` scans first and switches only if nothing
+answers, and if it did switch and the peer then appears on the top socket's
+controller the socket is given back (`cp_bus_is_top_host`, keyed on
+`5200000.ehci1`), because the switch is provably not what made the peer visible.
+Measured on the host end with the cable in the top socket: the peer sat on bus 1
+all session while buses 3 and 4 — `5101000.ehci0`/`ohci0`, the bottom socket's, up
+only because of the switch — held nothing. A hard kill makes it moot: the port
+mode and the record both go back on the next launch or a reboot, and until then
+the count is costing the charge socket, not the device.
+
 **Measurements to be careful with:** the fuel counter moves in 30-unit steps
 (`charge_full` = 3000), so one step is 1% — a 90-second window can only show
 0 or ±1%. For a rate, sample 10–15 minutes. And `axp2202-battery/status` has been

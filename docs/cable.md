@@ -154,6 +154,33 @@ This is also why `bottom ↔ bottom` is worse: it would leave *neither* charge
 socket free, and the end that would lose its charger is the end doing the
 sourcing.
 
+**So the switch is only made when it is needed.** Forcing the port to host is
+what brings up the bottom socket's host controller, and in host mode that socket
+*sources* 5 V instead of accepting a charger — which would put "the cable goes in
+the top" and "the charger goes in the bottom" in conflict over one socket.
+
+The host end therefore looks before it switches: the peer is scanned for on the
+host controllers that are already up, and the port is forced only if nothing
+answers. The top socket's controller is host-only and bound from boot, so with
+the cable there the peer is visible immediately and the port is never touched.
+If the port *was* forced — the cable went in after the session was armed, or it
+is in the bottom socket — and the peer then appears on the top socket's
+controller, the socket is given back as soon as the attachment is real, because
+the switch is provably not what made the peer visible.
+
+Measured on the host end, with the cable in the top socket and `otg_role` reading
+`usb_host`, peer claimed on `/dev/bus/usb/001/007`:
+
+| controller | buses | contents |
+|---|---|---|
+| `5200000.ehci1` + `5200000.ohci1` — **top socket** | 1, 2 | **the peer** |
+| `5101000.ehci0` + `5101000.ohci0` — bottom socket, up only because of the switch | 3, 4 | nothing |
+
+That is what the fix keys on: which controller answered, not what looked
+different afterwards. A peer the top socket's controller can already see was
+reachable without the switch, so the switch was costing the charge socket for
+nothing.
+
 The charging current itself is not ours to steer. Every charge-control attribute
 on the PMIC is mode `0444` with no `store` callback — a write to
 `axp2202-usb/input_current_limit` or `axp2202-battery/constant_charge_current`
