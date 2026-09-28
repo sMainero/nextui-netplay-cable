@@ -40,6 +40,33 @@ available — no game files are sent between devices. So if you want to trade be
 isn't met, the game restarts automatically on the normal link-cable path and
 plays as it always did.
 
+### USB-C cable (tg5040)
+
+A third transport: one device presents a USB gadget, the other enumerates it, and
+plain IPv4 runs over the cable. No radio is touched, so nothing about your WiFi is
+disturbed, and of the three it has by far the lowest latency.
+
+Three things to know. None is obvious, and getting one wrong looks like a broken
+build:
+
+- **Both devices need this build.** One end presents the link and the other
+  enumerates it, so an older Netplay on the far end cannot take part in a cable
+  session. WiFi and ad hoc are unaffected either way — a mixed pair still plays
+  over the network.
+- **The two USB-C sockets are not interchangeable.** The device you pick
+  **Host ▸ Cable (USB)** on takes the cable in its **bottom** socket; the device
+  you pick **Join ▸ USB cable peer** on takes it in its **top** socket. On the
+  wrong socket nothing happens and nothing says why: the hosting end sits on
+  "waiting for the other device" and the joining end reports "no cable peer".
+- **The joining end powers the other one.** A USB host supplies the 5 V, so the
+device you pick Join on runs its battery down charging its partner. Its bottom
+socket is free, because the cable is in its top one — **put a charger there.**
+The hosting end is charged through the cable, so it needs nothing.
+
+`adb` stops working for the life of a cable session: the link takes the USB
+controller from the firmware's own gadget. It returns when the session ends, and a
+reboot always restores it.
+
 ## Compatibility
 
 The .pak will check each installed core's build for shared-screen netplay. Matching builds = maximum compatibility. If the builds don't match, it can attempt to fall back on specially compiled "compatibility cores" that should work regardless.
