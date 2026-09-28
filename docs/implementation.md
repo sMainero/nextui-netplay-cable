@@ -502,7 +502,8 @@ apart as two codebases.
 
 ### Saves: send the host's, or keep your own?
 
-Mode decides it, and the two modes want opposite things:
+Mode decides it — not transport, which is why the third one below changes none
+of this — and the two modes want opposite things:
 
 - **Shared screen**: both devices run one logical console in lockstep, so the
   save is part of the emulated state. The host's `.sav` **must** be sent or the

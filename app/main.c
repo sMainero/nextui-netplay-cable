@@ -64,6 +64,27 @@ static int     adhoc_count = 0;
 static int     join_total = 0;      /* peer_count + adhoc_count */
 static NS_Peer* join_at(int i) { return i < peer_count ? &peers[i] : &adhoc[i - peer_count]; }
 
+/* The Join list is three sources in one index space: announcements heard on the
+ * network we are already on, ad hoc networks found by scanning for our prefix,
+ * and the cable - which is neither, because its peer is on the other end of a
+ * wire rather than on a network.
+ *
+ * The cable row is last, and derived from the two counts rather than remembered:
+ * the rows above it come and go as announcements arrive and scans run, and a
+ * fixed row that moved with them would move the selection under the user.
+ * join_recount is the one place the length is computed, so the list and the
+ * position of that row cannot disagree.
+ *
+ * The row exists only where the link could ever work - NS_cableSupported is
+ * cached, so asking for it here is free. */
+static int cable_row(void) { return NS_cableSupported() ? peer_count + adhoc_count : -1; }
+
+static void join_recount(void) {
+	join_total = peer_count + adhoc_count;
+	if (cable_row() >= 0) join_total++;
+}
+
+
 /* A hotspot can be visible both through its last broadcast announcement and
  * through the WiFi scan. They are two sightings of one host, not two choices.
  * Prefer the announcement: it carries platform metadata and credentials. Mark
@@ -74,7 +95,7 @@ static void dedupe_adhoc(void) {
 	for (int i = 0; i < adhoc_count; i++) {
 		bool duplicate = false;
 		for (int j = 0; j < peer_count; j++) {
-			if (peers[j].hotspot && peers[j].ssid[0] &&
+			if (peers[j].link == NS_LINK_ADHOC && peers[j].ssid[0] &&
 			    !strcmp(peers[j].ssid, adhoc[i].ssid)) {
 				peers[j].scanned = true;
 				duplicate = true;
@@ -155,7 +176,6 @@ static int draw_row(SDL_Surface* screen_s, const char* text, int y, bool selecte
  * you need to tell an ad hoc session from a failed one. Submenus keep the top
  * level short enough that the status line is always visible. */
 enum { MENU_HOST, MENU_JOIN, MENU_TOOLS, MENU_COUNT };
-enum { HOST_ADHOC, HOST_WIFI, HOST_COUNT };
 enum { TOOL_SETTINGS, TOOL_DEBUG, TOOL_FIXWIFI, TOOL_OFF, TOOL_COUNT };
 enum { SET_SIMPLE, SET_COMPAT, SET_INSTANCED, SET_GAMESWITCHER, SET_COUNT };
 enum { DEBUG_FORCE_COMPAT, DEBUG_VERBOSE_LOGS, DEBUG_CHECKS, DEBUG_COUNT };
@@ -169,16 +189,42 @@ static const char* menu_label(int item) {
 	return "";
 }
 
-/* Creating our own network needs an AP-capable interface. Offering it on a
- * device that cannot do it produces a failure the user cannot act on, so the
- * entry is simply absent there. */
-static int host_menu_count(void) { return NS_canHostAdhoc() ? HOST_COUNT : 1; }
+/* Which host entries this device can actually offer, in the order they are
+ * shown.
+ *
+ * The entries are link kinds rather than a private enum beside them: a row and
+ * the session it arms are the same answer to "which medium", and a second
+ * vocabulary for it is exactly the kind of thing that drifts out of step with
+ * the first. Creating a network needs an AP-capable interface; hosting over a
+ * cable needs a controller, a TUN device and a writable configfs. A device can
+ * have either without the other, so the entries are filtered into a list the
+ * cursor indexes into - which is what the single-entry special case that used to
+ * live here could not express.
+ *
+ * Built rather than remembered, for the same reason the Join count is: the
+ * answer is a property of the device, and the cursor is an index into the list
+ * it builds. */
+#define HOST_MAX 3
 
-static const char* host_label(int item) {
-	if (!NS_canHostAdhoc()) item = HOST_WIFI;   /* only one entry to show */
-	switch (item) {
-	case HOST_ADHOC: return "Create ad hoc network";
-	case HOST_WIFI:  return "Host over WiFi";
+typedef char host_max_covers_every_kind[HOST_MAX >= NS_LINK_CABLE + 1 ? 1 : -1];
+
+static NS_LinkKind host_entries[HOST_MAX];
+
+static int host_menu_build(void) {
+	int n = 0;
+	if (NS_canHostAdhoc()) host_entries[n++] = NS_LINK_ADHOC;
+	host_entries[n++] = NS_LINK_WIFI;
+	if (NS_cableSupported()) host_entries[n++] = NS_LINK_CABLE;
+	return n;
+}
+
+/* What each hosting row is called. The ad-hoc one says it creates a network
+ * because that is the thing it does that the other two do not. */
+static const char* host_label(NS_LinkKind kind) {
+	switch (kind) {
+	case NS_LINK_ADHOC: return "Create ad hoc network";
+	case NS_LINK_WIFI:  return "Host over WiFi";
+	case NS_LINK_CABLE: return "Cable (USB)";
 	}
 	return "";
 }
@@ -311,6 +357,18 @@ static void wifi_poll(bool force) {
 	if (c.valid && c.ip[0]) snprintf(local_ip, sizeof(local_ip), "%s", c.ip);
 }
 
+/* Whether the far end of the cable is there, sampled on the armed session's own
+ * one-second tick rather than per frame.
+ *
+ * NS_cablePeerPresent opens and parses the daemon's status file, and this screen
+ * redraws at render rate - so it is asked on the cadence the radio is asked on,
+ * for the reason above. NS_linkKind is cached, so most ticks cost nothing. */
+static bool cable_peer_present = false;
+
+static void cable_poll(void) {
+	cable_peer_present = NS_linkKind() == NS_LINK_CABLE && NS_cablePeerPresent();
+}
+
 /* SSID plus what it means for us: the address a peer would dial. */
 static int draw_wifi_line(SDL_Surface* s, int y) {
 	char line[160];
@@ -387,8 +445,13 @@ static void render(SDL_Surface* s) {
 		int y = SCALE1(PADDING + 44);
 		if (armed) {
 			char line[128];
+			/* What this session runs over. A network name only answers that
+			 * question for the two WiFi transports: a cable session has no
+			 * network, and falling back to the radio's SSID said
+			 * "Hosting: <house network>" about a link that never touched it. */
 			const char* network = session.network[0] ? session.network
-			                    : wifi_up ? wifi_ssid : "WiFi";
+			                    : session.link == NS_LINK_WIFI && wifi_up ? wifi_ssid
+			                    : NS_linkKindLabel(session.link);
 			if (session.role == NS_ROLE_HOST) {
 				snprintf(line, sizeof(line), "Hosting: %s", network);
 				y = draw_line(s, line, y, COLOR_WHITE, false);
@@ -413,6 +476,16 @@ static void render(SDL_Surface* s) {
 				         session.host[0] ? session.host : "unknown");
 				y = draw_line(s, line, y + SCALE1(4), COLOR_GRAY, true);
 			}
+			/* The one thing this screen can say about a cable link and cannot say
+			 * about the others: whether there is still something on the other end
+			 * of the wire. A cable session does not end when it is unplugged, so
+			 * "armed" and "reachable" are different answers here. */
+			if (session.link == NS_LINK_CABLE) {
+				y = draw_line(s, cable_peer_present
+				              ? "Cable: the other device is there"
+				              : "Cable: no other device on the wire",
+				              y + SCALE1(4), COLOR_GRAY, true);
+			}
 			y = draw_row(s, "Tools", y + SCALE1(8), true);
 		} else {
 			for (int i = 0; i < MENU_COUNT; i++)
@@ -428,11 +501,19 @@ static void render(SDL_Surface* s) {
 	case SCREEN_HOST_MENU: {
 		draw_title(s, "Host");
 		int y = SCALE1(PADDING + 44);
-		for (int i = 0; i < host_menu_count(); i++)
-			y = draw_row(s, host_label(i), y, i == sub_sel);
+		int n = host_menu_build();
+		for (int i = 0; i < n; i++)
+			y = draw_row(s, host_label(host_entries[i]), y, i == sub_sel);
+		/* Why an entry the user may have expected is not here. The rule this
+		 * pak's probes follow is that a capability the platform lacks is shown as
+		 * a visible gap rather than assumed away - and the precise reason is in
+		 * the startup log either way. */
 		if (!NS_canHostAdhoc())
 			y = draw_line(s, "This device cannot create a network (no AP interface).",
 			              y + SCALE1(6), COLOR_GRAY, true);
+		if (!NS_cableSupported())
+			y = draw_line(s, "This device cannot host over a cable (no USB gadget support).",
+			              y + SCALE1(2), COLOR_GRAY, true);
 		y = draw_wifi_line(s, y + SCALE1(8));
 		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
 		GFX_blitButtonGroup((char*[]){"B", "BACK", "A", "SELECT", NULL}, 1, s, 1);
@@ -578,27 +659,38 @@ static void render(SDL_Surface* s) {
 	case SCREEN_JOINING: {
 		draw_title(s, "Join");
 		int y = SCALE1(PADDING + 44);
-		if (join_total == 0) {
+		/* The cable row is not something that was looked for: its peer is a wire
+		 * away, so it is offered from the first frame, before the search has
+		 * found anything - and the hint below is about the other two sources
+		 * rather than about the list being empty. */
+		int cable = cable_row();
+		for (int i = 0; i < join_total; i++) {
+			if (i == cable) {
+				y = draw_row(s, "USB cable peer", y, i == peer_sel);
+				continue;
+			}
+
+			NS_Peer* pr = join_at(i);
+			char line[128];
+			if (pr->scanned) {
+				/* The SSID carries the host's code, which is what the user
+				 * sees on the hosting device - that is the thing to match. */
+				snprintf(line, sizeof(line), "%s  (%s)", pr->ssid,
+				         NS_linkKindLabel(pr->link));
+			} else {
+				int same = !strcmp(pr->platform, NS_platform());
+				snprintf(line, sizeof(line), "%s  %s%s", pr->ip,
+				         NS_linkKindLabel(pr->link),
+				         same ? "" : "  (different device)");
+			}
+			y = draw_row(s, line, y, i == peer_sel);
+		}
+		if (peer_count + adhoc_count == 0) {
+			y += SCALE1(4);
 			y = draw_line(s, "Looking for a host...", y, COLOR_WHITE, false);
 			y += SCALE1(4);
 			y = draw_line(s, "On WiFi: the host session must still be armed.", y, COLOR_GRAY, true);
 			y = draw_line(s, "Ad hoc: press Y to scan again.", y, COLOR_GRAY, true);
-		} else {
-			for (int i = 0; i < join_total; i++) {
-				NS_Peer* pr = join_at(i);
-				char line[128];
-				if (pr->scanned) {
-					/* The SSID carries the host's code, which is what the user
-					 * sees on the hosting device - that is the thing to match. */
-					snprintf(line, sizeof(line), "%s  (ad hoc)", pr->ssid);
-				} else {
-					int same = !strcmp(pr->platform, NS_platform());
-					snprintf(line, sizeof(line), "%s%s%s", pr->ip,
-					         pr->hotspot ? "  ad hoc" : "  WiFi",
-					         same ? "" : "  (different device)");
-				}
-				y = draw_row(s, line, y, i == peer_sel);
-			}
 		}
 		y = draw_wifi_line(s, y + SCALE1(8));
 		if (status[0]) draw_line(s, status, y, COLOR_GRAY, true);
@@ -621,8 +713,14 @@ static void abort_arm_attempt(bool may_have_activated) {
 	NS_compatServeStop();
 	if (may_have_activated)
 		NS_disarm();
-	else
+	else {
 		NS_hotspotStop();
+		/* The cable daemon is started *before* the session is armed - the link
+		 * has to be up before it can be named - so a preflight that fails after
+		 * it is up owns it, and NS_disarm is not reached on that path. It is
+		 * detached: nothing else would ever stop it. */
+		NS_cableStop();
+	}
 	hosting_hotspot = 0;
 }
 
@@ -694,15 +792,20 @@ static void do_arm(NS_Role role, const char* peer) {
 			core_note[0] = '\0';
 	}
 
-	int adhoc = NS_hotspotActive();
+	NS_LinkKind link = NS_linkKind();
+	/* The address a peer would dial, which follows the transport: over WiFi it is
+	 * whatever the radio was given, and over a cable it is the fixed address of
+	 * the end this device is. Asking rather than reading the WiFi connection,
+	 * whose answer has nothing to do with a link that never touched the radio -
+	 * the medium is the one thing that decides which of the two this is. */
+	char reach[NS_IP_LEN];
+	if (!NS_linkIP(link, reach, sizeof(reach))) snprintf(reach, sizeof(reach), "%s", local_ip);
 	if (role == NS_ROLE_HOST)
 		snprintf(status, sizeof(status), "Hosting on %s  -  %s, delay %d",
-		         local_ip, adhoc ? "ad hoc" : "WiFi",
-		         adhoc ? NS_INPUT_DELAY_ADHOC : NS_INPUT_DELAY_WIFI);
+		         reach, NS_linkKindLabel(link), NS_inputDelayForKind(link));
 	else
 		snprintf(status, sizeof(status), "Joined %s  -  %s, delay %d%s",
-		         peer, adhoc ? "ad hoc" : "WiFi",
-		         adhoc ? NS_INPUT_DELAY_ADHOC : NS_INPUT_DELAY_WIFI, core_note);
+		         peer, NS_linkKindLabel(link), NS_inputDelayForKind(link), core_note);
 	screen = SCREEN_MENU;
 }
 
@@ -734,11 +837,23 @@ int main(int argc, char* argv[]) {
 	// to leave the device associated to nothing, with no way back except the
 	// system WiFi menu. Check on every launch, before anything else.
 	NS_Recovery recovered = NS_wifiRecoverIfStranded();
+	/* The cable link takes things from the firmware the same way an ad-hoc
+	 * session takes the radio - the USB controller out of the firmware's gadget,
+	 * and the port's role - and it leaves the same kind of record when it dies
+	 * before putting them back. Repaired on the same launch, before anything
+	 * else: this is the pass that gets adb working again after a cable session
+	 * that was killed rather than ended. */
+	NS_Recovery cable_recovered = NS_cableRecoverIfStranded();
 	if (recovered == NS_RECOVERY_DONE) {
 		snprintf(status, sizeof(status), "Reconnected to WiFi after an ad hoc session.");
 	} else if (recovered == NS_RECOVERY_FAILED) {
 		snprintf(status, sizeof(status),
 		         "Could not reconnect to WiFi - use Restore WiFi, or reboot.");
+	} else if (cable_recovered == NS_RECOVERY_DONE) {
+		snprintf(status, sizeof(status), "Put the USB port back after a cable session.");
+	} else if (cable_recovered == NS_RECOVERY_FAILED) {
+		snprintf(status, sizeof(status),
+		         "Could not put the USB port back - a reboot will finish the repair.");
 	} else if (cleaned_leftover) {
 		snprintf(status, sizeof(status), "Cleaned up a session left by a previous boot.");
 	}
@@ -783,17 +898,29 @@ int main(int argc, char* argv[]) {
 			uint32_t now = SDL_GetTicks();
 			if (!session_checked_ms || now - session_checked_ms >= 1000) {
 				session_checked_ms = now;
+				/* The session's own re-read is also the one place the cable's
+				 * peer question is asked: it costs a file read, and this loop
+				 * runs at frame rate. */
+				cable_poll();
 				dirty = 1;
 			}
 		}
 
 		/* X ends the session from any screen. It is the thing most often
 		 * wanted and it used to be buried in the list. */
+		/* X ends the session from any screen. It is the thing most often
+		 * wanted and it used to be buried in the list. */
 		if (PAD_justPressed(BTN_X) && NS_isArmed()) {
 			// NS_endSession stops the AP and restores wifi itself; calling
 			// NS_hotspotStop again here ran the teardown twice and logged a
 			// spurious "nothing recorded to restore wifi with".
-			set_progress("Restoring original WiFi", "Leaving the ad hoc network.");
+			/* Which teardown the spinner is covering depends on the medium, and a
+			 * cable session restores no WiFi at all: it puts a USB controller and
+			 * a port role back and never touched the radio. */
+			if (NS_linkKind() == NS_LINK_CABLE)
+				set_progress("Ending the cable link", "Putting the USB port back.");
+			else
+				set_progress("Restoring original WiFi", "Leaving the ad hoc network.");
 			NS_endSession();
 			set_progress("Joining", "This can take up to a minute.");
 			core_note[0] = '\0';
@@ -803,9 +930,12 @@ int main(int argc, char* argv[]) {
 			 * were on while the live icon reports the one we are on - which is
 			 * how a device claiming to be connected showed no WiFi icon. */
 			wifi_poll(true);
-			snprintf(status, sizeof(status), wifi_up
-			         ? "Session ended. Bindings kept."
-			         : "Session ended. Original WiFi recovery continues...");
+			/* "Recovery continues" is a sentence about the radio, so a cable
+			 * session does not get it whatever the radio happens to be doing. */
+			if (wifi_up || NS_linkKind() == NS_LINK_CABLE)
+				snprintf(status, sizeof(status), "Session ended. Bindings kept.");
+			else
+				snprintf(status, sizeof(status), "Session ended. Original WiFi recovery continues...");
 			screen = SCREEN_MENU;
 			dirty = 1;
 		}
@@ -839,7 +969,8 @@ int main(int argc, char* argv[]) {
 				case MENU_HOST:  screen = SCREEN_HOST_MENU; break;
 				case MENU_TOOLS: screen = SCREEN_TOOLS; break;
 				case MENU_JOIN:
-					peer_count = 0; peer_sel = 0; adhoc_count = 0; join_total = 0;
+					peer_count = 0; peer_sel = 0; adhoc_count = 0;
+					join_recount();
 					NS_discoverTick(NULL, 0);
 					NS_discoverStart();
 					screen = SCREEN_JOINING;
@@ -848,6 +979,7 @@ int main(int argc, char* argv[]) {
 					snprintf(status, sizeof(status), "Scanning for ad hoc networks...");
 					render(s);
 					adhoc_count = NS_scanAdhoc(adhoc, NS_MAX_PEERS);
+					join_recount();
 					status[0] = '\0';
 					break;
 				}
@@ -856,15 +988,19 @@ int main(int argc, char* argv[]) {
 			break;
 
 		case SCREEN_HOST_MENU: {
-			int n = host_menu_count();
+			int n = host_menu_build();
 			if (PAD_justPressed(BTN_UP))   { sub_sel = (sub_sel + n - 1) % n; dirty = 1; }
 			if (PAD_justPressed(BTN_DOWN)) { sub_sel = (sub_sel + 1) % n; dirty = 1; }
 			if (PAD_justPressed(BTN_B))    { screen = SCREEN_MENU; dirty = 1; }
 			if (PAD_justPressed(BTN_A)) {
-				int choice = NS_canHostAdhoc() ? sub_sel : HOST_WIFI;
+				/* The cursor indexes the entries this device can offer, so the
+				 * choice is resolved through the same list the rows were drawn
+				 * from - and clamped, because it can outlive the screen it was
+				 * set on. */
+				NS_LinkKind choice = sub_sel < n ? host_entries[sub_sel] : NS_LINK_WIFI;
 				status[0] = '\0';
 
-				if (choice == HOST_ADHOC) {
+				if (choice == NS_LINK_ADHOC) {
 					NS_hotspotCredentials(hs_ssid, sizeof(hs_ssid), hs_psk, sizeof(hs_psk));
 					// The channel survey takes a couple of seconds; say so.
 					snprintf(status, sizeof(status), "Surveying channels...");
@@ -879,6 +1015,32 @@ int main(int argc, char* argv[]) {
 					hosting_hotspot = 1;
 					snprintf(local_ip, sizeof(local_ip), "%s", NS_HOTSPOT_HOST_IP);
 					NS_announceHotspot(hs_ssid, hs_psk);
+				} else if (choice == NS_LINK_CABLE) {
+					/* Any network this device is still serving comes down first,
+					 * and the order is not cosmetic: a cable session's teardown
+					 * deliberately touches nothing on the radio, so an AP left
+					 * running here would outlive the session with nothing left
+					 * that knows how to stop it. Done before the daemon starts,
+					 * while the medium is still ad hoc - NS_hotspotStop's own
+					 * client-stack restore is what puts the radio back, and the
+					 * cable guard that would skip it is not in force yet. */
+					hosting_hotspot = 0;
+					NS_hotspotStop();
+					NS_announceHotspot(NULL, NULL);
+
+					// this blocks while the gadget comes up; say so first
+					snprintf(status, sizeof(status), "Presenting USB gadget...");
+					set_progress("Hosting over cable", "Waiting for the other device.");
+					render(s);
+
+					char err[96] = "";
+					if (!NS_cableHostStart(err, sizeof(err))) {
+						set_progress("Joining", "This can take up to a minute.");
+						snprintf(status, sizeof(status), "%s", err);
+						dirty = 1;
+						break;   // stay here so the reason is readable
+					}
+					set_progress("Joining", "This can take up to a minute.");
 				} else {
 					// Leaving an AP up would share one radio and one channel
 					// with the network this session is about to run over.
@@ -1097,7 +1259,7 @@ int main(int argc, char* argv[]) {
 			int n = NS_discoverTick(peers, NS_MAX_PEERS);
 			if (n != peer_count) { peer_count = n; dirty = 1; }
 			dedupe_adhoc();
-			join_total = peer_count + adhoc_count;
+			join_recount();
 			if (peer_sel >= join_total) peer_sel = join_total ? join_total - 1 : 0;
 
 			if (PAD_justPressed(BTN_UP) && join_total)   { peer_sel = (peer_sel + join_total - 1) % join_total; dirty = 1; }
@@ -1112,16 +1274,44 @@ int main(int argc, char* argv[]) {
 				adhoc_count = NS_scanAdhoc(adhoc, NS_MAX_PEERS);
 				int scanned_count = adhoc_count;
 				dedupe_adhoc();
-				join_total = peer_count + adhoc_count;
+				join_recount();
 				snprintf(status, sizeof(status), "%d ad hoc network(s) found.", scanned_count);
 				dirty = 1;
 			}
 
 			if (PAD_justPressed(BTN_A) && join_total) {
+				/* The cable row first: it is not a peer that was found, it is a
+				 * wire, and it is the one row whose address is known before
+				 * anything is up. */
+				if (peer_sel == cable_row()) {
+					NS_discoverStop();
+
+					// this blocks while the peer is enumerated; say so first
+					snprintf(status, sizeof(status), "Looking for the cable peer...");
+					set_progress("Joining over cable", "Waiting for the other device.");
+					render(s);
+
+					char err[96] = "";
+					if (!NS_cableJoin(err, sizeof(err))) {
+						set_progress("Joining", "This can take up to a minute.");
+						snprintf(status, sizeof(status), "%s", err);
+						screen = SCREEN_MENU;
+						dirty = 1;
+						break;
+					}
+					set_progress("Joining", "This can take up to a minute.");
+					/* The hosting end of a cable is a fixed address, exactly as
+					 * the ad-hoc host's is: the other device is the USB device,
+					 * so there is nothing to learn from a beacon. */
+					do_arm(NS_ROLE_CLIENT, NS_CABLE_HOST_IP);
+					dirty = 1;
+					break;
+				}
+
 				NS_Peer* pr = join_at(peer_sel);
 				NS_discoverStop();
 
-				if (pr->hotspot) {
+				if (pr->link == NS_LINK_ADHOC) {
 					char err[96] = "";
 					// Credentials are fixed, so a network found by scan - or an
 					// announcement that predates this build - is still joinable.

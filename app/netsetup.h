@@ -22,6 +22,26 @@
  * discovery announcement still carries the field. */
 typedef enum { NS_MODE_NETPLAY, NS_MODE_LINK } NS_Mode;
 
+/* Which medium a session runs over.
+ *
+ * Replaces a pair of booleans - hotspot on the peer, adhoc at arm time - that
+ * could only ever describe the two WiFi transports. The third one is a USB
+ * cable, and it is not a variation on either: it moves no radio, it has no
+ * association, and its teardown owes the supplicant nothing. A boolean is a
+ * question ("did we host?") where what the code needs is an answer ("what is
+ * this link?"), and every site that asked the boolean had to re-derive the
+ * transport for itself.
+ *
+ *   WIFI   both devices already on a network; nothing moved
+ *   ADHOC  this device serves the network, or joined the peer's
+ *   CABLE  point-to-point over USB; no WiFi involvement at all
+ */
+typedef enum {
+	NS_LINK_WIFI = 0,
+	NS_LINK_ADHOC,
+	NS_LINK_CABLE,
+} NS_LinkKind;
+
 #define NS_SSID_LEN 24
 #define NS_PSK_LEN  24
 
@@ -29,7 +49,7 @@ typedef struct {
 	char    ip[NS_IP_LEN];
 	char    platform[16];
 	NS_Mode mode;
-	bool    hotspot;                /* host will move to its own network */
+	NS_LinkKind link;               /* what this peer would be reached over */
 	bool    scanned;                /* found by SSID scan, not by announcement */
 	char    ssid[NS_SSID_LEN];
 	char    psk[NS_PSK_LEN];
@@ -113,6 +133,7 @@ bool NS_stubsInstalled(void);  /* launch stubs are in place, session or not */
 typedef struct {
 	bool    armed;
 	NS_Role role;
+	NS_LinkKind link;               /* the medium the session file names */
 	char    network[NS_SSID_LEN];
 	char    psk[NS_PSK_LEN];
 	char    host[NS_IP_LEN];
@@ -297,6 +318,110 @@ int NS_compatSync(const char* host_ip, char* err, int errlen);
  * transport this is built for. */
 #define NS_INPUT_DELAY_ADHOC 3
 #define NS_INPUT_DELAY_WIFI  10
+
+/* One hop over a cable, no radio and no beacon. Kept as its own constant rather
+ * than aliasing the ad-hoc value: the two are not the same link, and a value
+ * tuned for one transport being reused for the other is exactly the mistake the
+ * two constants above were split to fix. Floor only - the shim may raise it from
+ * the measured round trip and never lowers it.
+ *
+ * **One frame, not three.** The design chose 3 from the ad-hoc measurements
+ * (1.7 / 4.3 / 21.5 ms min/avg/max) as the closest available analogue, because
+ * the cable had not been measured yet. It has now: `ping` across the cable, two
+ * Bricks, 4/4 packets both directions, **0.329 / 0.557 / 0.661 ms**. One tenth of
+ * the ad-hoc average, with no access point and no second hop, so the jitter that
+ * made 3 right there does not exist here - and 3 frames is ~50 ms of deliberate
+ * input lag on a link whose round trip is half a millisecond, which is felt.
+ *
+ * 1 (16.7 ms) is the floor the shim can still raise if a measurement ever asks
+ * for more; it never lowers it, so this is the value that decides how the cable
+ * feels. The shim's own parser accepts 1..20, so 1 is the lowest this can be. */
+#define NS_INPUT_DELAY_CABLE 1
+
+/* --- link kind --------------------------------------------------------- */
+
+/* Cable link. Point-to-point, so both addresses are fixed and neither side
+ * needs DHCP, a lease, or an address to discover - the same trick the ad-hoc
+ * host already uses with NS_HOTSPOT_HOST_IP, so the client knows its peer
+ * before the link is up.
+ *
+ * Deliberately not 10.0.0.0/24: that is the ad-hoc subnet, and a device that
+ * hosted and then did not fully release the interface has collided with it
+ * before. Both previous transport additions in this project produced an address
+ * or interface collision within two days of landing. */
+#define NS_CABLE_HOST_IP   "10.77.0.1"
+#define NS_CABLE_CLIENT_IP "10.77.0.2"
+#define NS_CABLE_PREFIX    "24"
+
+/* The medium this app is on, or was armed on: the session file when one exists,
+ * otherwise the process-local flags. One reader, so the app, the status line and
+ * the launcher cannot disagree about which transport a session uses. */
+NS_LinkKind NS_linkKind(void);
+
+/* The session-file spelling: "wifi" / "adhoc" / "cable". launcher/state-path.sh
+ * reads the same three tokens, so the file format has exactly one vocabulary. */
+const char* NS_linkKindName(NS_LinkKind kind);
+NS_LinkKind NS_linkKindFromName(const char* name);
+
+/* What to call the transport on screen. Separate from the file spelling above
+ * because "adhoc" is not "ad hoc", and the UI says the latter in three places. */
+const char* NS_linkKindLabel(NS_LinkKind kind);
+
+/* The input-delay floor this transport gets. */
+int NS_inputDelayForKind(NS_LinkKind kind);
+
+/* --- the cable link -----------------------------------------------------
+ *
+ * The third transport, and the only one this app does not bring up itself: a
+ * detached daemon owns the USB gadget (or the enumerating end of it) and the
+ * point-to-point interface, and everything below is a question asked about it or
+ * a process it owns. Nothing here guesses at the link's state - the daemon is the
+ * only thing that can tell a bound gadget with the far end unplugged from a live
+ * link, and a port in host mode with nothing on it from one with a peer.
+ */
+
+/* Whether this device could ever do a cable link: a controller, a TUN device, a
+ * writable configfs and functionfs. Asked before the choice is offered, so a
+ * device that cannot do it never shows an option that must fail.
+ *
+ * Cached, and deliberately not NS_canHostAdhoc's answer: that asks whether there
+ * is an AP-capable interface, and a device without one would lose this option
+ * with it. */
+bool NS_cableSupported(void);
+
+/* Whether the far end of the cable is there, as the daemon last published it.
+ *
+ * Dynamic and deliberately uncached: the answer changes when someone plugs a
+ * cable in, and an answer that outlives live hardware is the failure the address
+ * probes in this file have already produced twice. Callers that draw per frame
+ * ask it on a cadence, as they already ask about the radio. */
+bool NS_cablePeerPresent(void);
+
+/* The daemon is running. Useful separately from the answer above: a cable arm is
+ * a cable arm because its daemon is up, which the session file cannot say yet. */
+bool NS_cableActive(void);
+
+/* Bring the link up, before the session is armed - the ordering both WiFi
+ * transports use, and the reason the daemon takes its role from an argument
+ * rather than from the session file. Each reports a reason worth showing and
+ * stops whatever it started. */
+bool NS_cableHostStart(char* err, int errlen);   /* this device presents the gadget */
+bool NS_cableJoin(char* err, int errlen);        /* this device enumerates the peer */
+
+void NS_cableStop(void);
+
+/* Put back what a crashed cable session took from the firmware: the controller,
+ * and the port's role if it was forced. Mirrors NS_wifiRecoverIfStranded - the
+ * record's existence is the recovery state, and it is removed only once nothing
+ * is left owing: either the repair worked, or it turned out there was nothing
+ * here to repair. */
+NS_Recovery NS_cableRecoverIfStranded(void);
+
+/* The address a peer would dial on this transport. A cable link's addresses are
+ * fixed and known before the link exists; every other transport keeps answering
+ * with the radio's own address, which is why this sits beside NS_localIP rather
+ * than replacing it. */
+bool NS_linkIP(NS_LinkKind kind, char* out, int len);
 
 /* Generate throwaway credentials for a session. */
 void NS_hotspotCredentials(char* ssid, int ssid_len, char* psk, int psk_len);

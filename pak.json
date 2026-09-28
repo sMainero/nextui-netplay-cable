@@ -1,20 +1,19 @@
 {
   "name": "Netplay",
-  "version": "v3.1.1-test",
+  "version": "v3.2.2-cable",
   "type": "TOOL",
   "description": "Shared-screen netplay and link-cable play between two handhelds, over an ad hoc network the devices create themselves.",
   "author": "bmpriest",
   "release_filename": "Netplay.pak.zip",
   "changelog": {
+    "v3.2.2-cable": "Cable link fixes, all found by playing over it. An accidental unplug no longer ends the link: the hosting end now waits for the peer to come back instead of exiting, and the joining end's device scan no longer opens USB nodes it has not identified first - opening the wrong one blocked the daemon in uninterruptible sleep, which needed a reboot to clear. The cable's input-delay floor drops from 3 frames to 1, from a measured 0.3-0.7 ms round trip: the old value was borrowed from ad hoc before the cable had ever been measured, and cost about 50 ms of avoidable input lag. tg5040 build only.",
+    "v3.2.1-cable": "Fixes the cable link against what the hardware actually does. The daemon no longer creates its own USB gadget - this kernel allows exactly one, and the firmware's already owns it - so it takes the firmware's over for the session and puts its function, mount, userspace and identity back on the way out. The port is switched by reading the vendor's trigger node rather than writing otg_role, which this BSP refuses. A cable session now ends with adb working and the repair record cleared, and the daemon no longer dies mid-restore. Also: a stale pidfile no longer blocks a later launch. tg5040 build only.",
+    "v3.2.0-cable": "A third transport: a USB-C cable between two devices. The host presents a userspace FunctionFS gadget and the peer claims the same vendor interface over usbfs; a TUN interface on each end carries the existing TCP transport unchanged. No radio is moved and no WiFi is touched, so the ad-hoc and hotspot paths are unaffected. Adds the link= session key, which also lets a previous build's session file keep working. tg5040 build only.",
     "v3.1.1-test": "Test build for different devices, including dual instance support for gambatte and mgba.",
     "v2.1.0-test": "Instanced link play for Game Boy: both devices emulate both consoles and WiFi carries only controller inputs. Works with two different linked cartridges - Gold/Silver, Seasons/Ages - found inside a zipped library without transferring any game file. Cartridge real-time clocks are negotiated so each console keeps its own owner's time. Verified with a completed Pokemon trade across 13,500 frames with no desync.",
     "v2.0.0-test": "Libretro shim, ad hoc networking, local compatibility-core fallback, bind-mounted pak wrapping, and WiFi recovery. Adds my282, my355 and h700."
   },
   "platforms": [
-    "tg5040",
-    "tg5050",
-    "my282",
-    "my355",
-    "h700"
+    "tg5040"
   ]
 }

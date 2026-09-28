@@ -27,11 +27,38 @@ if [ -n "$NETPLAY_PAK" ] && [ -f "$NETPLAY_PAK/session.conf" ] &&
 fi
 export NETPLAY_STATE
 
-# Remove a session file and its broker bookkeeping, then idle Game Switcher.
+# The medium an armed session names, as one of the three tokens the app writes.
+#
+# The session file is authoritative; the fallback is for a session armed by a
+# build that predates the link= line. That build recorded adhoc_ssid for exactly
+# the sessions that had moved the radio - a host only wrote it while serving, a
+# client only after joining - so its presence answers the same question. An
+# unrecognised value falls through to the same place, matching the app.
+#
+# Echoes "none" when there is no session at all, so a caller can tell "not
+# armed" from "armed and not a cable link".
+netplay_link_kind() {
+	[ -f "${1:-}" ] || { echo none; return 0; }
+	_netplay_link=$(sed -n 's/^link=//p' "$1" 2>/dev/null | head -1)
+	case "$_netplay_link" in
+	cable|adhoc|wifi) echo "$_netplay_link"; return 0 ;;
+	esac
+	if grep -q '^adhoc_ssid=.' "$1" 2>/dev/null; then echo adhoc; else echo wifi; fi
+}
+
+# Remove a session file and its bookkeeping, then idle Game Switcher.
 # Shared by session-cleanup.sh and wifi-watchdog.sh so the set of files that
 # make up "session ended" state cannot go out of sync between the two.
+#
+# The cable daemon's pid and status files join that set for the same reason: one
+# left behind makes the next session believe a daemon is already running. Its
+# usb_restore breadcrumb deliberately does NOT, and neither does its log: the
+# breadcrumb is the record of an owed repair and is removed only once that
+# repair succeeds - the same policy as wifi_restore - and the log is not session
+# state, exactly as broker.log is not.
 netplay_end_session() {
-	rm -f "$1" "$NETPLAY_STATE/broker.pid" "$NETPLAY_STATE/broker.status"
+	rm -f "$1" "$NETPLAY_STATE/broker.pid" "$NETPLAY_STATE/broker.status" \
+	      "$NETPLAY_STATE/cable.pid" "$NETPLAY_STATE/cable.status"
 	if [ -x "$NETPLAY_PAK/launcher/gameswitcher.sh" ]; then
 		SDCARD_PATH="${SDCARD_PATH:-/mnt/SDCARD}" PLATFORM="${PLATFORM:-tg5040}" \
 			NETPLAY_PAK="$NETPLAY_PAK" \

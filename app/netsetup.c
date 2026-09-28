@@ -1,4 +1,9 @@
 #include "netsetup.h"
+/* The daemon's file names and the line length its status grammar works to -
+ * cable.pid, cable.status, usb_restore - taken from the daemon's own header
+ * rather than spelled again here. launcher/state-path.sh reads the same names,
+ * and the daemon writes them. */
+#include "usbnet.h"
 
 #include <arpa/inet.h>
 #include <dlfcn.h>
@@ -13,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -22,6 +28,32 @@
 #define DISCOVERY_PORT  55438
 #define DISCOVERY_MAGIC 0x4E504C4BU /* 'NPLK' - same family as the link */
 #define ANNOUNCE_MS     500
+
+/* How long the app may wait for the cable link, in attempts with a visible
+ * stage. The daemon re-scans the bus on its own schedule and the far end of the
+ * cable is a person, so an attempt is one window of "let it enumerate" rather
+ * than one try at it, and the retry covers the port that needs a second window
+ * after a mode switch. Bounded and animated for the same reason NS_JOIN_* are:
+ * this runs from a screen. */
+#define NS_CABLE_ATTEMPTS 5
+#define NS_CABLE_WAIT_S   6
+#define NS_CABLE_GAP_S    2
+
+/* How long the port's role node may take to answer before an attempt to
+ * restore it is abandoned, in 100 ms ticks. A deadline on a marker file
+ * rather than on a process, because the read behind it is the one thing here
+ * that can wait forever (see ns_role_restore_node). */
+#define NS_CABLE_ROLE_TICKS 20
+
+/* The two paths this side has to know in order to undo a record the daemon
+ * wrote: where configfs is mounted, and the override the daemon honours for the
+ * port's role nodes. Both are the daemon's own facts, taken from its own
+ * environment convention, which is what lets the tests run the repair against a
+ * directory tree instead of a device. */
+#define NS_CABLE_CONFIGFS_ENV     "NP_CABLE_CONFIGFS"
+#define NS_CABLE_CONFIGFS_DEFAULT "/sys/kernel/config"
+#define NS_CABLE_ROLE_DIR_ENV     "NP_CABLE_ROLE_DIR"
+#define NS_CABLE_ROLE_DIR_NONE    "none"
 
 typedef struct __attribute__((packed)) {
 	uint32_t magic;
@@ -51,6 +83,8 @@ static char joined_ssid[NS_SSID_LEN];  /* recorded into the session so the */
 static char joined_psk[NS_PSK_LEN];    /* launch stub can rejoin per game */
 static NS_ProgressFn ns_progress;      /* lets the UI animate a blocking join */
 static bool file_exists(const char* p);
+/* Defined with the ad-hoc code below; the link-kind section needs it first. */
+static void wifi_client_leave_adhoc(void);
 
 /* Everything that differs per platform lives in launcher/wifi-platform.sh, and
  * this is how the app reaches it.
@@ -1279,6 +1313,152 @@ int NS_compatSync(const char* host_ip, char* err, int errlen) {
 }
 
 //////////////////////////////////////////////////////////////////////////////
+// cable link - the daemon's status, as this app reads it
+//
+// A detached daemon owns the USB gadget (or the enumerating end of the cable)
+// and the point-to-point interface, and publishes what it knows into
+// cable.status. Nothing here asks it anything: it is a separate product that may
+// have died at any moment, so a file that is either there or not is the only
+// answer that survives that.
+//
+// The app links none of the daemon's code - the cable daemon is built from its
+// own sources, which are not in this binary's dependency line - so the two things
+// they share, the status grammar and the shape of the USB repair record, are
+// written down on both sides. That is a real risk, and it is handled the way the
+// launcher handles its half of the session format: the test suite diffs the
+// vocabulary against the daemon's own tables rather than trusting two copies to
+// stay equal.
+//
+// The reader sits above the arm-time checks because they are its first caller,
+// and the lifecycle sits with the broker's, which it copies.
+//////////////////////////////////////////////////////////////////////////////
+
+/* The daemon's lifecycle, in the order app/usbnet.h declares it. The order is
+ * load-bearing: the states a caller treats as "not yet" all precede the one it
+ * treats as "up", so "has it got as far as X" is a comparison rather than a set
+ * membership test. */
+typedef enum {
+	NS_CABLE_NONE = -1,   /* no status file, or a token this build does not know */
+	NS_CABLE_IDLE = 0,    /* running, nothing attempted */
+	NS_CABLE_ROLE,        /* settling which end of the cable is the host */
+	NS_CABLE_GADGET,      /* bringing the gadget or the interface up */
+	NS_CABLE_WAIT,        /* our side is up; no peer has appeared */
+	NS_CABLE_UP,          /* the peer is there and records are moving */
+	NS_CABLE_FAILED,      /* terminal; error= says what */
+} NS_CableState;
+
+static const struct {
+	const char* name;
+	NS_CableState state;
+} ns_cable_states[] = {
+	{ "idle",   NS_CABLE_IDLE   },
+	{ "role",   NS_CABLE_ROLE   },
+	{ "gadget", NS_CABLE_GADGET },
+	{ "wait",   NS_CABLE_WAIT   },
+	{ "up",     NS_CABLE_UP     },
+	{ "failed", NS_CABLE_FAILED },
+};
+
+#define NS_CABLE_STATE_COUNT (sizeof(ns_cable_states) / sizeof(ns_cable_states[0]))
+
+/* The daemon's file names come from its own header rather than from a string
+ * here: launcher/state-path.sh reads the same names, and a third spelling would
+ * be a third thing to keep in step. */
+static void ns_cable_path(const char* name, char* out, int len) {
+	snprintf(out, len, "%s/%s", ns_state, name);
+}
+
+/* One field of the status file.
+ *
+ * Reads the key it was asked for and ignores everything else, including keys this
+ * build does not know - the rule every key=value reader in this tree applies, and
+ * the reason a newer daemon can add a field without a version bump. The last
+ * occurrence of a key wins, as it does in NS_sessionInfo.
+ *
+ * False means "the daemon did not say", which is not the same as an empty value:
+ * a daemon that has nothing to report leaves the line out. */
+static bool ns_cable_status_field(const char* key, char* out, int len) {
+	char path[512];
+	ns_cable_path(CP_STATUS_FILE, path, sizeof(path));
+
+	if (len > 0) out[0] = '\0';
+	FILE* f = fopen(path, "r");
+	if (!f) return false;
+
+	char line[CP_LINE_MAX];
+	bool found = false;
+	while (fgets(line, sizeof(line), f)) {
+		char* nl = strpbrk(line, "\r\n");
+		if (nl) *nl = '\0';
+		char* value = strchr(line, '=');
+		if (!value) continue;
+		*value++ = '\0';
+		if (!strcmp(line, key)) { snprintf(out, len, "%s", value); found = true; }
+	}
+	fclose(f);
+	return found;
+}
+
+/* Where the daemon is in its lifecycle, as of its last publish. Every state this
+ * build does not recognise is "no answer" rather than a state, so a daemon from a
+ * newer build is reported as unknown and never mistaken for a working link.
+ *
+ * Deliberately uncached, and deliberately not a liveness test: what the daemon
+ * last said and whether the daemon is still there are two questions, and the
+ * callers that care about the second ask it. */
+static bool ns_cable_state(NS_CableState* out) {
+	char token[CP_LINE_MAX];
+
+	if (out) *out = NS_CABLE_NONE;
+	if (!ns_cable_status_field("state", token, sizeof(token))) return false;
+	for (size_t i = 0; i < NS_CABLE_STATE_COUNT; i++) {
+		if (!strcmp(ns_cable_states[i].name, token)) {
+			if (out) *out = ns_cable_states[i].state;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Whether the daemon has got as far as the caller needs. FAILED is not "as far
+ * as" anything - it is terminal, and the caller says so in the daemon's own
+ * words instead. */
+static bool ns_cable_reached(NS_CableState state, NS_CableState want) {
+	return state != NS_CABLE_NONE && state != NS_CABLE_FAILED && state >= want;
+}
+
+/* The daemon's own words for why the link did not come up, or the caller's
+ * wording when it has none.
+ *
+ * This is the one place the three different answers reach the user. No
+ * controller on this device, no cable, and no peer are three different problems
+ * with three different fixes, the daemon is the only thing that can tell them
+ * apart, and the app is the only thing the user can see. */
+static void ns_cable_error(char* err, int errlen, const char* fallback) {
+	char text[CP_ERROR_MAX];
+	if (ns_cable_status_field("error", text, sizeof(text)) && text[0])
+		snprintf(err, errlen, "%s", text);
+	else
+		snprintf(err, errlen, "%s", fallback);
+}
+
+/* Where configfs is mounted: the daemon's own fact, and the one path this side
+ * has to know - the capability probe asks whether a gadget could be built there,
+ * and the recovery asks which gadgets hold the controller. Its override is the
+ * daemon's too, which is what lets both run against a directory tree instead of
+ * a device. */
+static const char* ns_configfs_root(void) {
+	const char* env = getenv(NS_CABLE_CONFIGFS_ENV);
+	return (env && env[0]) ? env : NS_CABLE_CONFIGFS_DEFAULT;
+}
+
+/* The configfs path a gadget would be built in. One derivation, so the probe and
+ * the recovery cannot disagree about which root they mean. */
+static int ns_gadget_dir(char* out, int len) {
+	return snprintf(out, len, "%s/usb_gadget", ns_configfs_root());
+}
+
+//////////////////////////////////////////////////////////////////////////////
 // assumption checks
 //////////////////////////////////////////////////////////////////////////////
 
@@ -1419,6 +1599,30 @@ int NS_runChecks(NS_Check* out, int max, NS_CheckResult* worst) {
 		    "WiFi tools for ad hoc", detail);
 	}
 
+	/* 6. The cable link, when one is live.
+	 *
+	 * Asked only then, because a running cable daemon is the honest test for
+	 * this being a cable arm: the daemon is started before the session is
+	 * written - the link has to be up before it can be named - so neither the
+	 * process-local flags nor the session file can answer it yet.
+	 *
+	 * Waiting is a warning, not a failure: on the hosting side waiting is the
+	 * normal state of a gadget that has been presented with nothing plugged into
+	 * it, which is an arm that should proceed. A daemon that has given up is a
+	 * failure, and it brings its own reason with it. */
+	if (NS_cableActive()) {
+		NS_CableState cable_state = NS_CABLE_NONE;
+		char detail[96];
+		if (!ns_cable_state(&cable_state))
+			add(out, &n, max, NS_CHECK_WARN, "Cable link", "the daemon has not said anything yet");
+		else if (cable_state == NS_CABLE_FAILED) {
+			ns_cable_error(detail, sizeof(detail), "the cable link could not come up");
+			add(out, &n, max, NS_CHECK_FAIL, "Cable link", detail);
+		} else if (cable_state == NS_CABLE_UP)
+			add(out, &n, max, NS_CHECK_OK, "Cable link", "peer present");
+		else
+			add(out, &n, max, NS_CHECK_WARN, "Cable link", "waiting for the other end of the cable");
+	}
 	for (int i = 0; i < n; i++) if (out[i].result > w) w = out[i].result;
 	if (worst) *worst = w;
 	return n;
@@ -1463,6 +1667,65 @@ static int broker_pid(void) {
 	return strstr(cmdline, "netplay-broker.elf") ? pid : 0;
 }
 
+//////////////////////////////////////////////////////////////////////////////
+// link kind - the vocabulary
+//
+// One vocabulary for the medium a session runs over, shared by the app, the
+// session file and the launcher guards. The token table below IS that
+// vocabulary: the writer, the reader and the validity test all walk it, so a
+// token cannot exist in one of them and not the others, and launcher/state-path.sh
+// recognises the same three spellings.
+//
+// Pure: nothing here reads a session or a process flag, so it sits above the
+// first thing that needs it.
+//////////////////////////////////////////////////////////////////////////////
+
+static const struct {
+	const char* name;
+	NS_LinkKind kind;
+} ns_link_names[] = {
+	{ "wifi",  NS_LINK_WIFI  },
+	{ "adhoc", NS_LINK_ADHOC },
+	{ "cable", NS_LINK_CABLE },
+};
+
+#define NS_LINK_NAME_COUNT (sizeof(ns_link_names) / sizeof(ns_link_names[0]))
+
+const char* NS_linkKindName(NS_LinkKind kind) {
+	for (size_t i = 0; i < NS_LINK_NAME_COUNT; i++)
+		if (ns_link_names[i].kind == kind) return ns_link_names[i].name;
+	return ns_link_names[0].name;
+}
+
+static bool ns_link_token_valid(const char* name) {
+	if (!name || !name[0]) return false;
+	for (size_t i = 0; i < NS_LINK_NAME_COUNT; i++)
+		if (!strcmp(ns_link_names[i].name, name)) return true;
+	return false;
+}
+
+NS_LinkKind NS_linkKindFromName(const char* name) {
+	for (size_t i = 0; i < NS_LINK_NAME_COUNT; i++)
+		if (name && !strcmp(ns_link_names[i].name, name)) return ns_link_names[i].kind;
+	return NS_LINK_WIFI;
+}
+
+const char* NS_linkKindLabel(NS_LinkKind kind) {
+	switch (kind) {
+	case NS_LINK_ADHOC: return "ad hoc";
+	case NS_LINK_CABLE: return "cable";
+	}
+	return "WiFi";
+}
+
+int NS_inputDelayForKind(NS_LinkKind kind) {
+	switch (kind) {
+	case NS_LINK_ADHOC: return NS_INPUT_DELAY_ADHOC;
+	case NS_LINK_CABLE: return NS_INPUT_DELAY_CABLE;
+	}
+	return NS_INPUT_DELAY_WIFI;
+}
+
 bool NS_sessionInfo(NS_SessionInfo* out) {
 	if (!out) return false;
 	memset(out, 0, sizeof(*out));
@@ -1473,8 +1736,10 @@ bool NS_sessionInfo(NS_SessionInfo* out) {
 	if (!f) return false;
 	out->armed = true;
 	out->role = NS_ROLE_HOST;
+	out->link = NS_LINK_WIFI;
 
 	char line[192];
+	bool link_seen = false;
 	while (fgets(line, sizeof(line), f)) {
 		char* nl = strpbrk(line, "\r\n");
 		if (nl) *nl = '\0';
@@ -1482,11 +1747,35 @@ bool NS_sessionInfo(NS_SessionInfo* out) {
 		if (!value) continue;
 		*value++ = '\0';
 		if (!strcmp(line, "role")) out->role = !strcmp(value, "client") ? NS_ROLE_CLIENT : NS_ROLE_HOST;
+		else if (!strcmp(line, "link")) {
+			/* Only a token this build understands counts as present, so a
+			 * truncated or corrupt line falls back the same way an absent one
+			 * does - which is also what the shell reader does with an
+			 * unrecognised value. */
+			if (ns_link_token_valid(value)) {
+				out->link = NS_linkKindFromName(value);
+				link_seen = true;
+			}
+		}
 		else if (!strcmp(line, "peer")) snprintf(out->host, sizeof(out->host), "%s", value);
 		else if (!strcmp(line, "adhoc_ssid")) snprintf(out->network, sizeof(out->network), "%s", value);
 		else if (!strcmp(line, "adhoc_psk")) snprintf(out->psk, sizeof(out->psk), "%s", value);
 	}
 	fclose(f);
+
+	/* A session written before link= existed. The previous build recorded
+	 * adhoc_ssid for exactly the sessions that had moved the radio, on both
+	 * roles - a host only wrote it while serving, a client only after joining -
+	 * so its presence answers the question the link= line now answers
+	 * explicitly.
+	 *
+	 * Deliberately before the hostapd upgrade below, which recovers network and
+	 * key metadata on a host that predates it but must not change how the link
+	 * is classified: the shell reader keys on adhoc_ssid alone, and two answers
+	 * to "what is this link" is the failure this whole section exists to
+	 * remove. */
+	if (!link_seen && out->network[0]) out->link = NS_LINK_ADHOC;
+
 	if (out->role == NS_ROLE_HOST && !out->network[0] &&
 	    system("pidof hostapd >/dev/null 2>&1") == 0) {
 		/* Upgrade an already-running host created before host metadata was
@@ -1595,6 +1884,911 @@ void NS_brokerStop(void) {
 	snprintf(path, sizeof(path), "%s/broker.status", ns_state); remove(path);
 }
 
+//////////////////////////////////////////////////////////////////////////////
+// cable link - the daemon
+//
+// The app's handle on the cable daemon, plus everything it does about a daemon
+// that has outlived its session. The lifecycle is the broker's, directly above:
+// detached, pidfile as the single-instance lock, readiness judged by a live pid
+// and a published status, SIGTERM then a bounded wait then SIGKILL. A second
+// daemon in this pak should not invent a second way to be a daemon.
+//
+// The division of labour is not cosmetic. Everything here runs from a screen, so
+// nothing it calls may be unbounded; the slow and the dangerous steps - taking
+// the controller, forcing the port, enumerating - live in the daemon, and this
+// side only ever starts it, asks it, and stops it.
+//////////////////////////////////////////////////////////////////////////////
+
+/* The daemon, if it is ours and alive.
+ *
+ * Two questions in one, for the reason broker_pid states: the file names a
+ * process, and the process's own command line is what proves the number still
+ * refers to it. A pidfile alone is a number a recycled pid can make a lie about,
+ * and this one is read on every status refresh. */
+static int cable_pid(void) {
+	char path[512];
+	ns_cable_path(CP_PID_FILE, path, sizeof(path));
+	FILE* f = fopen(path, "r");
+	int pid = 0;
+	if (f) { if (fscanf(f, "%d", &pid) != 1) pid = 0; fclose(f); }
+	if (pid <= 1) return 0;
+
+	char proc[64];
+	snprintf(proc, sizeof(proc), "/proc/%d/cmdline", pid);
+	f = fopen(proc, "r");
+	if (!f) return 0;
+	char cmdline[256] = "";
+	size_t n = fread(cmdline, 1, sizeof(cmdline) - 1, f);
+	fclose(f);
+	cmdline[n] = '\0';
+	return strstr(cmdline, "netplay-cable.elf") ? pid : 0;
+}
+
+bool NS_cableActive(void) { return cable_pid() != 0; }
+
+/* The peer is there, and it is the daemon's answer to give.
+ *
+ * Both halves are required: a status file that says "up" is worth nothing if the
+ * process that wrote it is gone - a daemon killed between its last publish and
+ * its cleanup leaves exactly that behind, and reporting it as a live link is how
+ * a screen ends up promising a peer that nobody can reach. */
+bool NS_cablePeerPresent(void) {
+	NS_CableState state = NS_CABLE_NONE;
+	if (!cable_pid()) return false;
+	return ns_cable_state(&state) && state == NS_CABLE_UP;
+}
+
+/* Could this device ever do a cable link? The four things the daemon needs from
+ * the kernel and the mount table, and which of them is missing when one is.
+ *
+ * Probed rather than assumed, the way NS_canHostAdhoc probes for an AP-capable
+ * interface: platforms differ here and the answer is not knowable in advance.
+ * Every step is a stat or an open - no shell, no device traffic, nothing that can
+ * block - which is what makes it safe to ask from render once and remember. */
+static const char* cable_capable(void) {
+	DIR* dir = opendir("/sys/class/udc");
+	if (!dir) return "no USB controller";
+	int controllers = 0;
+	struct dirent* entry;
+	while ((entry = readdir(dir))) if (entry->d_name[0] != '.') controllers++;
+	closedir(dir);
+	if (!controllers) return "no USB controller";
+
+	int fd = open("/dev/net/tun", O_RDWR);
+	if (fd < 0) return "no /dev/net/tun";
+	close(fd);
+
+	/* configfs mounted and writable where a gadget goes. Not mounted means there
+	 * is no usb_gadget directory at all; mounted read-only is the same answer
+	 * from this side. Asked of the same root the recovery drives, overridable the
+	 * same way - a fact this probe decided for itself would be a second answer to
+	 * a question the daemon has already answered. */
+	char gadget_root[600];
+	if (ns_gadget_dir(gadget_root, sizeof(gadget_root)) >= (int)sizeof(gadget_root))
+		return "the configfs path does not fit";
+	if (access(gadget_root, W_OK) != 0) return "configfs is not writable";
+
+	FILE* f = fopen("/proc/filesystems", "r");
+	bool functionfs = false;
+	char line[128];
+	while (f && fgets(line, sizeof(line), f)) if (strstr(line, "functionfs")) functionfs = true;
+	if (f) fclose(f);
+	if (!functionfs) return "this kernel has no functionfs";
+
+	return NULL;
+}
+
+bool NS_cableSupported(void) {
+	/* Cached, for the reason NS_canHostAdhoc caches its own answer: this is
+	 * called from render, several times a frame, and none of the four facts can
+	 * change while the app is open. The cache is per process, so a kernel that
+	 * gained a controller in the meantime is noticed at the next launch. */
+	static int cached = -1;
+	static const char* why;
+
+	if (cached < 0) {
+		why = cable_capable();
+		cached = why ? 0 : 1;
+		ns_log("cable link: %s\n", cached ? "supported" : why);
+	}
+	return cached != 0;
+}
+
+/* Start the daemon detached, in one role, and wait for it to prove it is alive.
+ *
+ * One starter for both roles: they differ in one argument and in what the caller
+ * then waits for, not in how a detached process is made. The role is an argument
+ * rather than something read from the session file because on both ends the link
+ * has to be up before the app arms the session - the ordering NS_hotspotStart and
+ * NS_hotspotJoin already use.
+ *
+ * Readiness is the broker's contract: a live pid AND a published status file,
+ * 30 x 100 ms with an early out when the child is already gone. The status file
+ * is also where a failure is explained, so a timeout reports the daemon's own
+ * reason rather than a generic one. */
+static bool cable_start(const char* role, char* err, int errlen) {
+	char path[512];
+
+	/* One daemon owns the cable at a time, and which end of it the daemon serves
+	 * is part of what it is. A running one is therefore either this same attempt
+	 * or the other end of a previous one, and stopping it costs a second and
+	 * settles the question either way. The alternative is a second daemon that
+	 * exits at once with "another cable daemon owns the session", which is a
+	 * worse thing to put on a screen than a restart. */
+	if (NS_cableActive()) NS_cableStop();
+
+	ns_cable_path(CP_PID_FILE, path, sizeof(path)); remove(path);
+	ns_cable_path(CP_STATUS_FILE, path, sizeof(path)); remove(path);
+
+	char executable[512];
+	snprintf(executable, sizeof(executable), "%s/bin/%s/netplay-cable.elf", ns_pak, ns_platform);
+	if (access(executable, X_OK) != 0) {
+		snprintf(err, errlen, "this device's pak has no cable support");
+		return false;
+	}
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		snprintf(err, errlen, "could not start the cable daemon");
+		return false;
+	}
+	if (pid == 0) {
+		setsid();
+		char log_path[512];
+		ns_cable_path(CP_LOG_FILE, log_path, sizeof(log_path));
+		int log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+		int null_fd = open("/dev/null", O_RDONLY);
+		if (null_fd >= 0) { dup2(null_fd, STDIN_FILENO); close(null_fd); }
+		if (log_fd >= 0) {
+			dup2(log_fd, STDOUT_FILENO);
+			dup2(log_fd, STDERR_FILENO);
+			if (log_fd > STDERR_FILENO) close(log_fd);
+		}
+		long max_fd = sysconf(_SC_OPEN_MAX);
+		if (max_fd < 0 || max_fd > 4096) max_fd = 4096;
+		for (int fd = STDERR_FILENO + 1; fd < max_fd; fd++) close(fd);
+		setenv("SDCARD_PATH", ns_sd, 1);
+		setenv("PLATFORM", ns_platform, 1);
+		execl(executable, executable, "--role", role, (char*)NULL);
+		_exit(127);
+	}
+
+	ns_cable_path(CP_STATUS_FILE, path, sizeof(path));
+	for (int i = 0; i < 30; i++) {
+		usleep(100 * 1000);
+		if (cable_pid() && file_exists(path)) return true;
+		if (kill(pid, 0) != 0 && errno == ESRCH) break;
+	}
+	waitpid(pid, NULL, WNOHANG);
+	ns_cable_error(err, errlen, "the cable daemon did not start");
+	NS_cableStop();
+	return false;
+}
+
+/* Wait for the link to reach what the caller needs, in bounded attempts with a
+ * visible stage.
+ *
+ * Shaped after NS_hotspotJoin, for the reason that has that shape: it runs from a
+ * screen, so it may not be unbounded, and what it waits for happens on someone
+ * else's schedule - the daemon re-scans the bus by itself, and the far end of the
+ * cable is a person plugging something in. An attempt is therefore one window of
+ * "let it enumerate", and a failed attempt is a tick of the spinner rather than an
+ * error; the retry covers the port that needs a second window after a mode switch.
+ *
+ * The daemon's liveness is checked every second: a daemon that has gone means
+ * nothing will ever arrive, and saying so now is better than finishing the
+ * budget. */
+static bool ns_cable_wait(NS_CableState want, char* err, int errlen) {
+	for (int attempt = 1; attempt <= NS_CABLE_ATTEMPTS; attempt++) {
+		for (int i = 0; i < NS_CABLE_WAIT_S; i++) {
+			NS_CableState state = NS_CABLE_NONE;
+
+			if (ns_progress)
+				ns_progress(want == NS_CABLE_UP ? "Finding the cable peer"
+				                                : "Presenting the USB gadget",
+				            attempt, NS_CABLE_ATTEMPTS);
+
+			if (!cable_pid()) {
+				ns_cable_error(err, errlen, "the cable daemon stopped");
+				return false;
+			}
+			if (ns_cable_state(&state)) {
+				if (state == NS_CABLE_FAILED) {
+					ns_cable_error(err, errlen, "the cable link could not come up");
+					return false;
+				}
+				if (ns_cable_reached(state, want)) return true;
+			}
+			sleep(1);
+		}
+
+		if (attempt < NS_CABLE_ATTEMPTS)
+			for (int i = 0; i < NS_CABLE_GAP_S; i++) {
+				if (ns_progress) ns_progress("Retrying", attempt + 1, NS_CABLE_ATTEMPTS);
+				sleep(1);
+			}
+	}
+
+	ns_cable_error(err, errlen,
+	               want == NS_CABLE_UP ? "no cable peer - is the other device hosting?"
+	                                   : "the USB gadget did not come up");
+	return false;
+}
+
+bool NS_cableHostStart(char* err, int errlen) {
+	if (!cable_start("gadget", err, errlen)) return false;
+
+	/* "Presenting" is the gadget bound and the controller taken. The peer is
+	 * expected later, and its absence is not a failure on this side: the hosting
+	 * device is the end that has to be ready first, and the other one finds it by
+	 * being plugged in. */
+	if (!ns_cable_wait(NS_CABLE_WAIT, err, errlen)) { NS_cableStop(); return false; }
+	return true;
+}
+
+bool NS_cableJoin(char* err, int errlen) {
+	if (!cable_start("host", err, errlen)) return false;
+
+	/* Here the peer is the point: this end switches its port to host and
+	 * enumerates, so waiting for it is what makes "join" mean what it means on
+	 * the WiFi paths - the link is usable when this returns. */
+	if (!ns_cable_wait(NS_CABLE_UP, err, errlen)) { NS_cableStop(); return false; }
+	return true;
+}
+
+/* Stop it, gracefully first.
+ *
+ * The escalation is NS_brokerStop's, with the same reasoning behind the wait: a
+ * graceful stop is how the daemon hands the controller and the port back, which
+ * is worth two seconds. Anything still standing after that is not going to put
+ * anything back, and a killed daemon leaves the USB repair record for the next
+ * launch to honour - which is the whole reason that record exists. */
+void NS_cableStop(void) {
+	int pid = cable_pid();
+	if (pid) {
+		kill(pid, SIGTERM);
+		for (int i = 0; i < 20 && kill(pid, 0) == 0; i++) {
+			int status;
+			if (waitpid(pid, &status, WNOHANG) == pid) break;
+			usleep(100 * 1000);
+		}
+		if (kill(pid, 0) == 0) kill(pid, SIGKILL);
+		waitpid(pid, NULL, WNOHANG);
+	}
+	char path[512];
+	ns_cable_path(CP_PID_FILE, path, sizeof(path)); remove(path);
+	ns_cable_path(CP_STATUS_FILE, path, sizeof(path)); remove(path);
+}
+
+/* The address a peer would dial on this transport.
+ *
+ * A cable link's addresses are fixed and known before the link exists - the end
+ * that serves the session is the USB device, the end that joins it enumerates -
+ * which is what lets a client write peer= before anything is up. Every other
+ * transport keeps answering with the radio's own address, so this sits beside
+ * NS_localIP rather than replacing it: it is asked where the answer has to follow
+ * the transport. */
+bool NS_linkIP(NS_LinkKind kind, char* out, int len) {
+	if (kind != NS_LINK_CABLE) return NS_localIP(out, len);
+
+	NS_SessionInfo info;
+	bool client = NS_sessionInfo(&info) && info.role == NS_ROLE_CLIENT;
+	snprintf(out, len, "%s", client ? NS_CABLE_CLIENT_IP : NS_CABLE_HOST_IP);
+	return true;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// cable link - what a crash left behind
+//
+// usb_restore is the daemon's record of a repair it owed the firmware: which
+// gadget the controller is handed back to, which controller, and which port
+// attribute and mode were forced. The daemon removes it once both are back.
+// This is the case where it did not get to - killed, or wedged - and the device
+// is still up.
+//
+// The record exists for the whole life of a healthy session, so its presence is
+// not by itself "something is owed": a session that is armed owns it. Only a
+// record that outlived its session is this pass's business, which is the one
+// deliberate difference from NS_wifiRecoverIfStranded above - the radio's record
+// means the stack was moved and not yet put back, and nothing else.
+//////////////////////////////////////////////////////////////////////////////
+
+/* The record, as the daemon writes it (app/usbnet.c): the gadget the controller
+ * is handed back to, the controller, what of that gadget the takeover displaced
+ * - its function, the mount that function's instance lived on, the userspace
+ * that owns it, the configuration ours was linked into, the identity ours was
+ * stamped over - and the port node and mode that were forced. Keyed rather
+ * than positional so neither role's half can erase the other's, and read with
+ * the tolerance every key=value reader here has - an unknown key is ignored
+ * and an unreadable line is dropped rather than made to fail a file whose whole
+ * job is to survive a crash. A record carrying only gadget and udc is one an
+ * older daemon wrote, and every restore below treats the newer keys as
+ * optional so that record still restores. */
+typedef struct {
+	char owner[CP_NAME_MAX];      /* CP_NAME_MAX is the daemon's own cap on every one of these
+	                                 fields - configfs's instance-name limit for the gadgets,
+	                                 and the same buffer the daemon read the controller's name
+	                                 into. Sized from its header so a value it wrote and this
+	                                 reader's copy of it cannot disagree about how long it is. */
+	char udc[CP_NAME_MAX];
+	char function[CP_NAME_MAX];
+	char config[CP_NAME_MAX];
+	char role_node[CP_NAME_MAX];
+	char role_value[CP_NAME_MAX];
+	char mount[CP_LINE_MAX];
+	char exe[CP_LINE_MAX];
+	char identity[CP_LINE_MAX];
+} NS_UsbRestore;
+
+static bool ns_usb_restore_read(NS_UsbRestore* out) {
+	char path[512];
+	ns_cable_path(CP_RESTORE_FILE, path, sizeof(path));
+
+	memset(out, 0, sizeof(*out));
+	FILE* f = fopen(path, "r");
+	if (!f) return false;
+
+	char line[CP_LINE_MAX];
+	while (fgets(line, sizeof(line), f)) {
+		char* nl = strpbrk(line, "\r\n");
+		if (nl) *nl = '\0';
+		char* value = strchr(line, '=');
+		if (!value) continue;
+		*value++ = '\0';
+		if      (!strcmp(line, "gadget"))     snprintf(out->owner, sizeof(out->owner), "%s", value);
+		else if (!strcmp(line, "udc"))        snprintf(out->udc, sizeof(out->udc), "%s", value);
+		else if (!strcmp(line, "function"))   snprintf(out->function, sizeof(out->function), "%s", value);
+		else if (!strcmp(line, "config"))     snprintf(out->config, sizeof(out->config), "%s", value);
+		else if (!strcmp(line, "mount"))      snprintf(out->mount, sizeof(out->mount), "%s", value);
+		else if (!strcmp(line, "exe"))        snprintf(out->exe, sizeof(out->exe), "%s", value);
+		else if (!strcmp(line, "identity"))   snprintf(out->identity, sizeof(out->identity), "%s", value);
+		else if (!strcmp(line, "role_node"))  snprintf(out->role_node, sizeof(out->role_node), "%s", value);
+		else if (!strcmp(line, "role_value")) snprintf(out->role_value, sizeof(out->role_value), "%s", value);
+	}
+	fclose(f);
+	return true;
+}
+
+/* One line out of a sysfs attribute. False when it is unreadable or empty, which
+ * for these files means the same thing: an unbound controller attribute and one
+ * that does not exist are both "nobody is there". */
+static bool ns_attr_read(const char* path, char* out, int len) {
+	if (len <= 0) return false;
+	out[0] = '\0';
+
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) return false;
+	char text[CP_NAME_MAX + 2];
+	ssize_t n = read(fd, text, sizeof(text) - 1);
+	close(fd);
+	if (n <= 0) return false;
+	text[n] = '\0';
+
+	/* Trailing blanks, including the newline every one of these files carries -
+	 * the same trim the daemon applies before comparing a value it read to one it
+	 * wrote. */
+	char* start = text;
+	while (*start == ' ' || *start == '\t') start++;
+	char* end = start + strlen(start);
+	while (end > start && (end[-1] == ' ' || end[-1] == '\t' ||
+	                       end[-1] == '\r' || end[-1] == '\n')) *--end = '\0';
+	if (!start[0]) return false;
+
+	snprintf(out, len, "%s", start);
+	return true;
+}
+
+/* One line into a sysfs attribute, the daemon's way: the newline is part of the
+ * write, because these attributes are parsed per write and a two-call version
+ * could be read as a different value. */
+static bool ns_attr_write(const char* path, const char* value) {
+	char text[CP_NAME_MAX + 2];
+	int n = snprintf(text, sizeof(text), "%s\n", value);
+	if (n <= 0 || n >= (int)sizeof(text)) return false;
+
+	/* O_TRUNC as well as O_WRONLY: sysfs ignores it, and a plain file does not -
+	 * and the tests drive this against a directory tree rather than a device, so
+	 * a second write of a shorter value has to replace the first rather than
+	 * overwrite its start. The shell's own `echo > /sys/...` opens the same way. */
+	int fd = open(path, O_WRONLY | O_TRUNC);
+	if (fd < 0) return false;
+	ssize_t wrote = write(fd, text, (size_t)n);
+	close(fd);
+	return wrote == (ssize_t)n;
+}
+
+/* A name out of the record is used to build a path, and the record is a file
+ * that is not ours - so a separator is refused before it can address something
+ * outside the directory it is supposed to name. */
+static bool ns_record_name_ok(const char* name) {
+	return name && name[0] && !strchr(name, '/');
+}
+
+/* Hand the controller back to the gadget the record names.
+ *
+ * The holder is found rather than assumed: the record names the gadget that had
+ * the controller before us, so the one to release is whichever directory holds
+ * the controller now - which is exactly how the daemon finds its predecessor.
+ * The named gadget is skipped in that scan, because a directory that already has
+ * what we are about to write needs neither a release nor a rebind.
+ *
+ * Nothing here is fatal. After a reboot configfs is empty and the platform's own
+ * gadget has the controller, which is the state this is trying to reach, so an
+ * absent directory is "already fine" rather than a failure - and the record's
+ * half of the repair is gone with it, which is what lets the boot-time pass drop
+ * the record (launcher/session-cleanup.sh). Only a write the kernel refused is a
+ * failure, and it leaves the record in place for the next attempt. */
+static bool ns_cable_udc_restore(const char* owner, const char* udc) {
+	char gadgets[600];
+
+	if (ns_gadget_dir(gadgets, sizeof(gadgets)) >= (int)sizeof(gadgets)) return true;
+	DIR* dir = opendir(gadgets);
+	if (!dir) {
+		ns_log("no gadget directory on this device: nothing holds the controller\n");
+		return true;
+	}
+
+	bool ok = true;
+	struct dirent* entry;
+	while ((entry = readdir(dir))) {
+		if (entry->d_name[0] == '.') continue;
+		if (!strcmp(entry->d_name, owner)) continue;
+
+		char attr[640], held[CP_NAME_MAX];
+		if (snprintf(attr, sizeof(attr), "%s/%s/UDC", gadgets, entry->d_name) >= (int)sizeof(attr)) continue;
+		if (!ns_attr_read(attr, held, sizeof(held))) continue;
+		if (strcmp(held, udc)) continue;
+
+		if (ns_attr_write(attr, "")) ns_log("released %s from %s\n", udc, entry->d_name);
+		else {
+			ns_log("could not release %s from %s\n", udc, entry->d_name);
+			ok = false;
+		}
+	}
+	closedir(dir);
+	if (!ok) return false;
+
+	char owner_attr[640], held[CP_NAME_MAX];
+	if (snprintf(owner_attr, sizeof(owner_attr), "%s/%s/UDC", gadgets, owner) >= (int)sizeof(owner_attr))
+		return true;
+	if (ns_attr_read(owner_attr, held, sizeof(held)) && !strcmp(held, udc)) return true;
+
+	if (!file_exists(owner_attr)) {
+		/* Nothing to hand it back to: the gadget the record names does not exist
+		 * on this boot, so there is nothing left of what was taken. */
+		ns_log("%s is not on this device: a reboot already put the controller back\n", owner);
+		return true;
+	}
+	if (!ns_attr_write(owner_attr, udc)) {
+		ns_log("could not hand %s back to %s\n", udc, owner);
+		return false;
+	}
+	ns_log("handed %s back to %s\n", udc, owner);
+	return true;
+}
+
+/* Where the port's role attribute lives.
+ *
+ * The record names the attribute rather than its directory - the daemon's
+ * platform table knows the directory and this side does not - so the directory is
+ * found the way the daemon finds the controller's previous holder: by looking for
+ * the attribute where the vendor stack actually exposes it, instead of assuming a
+ * path from a table this process does not have. One directory deep over the
+ * platform bus, which is where these nodes live, and a handful of entries. */
+static bool ns_role_path(const char* node, char* out, int len) {
+	static const char* const ROOTS[] = {
+		"/sys/devices/platform/soc",
+		"/sys/devices/platform",
+	};
+
+	if (!ns_record_name_ok(node)) return false;
+
+	/* The daemon's own override, honoured here for the same reason the configfs
+	 * one is: it is how the tests put the attribute in a directory tree. Its
+	 * "none" means this platform has no role nodes at all, which is an answer
+	 * rather than a failure - there is nothing to put back. */
+	const char* env = getenv(NS_CABLE_ROLE_DIR_ENV);
+	if (env && env[0]) {
+		if (!strcmp(env, NS_CABLE_ROLE_DIR_NONE)) return false;
+		char overridden[600];
+		if (snprintf(overridden, sizeof(overridden), "%s/%s", env, node) >= (int)sizeof(overridden))
+			return false;
+		if (!file_exists(overridden)) return false;
+		snprintf(out, len, "%s", overridden);
+		return true;
+	}
+	for (size_t r = 0; r < sizeof(ROOTS) / sizeof(ROOTS[0]); r++) {
+		DIR* dir = opendir(ROOTS[r]);
+		if (!dir) continue;
+
+		struct dirent* entry;
+		while ((entry = readdir(dir))) {
+			if (entry->d_name[0] == '.') continue;
+			char candidate[600];
+			if (snprintf(candidate, sizeof(candidate), "%s/%s/%s", ROOTS[r], entry->d_name, node)
+			    >= (int)sizeof(candidate)) continue;
+			if (!file_exists(candidate)) continue;
+			closedir(dir);
+			snprintf(out, len, "%s", candidate);
+			return true;
+		}
+		closedir(dir);
+	}
+	return false;
+}
+
+/* Restore the port's mode by *reading* the node the record names, from a forked
+ * child, and never wait on it.
+ *
+ * This is the one operation on this device that can put a process into
+ * uninterruptible sleep, so the discipline is the daemon's (app/usbnet.c
+ * cp_role_switch) and for the same reason: SIGKILL does not clear that state, so
+ * a helper that is waited on hangs its caller forever - and a popen()/pclose()
+ * that bounds only the read hangs the same way, because pclose waits for the
+ * child.
+ *
+ * The read is the switch: the node's show() performs it and answers with a
+ * completion string, so one open and one read is the whole action. The child
+ * leaves a marker only if the read answered. This polls for the marker against
+ * a deadline and reaps with WNOHANG: a missing marker is "the port did not
+ * answer", which is a sentence rather than a hang.
+ *
+ * The app needs its own copy rather than the daemon's: the daemon is by
+ * definition not running when this runs - it is the thing that died and left the
+ * record - and this binary links none of it. */
+static bool ns_role_restore_node(const char* node, const char* mode, char* err, int errlen) {
+	char marker[512];
+	snprintf(marker, sizeof(marker), "%s/usb_role.%d", ns_state, (int)getpid());
+	remove(marker);
+
+	pid_t child = fork();
+	if (child < 0) {
+		snprintf(err, errlen, "cannot start the port helper");
+		return false;
+	}
+	if (child == 0) {
+		/* Raw descriptors and _exit: this is a forked copy of a process that has
+		 * been writing to its own buffers, and an exit that flushed them would
+		 * repeat the parent's output. */
+		char answer[128];
+		int fd = open(node, O_RDONLY);
+		if (fd >= 0) {
+			if (read(fd, answer, sizeof(answer) - 1) > 0) {
+				int m = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+				if (m >= 0) close(m);
+			}
+			close(fd);
+		}
+		_exit(0);
+	}
+
+	bool ok = false;
+	for (int tick = 0; tick < NS_CABLE_ROLE_TICKS && !ok; tick++) {
+		(void)waitpid(child, NULL, WNOHANG);
+		if (file_exists(marker)) ok = true;
+		else usleep(100 * 1000);
+	}
+	remove(marker);
+	(void)waitpid(child, NULL, WNOHANG);
+
+	if (!ok) {
+		snprintf(err, errlen, "the port did not return to %s", mode);
+		return false;
+	}
+	return true;
+}
+
+/* Where a functionfs instance is mounted, out of /proc/mounts. The instance
+ * names the mount's source, so the function a restore is about to rebuild tells
+ * us which mount has to come back with it. The daemon has its own copy of this
+ * (cp_ffs_mount_of) for the same reason it has its own role helper. */
+static bool ns_ffs_mount_of(const char* instance, char* out, int len) {
+	FILE* f = fopen("/proc/mounts", "r");
+	if (!f) return false;
+	char line[512];
+	bool found = false;
+	while (!found && fgets(line, sizeof(line), f)) {
+		char source[64], target[400], type[32];
+		if (sscanf(line, "%63s %399s %31s", source, target, type) != 3) continue;
+		if (strcmp(type, "functionfs") || strcmp(source, instance)) continue;
+		snprintf(out, len, "%s", target);
+		found = true;
+	}
+	fclose(f);
+	return found;
+}
+
+/* Restart the userspace the record names, detached. One space-separated
+ * command, no quoting: it is what /proc/<pid>/cmdline recorded, and the case
+ * in point is a path plus flags. */
+static void ns_spawn_detached(const char* command) {
+	char buffer[CP_LINE_MAX];
+	snprintf(buffer, sizeof(buffer), "%s", command);
+
+	char* argv[16] = {0};
+	int argc = 0;
+	for (char* p = strtok(buffer, " "); p && argc < 15; p = strtok(NULL, " "))
+		argv[argc++] = p;
+	if (!argc) return;
+
+	pid_t pid = fork();
+	if (pid < 0) return;
+	if (pid == 0) {
+		setsid();
+		int null_fd = open("/dev/null", O_RDONLY);
+		if (null_fd >= 0) { dup2(null_fd, STDIN_FILENO); close(null_fd); }
+		execv(argv[0], argv);
+		_exit(127);
+	}
+	ns_log("restarted %s\n", command);
+}
+
+/* Release the controller from the gadget the record names, before anything else
+ * is touched.
+ *
+ * The daemon that died left its gadget bound, and removing a functionfs function
+ * from a bound gadget corrupts the kernel's functionfs instance on this vendor
+ * kernel - ffs_release_dev calls through freed memory and the oops takes the
+ * caller with it. Verified on hardware. So this runs first and the swap below
+ * only happens if it worked; a controller that will not let go means the gadget
+ * is left exactly as it is and the record is kept, which the next launch or a
+ * reboot will pick up. */
+static bool ns_cable_release_controller(const char* owner) {
+	char gadgets[600], attr[700], held[CP_NAME_MAX];
+
+	if (ns_gadget_dir(gadgets, sizeof(gadgets)) >= (int)sizeof(gadgets)) return true;
+	if (snprintf(attr, sizeof(attr), "%s/%s/UDC", gadgets, owner) >= (int)sizeof(attr)) return true;
+
+	/* Nothing held is nothing owed: already unbound, or the gadget is not there. */
+	if (!ns_attr_read(attr, held, sizeof(held)) || !held[0]) return true;
+
+	/* The write's return code is not the answer on this UDC: an unbind can
+	 * complete and still come back ENODEV, so the attribute is read back rather
+	 * than trusted - the same rule the daemon applies (cp_gadget_teardown), and
+	 * the same one NS_cableUdcRestore already uses for the bind. */
+	ns_attr_write(attr, "");
+	if (!ns_attr_read(attr, held, sizeof(held)) || !held[0]) {
+		ns_log("released the controller from %s\n", owner);
+		return true;
+	}
+
+	ns_log("could not release the controller from %s - leaving the gadget alone\n", owner);
+	return false;
+}
+
+/* Put the firmware's function back into its gadget, and take ours out. Ours is
+ * whatever sits in the functions directory that the record does not name as
+ * the firmware's: the takeover left exactly one such thing there, and a daemon
+ * that died mid-session left it linked into a configuration with no instance
+ * behind it - rebinding before this step would present that dead interface
+ * instead of adb. */
+static bool ns_cable_function_restore(const NS_UsbRestore* record) {
+	char gadgets[600], dir[600], functions[700], configs[700], path[700];
+	bool ok = true;
+
+	if (ns_gadget_dir(gadgets, sizeof(gadgets)) >= (int)sizeof(gadgets)) return true;
+	if (snprintf(dir, sizeof(dir), "%s/%s", gadgets, record->owner) >= (int)sizeof(dir)) return true;
+	if (snprintf(functions, sizeof(functions), "%s/functions", dir) >= (int)sizeof(functions)) return true;
+	if (snprintf(configs, sizeof(configs), "%s/configs", dir) >= (int)sizeof(configs)) return true;
+
+	/* Ours, out of every configuration and out of the functions directory. A
+	 * step that never happened is a step whose removal fails harmlessly, which
+	 * is why the unlinks are not checked - but a function directory that cannot
+	 * be removed is the one thing that stops the rebuild below, so that one
+	 * is. */
+	DIR* d = opendir(functions);
+	if (d) {
+		struct dirent* e;
+		while ((e = readdir(d))) {
+			if (e->d_name[0] == '.') continue;
+			if (record->function[0] && !strcmp(e->d_name, record->function)) continue;
+
+			DIR* c = opendir(configs);
+			if (c) {
+				struct dirent* ce;
+				while ((ce = readdir(c))) {
+					if (ce->d_name[0] == '.') continue;
+					if (snprintf(path, sizeof(path), "%s/%s/%s", configs, ce->d_name, e->d_name) < (int)sizeof(path))
+						remove(path);
+				}
+				closedir(c);
+			}
+
+			char mount_point[512];
+			const char* instance = strncmp(e->d_name, "ffs.", 4) ? e->d_name : e->d_name + 4;
+			if (ns_ffs_mount_of(instance, mount_point, sizeof(mount_point)) &&
+			    umount2(mount_point, MNT_DETACH) != 0 && errno != EINVAL)
+				ns_log("could not unmount %s: %s\n", mount_point, strerror(errno));
+
+			snprintf(path, sizeof(path), "%s/%s", functions, e->d_name);
+			if (rmdir(path) != 0) {
+				ns_log("could not remove %s: %s\n", e->d_name, strerror(errno));
+				ok = false;
+			}
+		}
+		closedir(d);
+	}
+
+	/* The identity the takeover stamped over, written back exactly as it was
+	 * read: vendor,product,device. */
+	if (record->identity[0]) {
+		char vendor[CP_NAME_MAX] = "", product[CP_NAME_MAX] = "", device[CP_NAME_MAX] = "";
+		if (sscanf(record->identity, "%39[^,],%39[^,],%39s", vendor, product, device) == 3) {
+			if (snprintf(path, sizeof(path), "%s/idVendor", dir) < (int)sizeof(path)) ns_attr_write(path, vendor);
+			if (snprintf(path, sizeof(path), "%s/idProduct", dir) < (int)sizeof(path)) ns_attr_write(path, product);
+			if (snprintf(path, sizeof(path), "%s/bcdDevice", dir) < (int)sizeof(path)) ns_attr_write(path, device);
+		}
+	}
+
+	/* The firmware's function, back in. A record without one is from the old
+	 * build, which took only the controller - and there is nothing to rebuild
+	 * here. */
+	if (!record->function[0]) return ok;
+
+	snprintf(path, sizeof(path), "%s/%s", functions, record->function);
+	if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+		ns_log("cannot recreate %s: %s\n", record->function, strerror(errno));
+		return false;
+	}
+
+	char instance[CP_NAME_MAX];
+	snprintf(instance, sizeof(instance), "%s", record->function + (strncmp(record->function, "ffs.", 4) ? 0 : 4));
+
+	if (record->mount[0]) {
+		(void)mkdir(record->mount, 0755);
+		if (mount(instance, record->mount, "functionfs", 0, NULL) != 0)
+			ns_log("cannot remount functionfs on %s: %s\n", record->mount, strerror(errno));
+	}
+
+	if (record->config[0] &&
+	    snprintf(path, sizeof(path), "%s/%s/%s", configs, record->config, record->function) < (int)sizeof(path)) {
+		char target[700];
+		if (snprintf(target, sizeof(target), "%s/%s", functions, record->function) < (int)sizeof(target) &&
+		    symlink(target, path) != 0 && errno != EEXIST)
+			ns_log("cannot link %s back into %s: %s\n", record->function, record->config, strerror(errno));
+	}
+
+	/* The userspace writes the instance's descriptors when it starts, so it
+	 * goes before the rebind that follows this in the caller. */
+	if (record->exe[0]) ns_spawn_detached(record->exe);
+
+	return ok;
+}
+
+/* Put back what a crashed cable session took from the firmware.
+ *
+ * Mirrors NS_wifiRecoverIfStranded, three outcomes and all, with the one
+ * difference stated at the head of this section: here the record is present for
+ * the whole life of a healthy session, so an armed session owns it and only a
+ * record that outlived its session is repaired.
+ *
+ * A daemon that is still running with no session is the other half of that: the
+ * link is up before the app arms the session, so there is a window in which a
+ * daemon legitimately has nothing to point at - and a crash inside that window
+ * leaves it holding the controller, and therefore adb. A graceful stop is the
+ * whole repair there, because the daemon hands both back on its way out. */
+NS_Recovery NS_cableRecoverIfStranded(void) {
+	NS_UsbRestore record;
+	char path[512];
+
+	if (!ns_usb_restore_read(&record)) return NS_RECOVERY_NONE;
+	if (NS_isArmed()) return NS_RECOVERY_NONE;
+
+	ns_cable_path(CP_RESTORE_FILE, path, sizeof(path));
+
+	if (NS_cableActive()) {
+		ns_log("a cable daemon is running with no session - stopping it\n");
+		NS_cableStop();
+		if (!file_exists(path)) return NS_RECOVERY_DONE;
+	}
+
+	bool owes_udc      = record.owner[0] && record.udc[0];
+	bool owes_function = record.owner[0] && record.function[0];
+	bool owes_role     = record.role_node[0] && record.role_value[0];
+
+	if (!owes_udc && !owes_role && !owes_function) {
+		/* The daemon died before it recorded anything to put back. There is
+		 * nothing to report and nothing to keep: a record is only worth its file
+		 * while it names a repair. */
+		ns_log("the USB repair record names nothing; removing it\n");
+		remove(path);
+		return NS_RECOVERY_NONE;
+	}
+
+	bool ok = true;
+
+	/* The controller first, then the function swap, then the rebind - the order is
+	 * the kernel's, not ours: a functionfs function cannot be removed from a
+	 * gadget that is still bound. */
+	if (owes_udc) ok = ns_cable_release_controller(record.owner);
+	if (ok && (owes_function || owes_udc)) ok = ns_cable_function_restore(&record);
+
+	if (ok && owes_udc) ok = ns_cable_udc_restore(record.owner, record.udc);
+
+	if (ok && owes_role) {
+		char node[600], err[CP_ERROR_MAX];
+		if (!ns_role_path(record.role_node, node, sizeof(node))) {
+			/* Not where the vendor stack puts it - another device family, or a
+			 * record written by a build that named something else. Nothing to
+			 * write, and nothing to keep the record for. */
+			ns_log("%s is not on this device; the port is where the firmware left it\n",
+			       record.role_node);
+		} else if (ns_role_restore_node(node, record.role_value, err, sizeof(err))) {
+			ns_log("the port is back in %s mode\n", record.role_value);
+		} else {
+			ns_log("could not put the port back to %s: %s\n", record.role_value, err);
+			ok = false;
+		}
+	}
+
+	if (!ok) {
+		/* Kept, like the radio's breadcrumb: the one record of a repair this
+		 * device still owes, and the next launch will try again. */
+		return NS_RECOVERY_FAILED;
+	}
+	remove(path);
+	return NS_RECOVERY_DONE;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// link kind - which one this app is on
+//////////////////////////////////////////////////////////////////////////////
+
+static NS_LinkKind ns_link_active = NS_LINK_WIFI;
+static bool        ns_link_known;
+
+/* What the app is acting on before a session is written - the arm path needs the
+ * answer in order to write it down, so it cannot read it back from the file.
+ *
+ * A running cable daemon is the third answer, and it is not a guess: the cable
+ * link has to be up before the session can name it - NS_cableHostStart and
+ * NS_cableJoin run before do_arm, the ordering the WiFi paths already use - so a
+ * live daemon means this arm is a cable arm. Nothing on the cable path touches
+ * hostapd, so the two cannot both be true. */
+static NS_LinkKind ns_link_pending(void) {
+	if (NS_cableActive()) return NS_LINK_CABLE;
+	if (hotspot_running || joined_hotspot) return NS_LINK_ADHOC;
+	return NS_LINK_WIFI;
+}
+
+/* Remember the medium once it is known, so every later caller agrees. Needed
+ * because the kind is asked for after the session file has been removed as
+ * often as while it exists. */
+static void ns_link_note(NS_LinkKind kind) {
+	ns_link_active = kind;
+	ns_link_known = true;
+}
+
+NS_LinkKind NS_linkKind(void) {
+	if (ns_link_known) return ns_link_active;
+
+	NS_SessionInfo info;
+	if (NS_sessionInfo(&info)) { ns_link_note(info.link); return ns_link_active; }
+	return ns_link_pending();
+}
+
+/* What a link kind owes when it ends.
+ *
+ * The distinction matters because the two WiFi transports are only two of
+ * three. A cable session has nothing to put back, and dragging it through
+ * wifi_client_stack_up() would kill and restart a supplicant for a session that
+ * never touched it.
+ *
+ * The kind is passed in rather than read here: both callers remove the session
+ * file before they tear the link down, and a read after that would describe a
+ * link that is still up as "not armed". The one remaining caller that cannot be
+ * handed the kind - wifi_client_leave_adhoc, reached from paths that never read
+ * a session - asks NS_linkKind(), which the note above has already settled.
+ * Defined before both callers rather than forward-declared, because a static
+ * function's prototype and its definition have to agree on linkage and this is
+ * shorter than making them agree in three places. */
+static void ns_link_teardown(NS_LinkKind link, bool was_client) {
+	ns_link_note(link);
+	if (link == NS_LINK_CABLE) return;
+	if (was_client) wifi_client_leave_adhoc();
+	else NS_hotspotStop();
+}
+
 bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 	char path[512];
 
@@ -1641,17 +2835,35 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 		fclose(boot);
 	}
 
-	/* Sized for the transport actually in use. Both sides reach the same answer
-	 * because a client only holds an ad hoc address when it joined this host's
-	 * network, and the host only serves one when it is hosting ad hoc.
+	/* Which medium this session runs over, and the delay floor that buys. The
+	 * shim never sees an interface, so it cannot infer the transport - this is
+	 * the one place the choice is recorded, and everything that has to behave
+	 * differently per transport reads it back from here.
 	 *
-	 * This is a safety floor, not merely a startup guess. The shim can raise it
-	 * when measured RTT requires more room, but a couple of quiet handshake
-	 * probes cannot lower it: later jitter is what the window must survive. The
-	 * transport selection is information the shim cannot infer on its own. */
-	bool adhoc = hotspot_running || joined_hotspot;
-	fprintf(f, "input_delay=%d\n", adhoc ? NS_INPUT_DELAY_ADHOC : NS_INPUT_DELAY_WIFI);
-	fprintf(f, "input_delay_auto=1\n");
+	 * The delay is a safety floor, not merely a startup guess. The shim can
+	 * raise it when measured RTT requires more room, but a couple of quiet
+	 * handshake probes cannot lower it: later jitter is what the window must
+	 * survive. Both devices must end on the same number, so the choice is
+	 * derived from the transport rather than from anything local to one side. */
+	NS_LinkKind link = ns_link_pending();
+	ns_link_note(link);
+	fprintf(f, "link=%s\n", NS_linkKindName(link));
+	fprintf(f, "input_delay=%d\n", NS_inputDelayForKind(link));
+
+	/* `input_delay_auto=1` invites the shim to raise the delay from the round trip
+	 * it measures. For a cable that invitation is a cost and not a protection:
+	 * the shim's proposal is ceil(max_rtt / one frame) + 1 with a floor of 2, so
+	 * a link whose round trip is about a millisecond - a fifteenth of a frame -
+	 * still comes back as 2, and 2 is one frame (16.7 ms) more input lag than a
+	 * measured cable needs. The app's value is measured for this transport and
+	 * the shim can never lower it, so pinning it is what the cable wants. The
+	 * other two transports keep the invitation, where the jitter it guards
+	 * against is real and measured.
+	 *
+	 * Agreement between the two devices is unaffected: the shim adopts the higher
+	 * of the two peers' values however either side is pinned (adopt_peer_delay),
+	 * so a peer whose link really did need more still wins. */
+	if (link != NS_LINK_CABLE) fprintf(f, "input_delay_auto=1\n");
 
 	/* Kept in the session format while peer executable sharing is frozen. */
 	fprintf(f, "share_cores=%d\n", NS_settings()->share_cores ? 1 : 0);
@@ -1755,7 +2967,12 @@ bool NS_arm(NS_Role role, const char* peer_ip, char* err, int errlen) {
 
 void NS_disarm(void) {
 	char cmd[1200];
+	/* Resolved before anything is removed: the teardown below has to know which
+	 * medium it is undoing, and the record that names it is deleted a few lines
+	 * down. */
+	NS_LinkKind link = NS_linkKind();
 	NS_brokerStop();
+	NS_cableStop();
 	NS_announceStop();
 	NS_compatServeStop();
 	/* Takes both routes down - mounts, the boot hook, and any legacy stubs -
@@ -1776,11 +2993,9 @@ void NS_disarm(void) {
 	         ns_sd, ns_platform, ns_pak, ns_pak);
 	system(cmd);
 
-	NS_hotspotStop();
+	ns_link_teardown(link, false);
 	NS_wifiPowerSaveRestore();
 }
-
-static void wifi_client_leave_adhoc(void);
 
 /* Drop the session but leave the launch stubs installed.
  *
@@ -1791,8 +3006,12 @@ static void wifi_client_leave_adhoc(void);
 void NS_endSession(void) {
 	char cmd[1200];
 	NS_SessionInfo session;
+	/* Both the role and the medium are read here, before the session file is
+	 * removed below. A session is a network arrangement as much as a file. */
+	NS_LinkKind link = NS_linkKind();
 	bool was_client = NS_sessionInfo(&session) && session.role == NS_ROLE_CLIENT;
 	NS_brokerStop();
+	NS_cableStop();
 	NS_announceStop();
 	NS_compatServeStop();
 	snprintf(cmd, sizeof(cmd), "rm -f '%s/session'", ns_state);
@@ -1803,14 +3022,12 @@ void NS_endSession(void) {
 	         ns_sd, ns_platform, ns_pak, ns_pak);
 	system(cmd);
 
-	/* A session is a network arrangement as much as a file. Remember the role
-	 * before removing that file: a guest must restore its station interface,
-	 * but must never enter host teardown merely because an unrelated/stale
-	 * hostapd process exists on the system. */
-	if (was_client)
-		wifi_client_leave_adhoc();
-	else
-		NS_hotspotStop();
+	/* A session is a network arrangement as much as a file. The role and the
+	 * medium were read before removing that file: a guest must restore its
+	 * station interface, but must never enter host teardown merely because an
+	 * unrelated/stale hostapd process exists on the system, and a cable session
+	 * has nothing to put back at all. */
+	ns_link_teardown(link, was_client);
 	NS_wifiPowerSaveRestore();
 }
 
@@ -1852,6 +3069,10 @@ void NS_announceTick(void) {
 	a.magic = htonl(DISCOVERY_MAGIC);
 	a.version = htonl(1);
 	a.mode = htonl((uint32_t)announce_mode);
+	/* Still a boolean on the wire, and still means "the host has moved to its
+	 * own network". A cable peer is never announced: it is found by USB
+	 * enumeration and its address is fixed, so it has no representation here
+	 * and the discovery packet needs no version bump for it. */
 	a.hotspot = htonl(announce_ssid[0] ? 1u : 0u);
 	snprintf(a.ssid, sizeof(a.ssid), "%s", announce_ssid);
 	snprintf(a.psk, sizeof(a.psk), "%s", announce_psk);
@@ -1882,7 +3103,7 @@ static void scan_line(const char* line, void* v) {
 	/* The host's address on its own network is fixed, so this is known before
 	 * we join - which is what makes joining by SSID alone work. */
 	snprintf(c->out[c->n].ip, sizeof(c->out[c->n].ip), "%s", NS_HOTSPOT_HOST_IP);
-	c->out[c->n].hotspot = true;
+	c->out[c->n].link = NS_LINK_ADHOC;
 	c->out[c->n].scanned = true;
 	c->n++;
 }
@@ -1971,7 +3192,7 @@ int NS_discoverTick(NS_Peer* peers, int max) {
 		a.platform[sizeof(a.platform) - 1] = '\0';
 		snprintf(peers[count].platform, sizeof(peers[count].platform), "%s", a.platform);
 		peers[count].mode = (ntohl(a.mode) == NS_MODE_LINK) ? NS_MODE_LINK : NS_MODE_NETPLAY;
-		peers[count].hotspot = ntohl(a.hotspot) != 0;
+		peers[count].link = ntohl(a.hotspot) ? NS_LINK_ADHOC : NS_LINK_WIFI;
 		a.ssid[sizeof(a.ssid) - 1] = '\0';
 		a.psk[sizeof(a.psk) - 1]   = '\0';
 		snprintf(peers[count].ssid, NS_SSID_LEN, "%s", a.ssid);
@@ -2498,6 +3719,13 @@ static bool on_own_adhoc(void) {
 }
 
 static void wifi_client_leave_adhoc(void) {
+	/* Never for a cable session, at any call site. A cable link never moved the
+	 * radio, so it owes the supplicant nothing; and the test it would otherwise
+	 * fall through to - on_own_adhoc() - matches any SSID carrying our prefix,
+	 * so a device that merely happens to be on a network called nextui-
+	 * something would have its client stack torn down and rebuilt for a session
+	 * that never touched it. */
+	if (NS_linkKind() == NS_LINK_CABLE) return;
 	if (!joined_hotspot && !on_own_adhoc()) return;
 	ns_log("leaving ad hoc network, restoring wifi\n");
 	wifi_client_stack_up();
