@@ -150,6 +150,24 @@ with the link up, both ends gaining:
 | host end, cable in top | `15% → 16%`, 3.757 → 3.769 V | charging, **while** sourcing to the peer |
 | gadget end, cable in bottom | `96% → 97%`, 4.161 → 4.166 V | charging from the peer |
 
+Stated the way that cannot be misread, because the two senses of "host" point
+at opposite ends:
+
+> **The client — `Join ▸ USB cable peer` — supplies the 5 V, and the host —
+> `Host ▸ Cable (USB)` — is charged by it through the cable.**
+
+The client is also the only end that *can* take a wall charger, in the socket the
+cable is not using. So each end has exactly one charging path and no choice about
+which one it gets: the client from its own socket, the host from the client. The
+host has no wall-charger option at all — the cable is sitting in the only socket
+that could accept one, and the other socket is host-only with no charge input
+behind it.
+
+The consequence is worth knowing before it happens: **the host end's battery is
+the gadget end's power supply.** If the client loses its charger, or its battery
+flattens, the gadget end starts draining — and nothing in the UI says so. A
+low-battery interlock on the client role is still an open item.
+
 This is also why `bottom ↔ bottom` is worse: it would leave *neither* charge
 socket free, and the end that would lose its charger is the end doing the
 sourcing.
