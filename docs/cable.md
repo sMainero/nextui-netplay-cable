@@ -89,6 +89,85 @@ Deliberately not `10.0.0.0/24`, which is the ad-hoc subnet: both previous
 transport additions in this repository produced an interface or address
 collision within two days, and the cheapest defence is not to reuse the range.
 
+### The socket, which is a hard constraint
+
+The two USB-C sockets are not interchangeable. **The gadget end takes the bottom
+socket; the host end takes the top.**
+
+| end | role it plays | socket |
+|---|---|---|
+| netplay host — `Host ▸ Cable (USB)` | USB **device**, presents the gadget | **bottom** |
+| netplay client — `Join ▸ USB cable peer` | USB **host**, enumerates the peer | **top** |
+
+The bottom socket carries the only UDC in the system. The top socket is wired to
+the other controller, USB1, which is HCI-only: a host, with no device path
+behind it. A gadget bound with the cable in the top socket is therefore bound to
+a controller that cannot reach the connector — it reports success, and nothing
+ever appears at the far end.
+
+Four independent facts say so, and any one of them is enough:
+
+- `/sys/class/udc/` holds exactly one controller (`5100000.udc-controller`), and
+  `sunxi_usb_udc` is bound to exactly that one.
+- The device tree describes exactly one `udc-controller` node
+  (`udc-controller@0x05100000`).
+- One UDC driver is built: `CONFIG_USB_SUNXI_UDC0=y` — no UDC1, no generic UDC.
+- `usbc1@0`, the node that would manage USB1 if it were dual-role, is
+  `status = okay` but has **no `compatible`**, so no driver binds it, and it
+  carries none of the OTG properties `usbc0@0` has (`usb_det_vbus_gpio`,
+  `usb_id_gpio`, `usbc-supply`, `usb_port_type`). There is nothing to switch.
+
+Two measurements agree: a flash drive in a top socket enumerates on
+`5200000.ehci1` (USB1), and a PC in a bottom socket puts the device in device
+mode, where it enumerates as `TRIMUI ADB` — USB0.
+
+**`top ↔ top` cannot work, and no amount of role switching makes it.** There is
+no UDC to bind, no manager node to switch, and no second UDC driver to load.
+Giving USB1 a device path would mean editing the device tree or the board file
+and reflashing the device — the class of change this design rules out, and not
+something these devices make practically possible.
+
+`bottom ↔ bottom` *would* be possible — both ends have the UDC — but it is worse,
+for the reason below.
+
+### ...and it decides where the charger goes
+
+The bottom socket is also the charge socket, which at first looks like a
+problem and turns out not to be one:
+
+- the **gadget end is charged through the very socket the cable occupies**. The
+  occupied socket *is* the charging path; nothing is lost.
+- the **host end keeps its charge socket free**, and it is the end that needs
+  it, because the USB host is the end that sources the 5 V charging the other
+  one.
+
+So the end to put on a charger is the **host** end — `Join ▸ USB cable peer` —
+in its free bottom socket. Measured on two Bricks in exactly that arrangement,
+with the link up, both ends gaining:
+
+| end | socket | battery over 90 s |
+|---|---|---|
+| host end, cable in top | `15% → 16%`, 3.757 → 3.769 V | charging, **while** sourcing to the peer |
+| gadget end, cable in bottom | `96% → 97%`, 4.161 → 4.166 V | charging from the peer |
+
+This is also why `bottom ↔ bottom` is worse: it would leave *neither* charge
+socket free, and the end that would lose its charger is the end doing the
+sourcing.
+
+The charging current itself is not ours to steer. Every charge-control attribute
+on the PMIC is mode `0444` with no `store` callback — a write to
+`axp2202-usb/input_current_limit` or `axp2202-battery/constant_charge_current`
+comes back `EPERM` — and none of the 24 regulators exposes a current limit. There
+is no "share the charge" setting to expose; feeding the host end from its own
+socket is the whole of the answer.
+
+**Getting it wrong is silent.** A gadget on the wrong socket, or a cable between
+two host sockets, produces no error at either end: the gadget end reports
+`Cable: no other device on the wire` and the client end exhausts its attempts
+with `no cable peer - is the other device hosting?`. Neither can tell "wrong
+socket" from "peer not plugged in yet", which is why this belongs here rather
+than in a log line.
+
 ## The shape of the link
 
 A single **vendor-class interface** (`0xff`) with **two bulk endpoints** —
