@@ -396,6 +396,11 @@ are worth recognising):
   **0.329 / 0.557 / 0.661 ms**, so the floor is now **1** (16.7 ms, the lowest the
   shim's parser accepts). `docs/cable.md` carries the measurement.
 
+All three were then **confirmed in play** on two Bricks: a deliberate cable bump
+left both daemons alive and the link came back without re-arming, and the delay
+change removed the lag that had been reported. The remaining item below has *not*
+been executed.
+
 Still open:
 
 1. **A launch with an armed session and no link waits ~30 s and then reports
@@ -408,7 +413,11 @@ Still open:
 2. **The app's crash recovery has never been executed.** `NS_cableRecoverIfStranded`
    (its controller-release and unmount/rmdir ordering fixed, its role restore
    converted to node reads) has only ever been reasoned about. A deliberately
-   killed session is the way to test it.
+   killed session is the way to test it. Its **consequence if wrong is bounded**
+   and worth knowing before shipping: a hard kill mid-session leaves the firmware's
+   gadget unbound, so `adb` is dead until the next Netplay launch runs the repair —
+   or until a reboot, which always restores it. Nothing about gameplay or the
+   device's firmware is at risk, which is why this was accepted untested.
 3. **The plan's automated criteria are stale.** `.rpiv/artifacts/plans/2026-09-28_01-18-40_usb-otg-cable-transport.md`
    still describes writing `otg_role`, creating a `netplay` gadget and a 4-key
    record. `docs/cable.md`'s "Bring-up", "What is verified where" and "Failure
