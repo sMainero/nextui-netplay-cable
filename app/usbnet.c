@@ -362,6 +362,12 @@ static CP_Urb   cp_urb_out;
 static uint8_t  cp_urb_in_buffer[CP_READ_MAX];
 static const char* cp_usb_dir = CP_USB_DIR;
 static const char* cp_usb_sysfs = CP_USB_SYSFS;
+/* Set when *this run* switched the port to host, and cleared when the socket is
+ * handed back or the run ends. It is what makes a give-back safe: a port that
+ * was already in host mode when this role started was not switched by us, and
+ * whatever put it there - the firmware, or a session whose record is still on
+ * disk - is who should put it back. */
+static bool cp_host_port_forced;
 
 /* The role helper's result file. Named after this process so that two daemons
  * that somehow run at once cannot read each other's answer, and removed on the
@@ -2348,8 +2354,12 @@ static bool cp_usb_parse_config(const uint8_t* config, size_t total, unsigned* i
  *
  * Matching first also removes the guesswork the old comment apologised for: sysfs
  * lists a device only while it is enumerated, so a node left behind by an
- * unplugged cable is never opened at all. */
-static bool cp_host_scan(char* node_out, size_t cap) {
+ * unplugged cable is never opened at all.
+ *
+ * The bus is reported as well as the node, because the caller has to know which
+ * controller answered: a peer the top socket's controller can already see is one
+ * the port switch was never needed for. */
+static bool cp_host_scan(char* node_out, size_t cap, unsigned* bus_out) {
 	DIR* devices = opendir(cp_usb_sysfs);
 	if (!devices) return false;
 
@@ -2378,10 +2388,41 @@ static bool cp_host_scan(char* node_out, size_t cap) {
 		    !cp_read_attr(path, dev, sizeof(dev))) continue;
 
 		int n = snprintf(node_out, cap, "%s/%03d/%03d", cp_usb_dir, atoi(bus), atoi(dev));
-		if (n > 0 && (size_t)n < cap) found = true;
+		if (n > 0 && (size_t)n < cap) {
+			if (bus_out) *bus_out = (unsigned)atoi(bus);
+			found = true;
+		}
 	}
 	closedir(devices);
 	return found;
+}
+
+/* Which controller owns a bus, which is how the two sockets are told apart
+ * without opening anything.
+ *
+ * The top socket is host-only and permanently bound - `5200000.ehci1` plus its
+ * companion `5200000.ohci1`, buses 1 and 2 on a Brick - and nothing can take it
+ * away: `usbc1@0` has no `compatible`, so no manager drives it and no role
+ * switch reaches it. The bottom socket has no host controller at all until its
+ * port is switched to host, which is when `5101000.ehci0` and `5101000.ohci0`
+ * bring up buses 3 and 4.
+ *
+ * So a peer found on the top socket's controller was enumerable without the
+ * switch - measured: with the cable in the top socket the peer sat on bus 1 for
+ * the whole session while `otg_role` read `usb_host`, buses 3 and 4 holding
+ * nothing. That is the case worth detecting, because the switch is not free: it
+ * turns the bottom socket into a 5 V source, and that socket is also the charge
+ * socket (§3). */
+#define CP_TOP_HCD "5200000.ehci1"
+
+static bool cp_bus_is_top_host(unsigned bus) {
+	char dir[CP_LINE_MAX], target[CP_LINE_MAX];
+
+	if (!bus || snprintf(dir, sizeof(dir), "%s/usb%u", cp_usb_sysfs, bus) >= (int)sizeof(dir)) return false;
+	ssize_t n = readlink(dir, target, sizeof(target) - 1);
+	if (n <= 0) return false;
+	target[n] = '\0';
+	return strstr(target, CP_TOP_HCD) != NULL;
 }
 
 /* Claim the interface and learn the two endpoints.
@@ -2582,9 +2623,10 @@ static CP_LinkResult cp_host_reap(void) {
  * plugged into it. */
 static bool cp_host_attach(char* err, int errlen) {
 	char node[CP_LINE_MAX];
+	unsigned bus = 0;
 
 	if (errlen) err[0] = '\0';
-	if (!cp_host_scan(node, sizeof(node))) return false;
+	if (!cp_host_scan(node, sizeof(node), &bus)) return false;
 
 	if (!cp_host_open(node, err, errlen)) {
 		cp_host_detach();
@@ -2594,6 +2636,25 @@ static bool cp_host_attach(char* err, int errlen) {
 		snprintf(err, errlen, "cannot start receiving: %s", strerror(errno));
 		cp_host_detach();
 		return false;
+	}
+
+	/* The peer answered on a controller this run did not bring up, so the switch
+	 * was not what made it visible and the socket can go back to accepting a
+	 * charger now, rather than at the end of the session. This is the common case
+	 * for the recommended arrangement: arm first, plug in second - the switch is
+	 * made while the cable is out (nothing is visible), and taken back the moment
+	 * the peer appears on the top socket instead of the bottom one.
+	 *
+	 * Restoring the role touches only the bottom socket's controller, so the link
+	 * on the top socket is not disturbed; and it is done only once the attachment
+	 * is real (interface claimed, receive URB in flight) so a give-back can never
+	 * pull the controller out from under a half-built attach. It is a one-shot:
+	 * after this the port is left alone for the rest of the run, which is why
+	 * moving the cable to the other socket mid-session needs a re-arm. */
+	if (cp_host_port_forced && cp_bus_is_top_host(bus)) {
+		cp_log("the peer is on the top socket's controller, so the port switch was not needed\n");
+		cp_role_restore();
+		cp_host_port_forced = false;
 	}
 	return true;
 }
@@ -2678,9 +2739,36 @@ static void cp_host_pump(void) {
  * role's, and for the same reason: the step that touches the platform comes
  * before the step that expects something of it. */
 static bool cp_host_start(char* err, int errlen) {
+	char node[CP_LINE_MAX], mode[CP_NAME_MAX];
+
 	cp_status_set_state(&cp_status, CP_STATE_ROLE);
 	cp_publish();
-	if (!cp_role_force(err, errlen)) return false;
+
+	/* The switch is the expensive half of this role, so it is tried last.
+	 *
+	 * Forcing the port to host bring-ups the bottom socket's host controller and
+	 * that socket is also the charge socket: in host mode it *sources* the 5 V
+	 * that charges the peer instead of accepting a charger, for as long as the
+	 * session lasts. It is only ever needed when the cable is in the bottom
+	 * socket.
+	 *
+	 * In the arrangement the socket rule recommends - cable in the top socket -
+	 * the peer is on a host-only controller that is bound from boot (§2.2), so it
+	 * can be seen without touching anything. Looking first is what keeps the
+	 * charge socket a charge socket; the bottom-socket case still switches, because
+	 * there the peer genuinely cannot be seen until the port becomes a host. */
+	if (cp_host_scan(node, sizeof(node), NULL)) {
+		cp_log("the peer is already visible; the port is left in %s mode\n",
+		       cp_port_mode(mode, sizeof(mode)) ? mode : "its current");
+	} else {
+		/* Whether the switch is ours to undo. A port already in host mode is left
+		 * out of the record on purpose: cp_role_force does not write one for it, and
+		 * this run has nothing to give back. */
+		bool was_host = cp_port_mode(mode, sizeof(mode)) && !strcmp(mode, CP_PORT_MODE_HOST);
+
+		if (!cp_role_force(err, errlen)) return false;
+		cp_host_port_forced = !was_host;
+	}
 
 	/* Both addresses are fixed and known here, unlike the gadget role's peer,
 	 * which is the same the other way round: the side that enumerates is the
@@ -2712,6 +2800,7 @@ static void cp_host_teardown(void) {
 	 * - the record is the last thing honoured, exactly as the controller's is on
 	 * the gadget side. */
 	cp_role_restore();
+	cp_host_port_forced = false;
 }
 
 static void cp_host_run(void) {
