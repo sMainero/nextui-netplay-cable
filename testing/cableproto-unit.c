@@ -194,6 +194,25 @@ static void test_paths(void) {
 	       "/sys/devices/platform/soc/usbc0/usb_host");
 #undef EXPECT
 
+	/* The mode words the port reports, and the node each is restored through.
+	 * "null" is the wrinkle: the mode is reported without the prefix while its
+	 * node carries one, and a caller that re-derived that would be a caller that
+	 * could disagree with this table. */
+	char node[CP_LINE_MAX];
+	CHECK(cp_role_trigger_name("null", node, sizeof(node)) > 0 && !strcmp(node, "usb_null"),
+	      "null did not resolve to usb_null");
+	CHECK(cp_role_trigger_name("usb_device", node, sizeof(node)) > 0 && !strcmp(node, "usb_device"),
+	      "usb_device did not resolve to itself");
+	CHECK(cp_role_trigger_name("usb_host", node, sizeof(node)) > 0 && !strcmp(node, "usb_host"),
+	      "usb_host did not resolve to itself");
+	CHECK(cp_role_trigger_name("host", node, sizeof(node)) == 0, "an unknown mode was accepted");
+	CHECK(cp_role_trigger_name("", node, sizeof(node)) == 0, "an empty mode was accepted");
+	CHECK(cp_role_trigger_name(NULL, node, sizeof(node)) == 0, "a null mode was accepted");
+	CHECK(cp_role_trigger_name("null", node, 0) == 0, "a zero-size buffer was accepted");
+	char small_node[8];
+	CHECK(cp_role_trigger_name("usb_host", small_node, sizeof(small_node)) == 0,
+	      "a truncated trigger name was accepted");
+
 	/* Refusals, because a truncated path opens a different file and reports it
 	 * as a missing attribute. */
 	char small[12];

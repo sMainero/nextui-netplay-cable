@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -38,10 +39,10 @@
 #define NS_CABLE_WAIT_S   6
 #define NS_CABLE_GAP_S    2
 
-/* How long the port's role attribute may take to answer before an attempt to
- * write it back is abandoned, in 100 ms ticks. A deadline on a marker file
- * rather than on a process, because that write is the one thing here that can
- * wait forever (see ns_role_write). */
+/* How long the port's role node may take to answer before an attempt to
+ * restore it is abandoned, in 100 ms ticks. A deadline on a marker file
+ * rather than on a process, because the read behind it is the one thing here
+ * that can wait forever (see ns_role_restore_node). */
 #define NS_CABLE_ROLE_TICKS 20
 
 /* The two paths this side has to know in order to undo a record the daemon
@@ -2193,11 +2194,16 @@ bool NS_linkIP(NS_LinkKind kind, char* out, int len) {
 //////////////////////////////////////////////////////////////////////////////
 
 /* The record, as the daemon writes it (app/usbnet.c): the gadget the controller
- * is handed back to, the controller, and the port attribute and mode that were
- * forced. Keyed rather than positional so neither role's half can erase the
- * other's, and read with the tolerance every key=value reader here has - an
- * unknown key is ignored and an unreadable line is dropped rather than made to
- * fail a file whose whole job is to survive a crash. */
+ * is handed back to, the controller, what of that gadget the takeover displaced
+ * - its function, the mount that function's instance lived on, the userspace
+ * that owns it, the configuration ours was linked into, the identity ours was
+ * stamped over - and the port node and mode that were forced. Keyed rather
+ * than positional so neither role's half can erase the other's, and read with
+ * the tolerance every key=value reader here has - an unknown key is ignored
+ * and an unreadable line is dropped rather than made to fail a file whose whole
+ * job is to survive a crash. A record carrying only gadget and udc is one an
+ * older daemon wrote, and every restore below treats the newer keys as
+ * optional so that record still restores. */
 typedef struct {
 	char owner[CP_NAME_MAX];      /* CP_NAME_MAX is the daemon's own cap on every one of these
 	                                 fields - configfs's instance-name limit for the gadgets,
@@ -2205,8 +2211,13 @@ typedef struct {
 	                                 into. Sized from its header so a value it wrote and this
 	                                 reader's copy of it cannot disagree about how long it is. */
 	char udc[CP_NAME_MAX];
+	char function[CP_NAME_MAX];
+	char config[CP_NAME_MAX];
 	char role_node[CP_NAME_MAX];
 	char role_value[CP_NAME_MAX];
+	char mount[CP_LINE_MAX];
+	char exe[CP_LINE_MAX];
+	char identity[CP_LINE_MAX];
 } NS_UsbRestore;
 
 static bool ns_usb_restore_read(NS_UsbRestore* out) {
@@ -2226,6 +2237,11 @@ static bool ns_usb_restore_read(NS_UsbRestore* out) {
 		*value++ = '\0';
 		if      (!strcmp(line, "gadget"))     snprintf(out->owner, sizeof(out->owner), "%s", value);
 		else if (!strcmp(line, "udc"))        snprintf(out->udc, sizeof(out->udc), "%s", value);
+		else if (!strcmp(line, "function"))   snprintf(out->function, sizeof(out->function), "%s", value);
+		else if (!strcmp(line, "config"))     snprintf(out->config, sizeof(out->config), "%s", value);
+		else if (!strcmp(line, "mount"))      snprintf(out->mount, sizeof(out->mount), "%s", value);
+		else if (!strcmp(line, "exe"))        snprintf(out->exe, sizeof(out->exe), "%s", value);
+		else if (!strcmp(line, "identity"))   snprintf(out->identity, sizeof(out->identity), "%s", value);
 		else if (!strcmp(line, "role_node"))  snprintf(out->role_node, sizeof(out->role_node), "%s", value);
 		else if (!strcmp(line, "role_value")) snprintf(out->role_value, sizeof(out->role_value), "%s", value);
 	}
@@ -2401,22 +2417,26 @@ static bool ns_role_path(const char* node, char* out, int len) {
 	return false;
 }
 
-/* Write the port's mode back from a forked child, and never wait on it.
+/* Restore the port's mode by *reading* the node the record names, from a forked
+ * child, and never wait on it.
  *
  * This is the one operation on this device that can put a process into
  * uninterruptible sleep, so the discipline is the daemon's (app/usbnet.c
- * cp_role_write) and for the same reason: SIGKILL does not clear that state, so a
- * helper that is waited on hangs its caller forever - and a popen()/pclose() that
- * bounds only the read hangs the same way, because pclose waits for the child.
+ * cp_role_switch) and for the same reason: SIGKILL does not clear that state, so
+ * a helper that is waited on hangs its caller forever - and a popen()/pclose()
+ * that bounds only the read hangs the same way, because pclose waits for the
+ * child.
  *
- * The child writes the attribute and, only if that worked, leaves a marker. This
- * polls for the marker against a deadline and reaps with WNOHANG: a missing
- * marker is "the port did not answer", which is a sentence rather than a hang.
+ * The read is the switch: the node's show() performs it and answers with a
+ * completion string, so one open and one read is the whole action. The child
+ * leaves a marker only if the read answered. This polls for the marker against
+ * a deadline and reaps with WNOHANG: a missing marker is "the port did not
+ * answer", which is a sentence rather than a hang.
  *
  * The app needs its own copy rather than the daemon's: the daemon is by
  * definition not running when this runs - it is the thing that died and left the
  * record - and this binary links none of it. */
-static bool ns_role_write(const char* node, const char* value, char* err, int errlen) {
+static bool ns_role_restore_node(const char* node, const char* mode, char* err, int errlen) {
 	char marker[512];
 	snprintf(marker, sizeof(marker), "%s/usb_role.%d", ns_state, (int)getpid());
 	remove(marker);
@@ -2430,11 +2450,10 @@ static bool ns_role_write(const char* node, const char* value, char* err, int er
 		/* Raw descriptors and _exit: this is a forked copy of a process that has
 		 * been writing to its own buffers, and an exit that flushed them would
 		 * repeat the parent's output. */
-		char text[CP_NAME_MAX + 2];
-		int n = snprintf(text, sizeof(text), "%s\n", value);
-		int fd = n > 0 && n < (int)sizeof(text) ? open(node, O_WRONLY | O_TRUNC) : -1;
+		char answer[128];
+		int fd = open(node, O_RDONLY);
 		if (fd >= 0) {
-			if (write(fd, text, (size_t)n) == (ssize_t)n) {
+			if (read(fd, answer, sizeof(answer) - 1) > 0) {
 				int m = open(marker, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 				if (m >= 0) close(m);
 			}
@@ -2453,10 +2472,187 @@ static bool ns_role_write(const char* node, const char* value, char* err, int er
 	(void)waitpid(child, NULL, WNOHANG);
 
 	if (!ok) {
-		snprintf(err, errlen, "the port did not return to %s", value);
+		snprintf(err, errlen, "the port did not return to %s", mode);
 		return false;
 	}
 	return true;
+}
+
+/* Where a functionfs instance is mounted, out of /proc/mounts. The instance
+ * names the mount's source, so the function a restore is about to rebuild tells
+ * us which mount has to come back with it. The daemon has its own copy of this
+ * (cp_ffs_mount_of) for the same reason it has its own role helper. */
+static bool ns_ffs_mount_of(const char* instance, char* out, int len) {
+	FILE* f = fopen("/proc/mounts", "r");
+	if (!f) return false;
+	char line[512];
+	bool found = false;
+	while (!found && fgets(line, sizeof(line), f)) {
+		char source[64], target[400], type[32];
+		if (sscanf(line, "%63s %399s %31s", source, target, type) != 3) continue;
+		if (strcmp(type, "functionfs") || strcmp(source, instance)) continue;
+		snprintf(out, len, "%s", target);
+		found = true;
+	}
+	fclose(f);
+	return found;
+}
+
+/* Restart the userspace the record names, detached. One space-separated
+ * command, no quoting: it is what /proc/<pid>/cmdline recorded, and the case
+ * in point is a path plus flags. */
+static void ns_spawn_detached(const char* command) {
+	char buffer[CP_LINE_MAX];
+	snprintf(buffer, sizeof(buffer), "%s", command);
+
+	char* argv[16] = {0};
+	int argc = 0;
+	for (char* p = strtok(buffer, " "); p && argc < 15; p = strtok(NULL, " "))
+		argv[argc++] = p;
+	if (!argc) return;
+
+	pid_t pid = fork();
+	if (pid < 0) return;
+	if (pid == 0) {
+		setsid();
+		int null_fd = open("/dev/null", O_RDONLY);
+		if (null_fd >= 0) { dup2(null_fd, STDIN_FILENO); close(null_fd); }
+		execv(argv[0], argv);
+		_exit(127);
+	}
+	ns_log("restarted %s\n", command);
+}
+
+/* Release the controller from the gadget the record names, before anything else
+ * is touched.
+ *
+ * The daemon that died left its gadget bound, and removing a functionfs function
+ * from a bound gadget corrupts the kernel's functionfs instance on this vendor
+ * kernel - ffs_release_dev calls through freed memory and the oops takes the
+ * caller with it. Verified on hardware. So this runs first and the swap below
+ * only happens if it worked; a controller that will not let go means the gadget
+ * is left exactly as it is and the record is kept, which the next launch or a
+ * reboot will pick up. */
+static bool ns_cable_release_controller(const char* owner) {
+	char gadgets[600], attr[700], held[CP_NAME_MAX];
+
+	if (ns_gadget_dir(gadgets, sizeof(gadgets)) >= (int)sizeof(gadgets)) return true;
+	if (snprintf(attr, sizeof(attr), "%s/%s/UDC", gadgets, owner) >= (int)sizeof(attr)) return true;
+
+	/* Nothing held is nothing owed: already unbound, or the gadget is not there. */
+	if (!ns_attr_read(attr, held, sizeof(held)) || !held[0]) return true;
+
+	/* The write's return code is not the answer on this UDC: an unbind can
+	 * complete and still come back ENODEV, so the attribute is read back rather
+	 * than trusted - the same rule the daemon applies (cp_gadget_teardown), and
+	 * the same one NS_cableUdcRestore already uses for the bind. */
+	ns_attr_write(attr, "");
+	if (!ns_attr_read(attr, held, sizeof(held)) || !held[0]) {
+		ns_log("released the controller from %s\n", owner);
+		return true;
+	}
+
+	ns_log("could not release the controller from %s - leaving the gadget alone\n", owner);
+	return false;
+}
+
+/* Put the firmware's function back into its gadget, and take ours out. Ours is
+ * whatever sits in the functions directory that the record does not name as
+ * the firmware's: the takeover left exactly one such thing there, and a daemon
+ * that died mid-session left it linked into a configuration with no instance
+ * behind it - rebinding before this step would present that dead interface
+ * instead of adb. */
+static bool ns_cable_function_restore(const NS_UsbRestore* record) {
+	char gadgets[600], dir[600], functions[700], configs[700], path[700];
+	bool ok = true;
+
+	if (ns_gadget_dir(gadgets, sizeof(gadgets)) >= (int)sizeof(gadgets)) return true;
+	if (snprintf(dir, sizeof(dir), "%s/%s", gadgets, record->owner) >= (int)sizeof(dir)) return true;
+	if (snprintf(functions, sizeof(functions), "%s/functions", dir) >= (int)sizeof(functions)) return true;
+	if (snprintf(configs, sizeof(configs), "%s/configs", dir) >= (int)sizeof(configs)) return true;
+
+	/* Ours, out of every configuration and out of the functions directory. A
+	 * step that never happened is a step whose removal fails harmlessly, which
+	 * is why the unlinks are not checked - but a function directory that cannot
+	 * be removed is the one thing that stops the rebuild below, so that one
+	 * is. */
+	DIR* d = opendir(functions);
+	if (d) {
+		struct dirent* e;
+		while ((e = readdir(d))) {
+			if (e->d_name[0] == '.') continue;
+			if (record->function[0] && !strcmp(e->d_name, record->function)) continue;
+
+			DIR* c = opendir(configs);
+			if (c) {
+				struct dirent* ce;
+				while ((ce = readdir(c))) {
+					if (ce->d_name[0] == '.') continue;
+					if (snprintf(path, sizeof(path), "%s/%s/%s", configs, ce->d_name, e->d_name) < (int)sizeof(path))
+						remove(path);
+				}
+				closedir(c);
+			}
+
+			char mount_point[512];
+			const char* instance = strncmp(e->d_name, "ffs.", 4) ? e->d_name : e->d_name + 4;
+			if (ns_ffs_mount_of(instance, mount_point, sizeof(mount_point)) &&
+			    umount2(mount_point, MNT_DETACH) != 0 && errno != EINVAL)
+				ns_log("could not unmount %s: %s\n", mount_point, strerror(errno));
+
+			snprintf(path, sizeof(path), "%s/%s", functions, e->d_name);
+			if (rmdir(path) != 0) {
+				ns_log("could not remove %s: %s\n", e->d_name, strerror(errno));
+				ok = false;
+			}
+		}
+		closedir(d);
+	}
+
+	/* The identity the takeover stamped over, written back exactly as it was
+	 * read: vendor,product,device. */
+	if (record->identity[0]) {
+		char vendor[CP_NAME_MAX] = "", product[CP_NAME_MAX] = "", device[CP_NAME_MAX] = "";
+		if (sscanf(record->identity, "%39[^,],%39[^,],%39s", vendor, product, device) == 3) {
+			if (snprintf(path, sizeof(path), "%s/idVendor", dir) < (int)sizeof(path)) ns_attr_write(path, vendor);
+			if (snprintf(path, sizeof(path), "%s/idProduct", dir) < (int)sizeof(path)) ns_attr_write(path, product);
+			if (snprintf(path, sizeof(path), "%s/bcdDevice", dir) < (int)sizeof(path)) ns_attr_write(path, device);
+		}
+	}
+
+	/* The firmware's function, back in. A record without one is from the old
+	 * build, which took only the controller - and there is nothing to rebuild
+	 * here. */
+	if (!record->function[0]) return ok;
+
+	snprintf(path, sizeof(path), "%s/%s", functions, record->function);
+	if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+		ns_log("cannot recreate %s: %s\n", record->function, strerror(errno));
+		return false;
+	}
+
+	char instance[CP_NAME_MAX];
+	snprintf(instance, sizeof(instance), "%s", record->function + (strncmp(record->function, "ffs.", 4) ? 0 : 4));
+
+	if (record->mount[0]) {
+		(void)mkdir(record->mount, 0755);
+		if (mount(instance, record->mount, "functionfs", 0, NULL) != 0)
+			ns_log("cannot remount functionfs on %s: %s\n", record->mount, strerror(errno));
+	}
+
+	if (record->config[0] &&
+	    snprintf(path, sizeof(path), "%s/%s/%s", configs, record->config, record->function) < (int)sizeof(path)) {
+		char target[700];
+		if (snprintf(target, sizeof(target), "%s/%s", functions, record->function) < (int)sizeof(target) &&
+		    symlink(target, path) != 0 && errno != EEXIST)
+			ns_log("cannot link %s back into %s: %s\n", record->function, record->config, strerror(errno));
+	}
+
+	/* The userspace writes the instance's descriptors when it starts, so it
+	 * goes before the rebind that follows this in the caller. */
+	if (record->exe[0]) ns_spawn_detached(record->exe);
+
+	return ok;
 }
 
 /* Put back what a crashed cable session took from the firmware.
@@ -2486,10 +2682,11 @@ NS_Recovery NS_cableRecoverIfStranded(void) {
 		if (!file_exists(path)) return NS_RECOVERY_DONE;
 	}
 
-	bool owes_udc  = record.owner[0] && record.udc[0];
-	bool owes_role = record.role_node[0] && record.role_value[0];
+	bool owes_udc      = record.owner[0] && record.udc[0];
+	bool owes_function = record.owner[0] && record.function[0];
+	bool owes_role     = record.role_node[0] && record.role_value[0];
 
-	if (!owes_udc && !owes_role) {
+	if (!owes_udc && !owes_role && !owes_function) {
 		/* The daemon died before it recorded anything to put back. There is
 		 * nothing to report and nothing to keep: a record is only worth its file
 		 * while it names a repair. */
@@ -2499,7 +2696,14 @@ NS_Recovery NS_cableRecoverIfStranded(void) {
 	}
 
 	bool ok = true;
-	if (owes_udc) ok = ns_cable_udc_restore(record.owner, record.udc);
+
+	/* The controller first, then the function swap, then the rebind - the order is
+	 * the kernel's, not ours: a functionfs function cannot be removed from a
+	 * gadget that is still bound. */
+	if (owes_udc) ok = ns_cable_release_controller(record.owner);
+	if (ok && (owes_function || owes_udc)) ok = ns_cable_function_restore(&record);
+
+	if (ok && owes_udc) ok = ns_cable_udc_restore(record.owner, record.udc);
 
 	if (ok && owes_role) {
 		char node[600], err[CP_ERROR_MAX];
@@ -2509,7 +2713,7 @@ NS_Recovery NS_cableRecoverIfStranded(void) {
 			 * write, and nothing to keep the record for. */
 			ns_log("%s is not on this device; the port is where the firmware left it\n",
 			       record.role_node);
-		} else if (ns_role_write(node, record.role_value, err, sizeof(err))) {
+		} else if (ns_role_restore_node(node, record.role_value, err, sizeof(err))) {
 			ns_log("the port is back in %s mode\n", record.role_value);
 		} else {
 			ns_log("could not put the port back to %s: %s\n", record.role_value, err);

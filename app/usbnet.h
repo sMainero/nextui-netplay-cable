@@ -162,7 +162,7 @@ typedef struct {
 	const char* udc_dir;    /* the controller list */
 	const char* tun_dev;    /* the tun clone device */
 	const char* role_dir;   /* vendor OTG role nodes, or NULL */
-	const char* gadget;     /* the gadget directory we create and remove */
+	const char* gadget;     /* the gadget we ride: discovered at run time, never created - the vendor kernel allows exactly one */
 	const char* function;   /* the functionfs instance name: ffs.<function> */
 	const char* iface;      /* the point-to-point interface we bring up */
 } CP_Facts;
@@ -207,6 +207,11 @@ int cp_gadget_attr(const CP_Facts* f, const char* attr, char* out, size_t cap);
 int cp_gadget_function_dir(const CP_Facts* f, char* out, size_t cap);
 int cp_ffs_ep_file(const CP_Facts* f, const char* ep, char* out, size_t cap);
 int cp_role_node(const CP_Facts* f, const char* node, char* out, size_t cap);
+
+/* The node whose read puts the vendor OTG port in `mode` - the trigger for a
+ * mode, as cp_role_node is the path for a node. See cableproto.c for why the
+ * unset mode's node is spelled differently from the mode itself. */
+int cp_role_trigger_name(const char* mode, char* out, size_t cap);
 
 /* The token a functionfs mount must claim as its source. configfs names the
  * function directory ffs.<function> and the mount has to name the instance

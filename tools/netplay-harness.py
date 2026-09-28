@@ -8,7 +8,7 @@ import hashlib
 import ipaddress
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shlex
 import shutil
 import socket
@@ -35,6 +35,7 @@ ARTIFACTS = {
     "drastic-adapter": ("Emus/{platform}/NDS.pak/drastic/libs/libadvdrastic.so", "0644"),
     "netplay-shim": ("Tools/{platform}/Netplay.pak/bin/{platform}/netplay_shim.so", "0755"),
     "netplay-app": ("Tools/{platform}/Netplay.pak/bin/{platform}/netplay.elf", "0755"),
+    "netplay-broker": ("Tools/{platform}/Netplay.pak/bin/{platform}/netplay-broker.elf", "0755"),
     "netplay-cable": ("Tools/{platform}/Netplay.pak/bin/{platform}/netplay-cable.elf", "0755"),
     "netplay-launcher": ("Tools/{platform}/Netplay.pak/launcher/minarch.elf", "0755"),
 }
@@ -215,6 +216,16 @@ class Remote:
         self.connect_timeout = connect_timeout
         self.operation_timeout = max(30, connect_timeout * 6)
         self._temp = tempfile.TemporaryDirectory(prefix="netplay-harness-")
+
+        # ControlPath is a unix socket, so its path has to fit sockaddr_un.sun_path
+        # - 104 bytes on a Mac. tempfile.gettempdir() is /var/folders/<hash>/T
+        # there, which plus the 40-character %C does not, and ssh then refuses to
+        # start at all: every subcommand reports the device unreachable. The
+        # config and the askpass helper can live in the long temp directory; only
+        # the socket needs a short one, and only this process uses it.
+        self._sockets = Path(f"/tmp/netplay-harness-{os.getpid()}")
+        self._sockets.mkdir(mode=0o700, exist_ok=True)
+
         self._askpass = None
         if os.environ.get(password_env):
             helper = Path(self._temp.name) / "askpass.sh"
@@ -232,7 +243,7 @@ class Remote:
             "    UserKnownHostsFile /dev/null",
             "    LogLevel ERROR",
             "    ControlMaster auto",
-            f'    ControlPath "{self._temp.name}/ssh-%C"',
+            f'    ControlPath "{self._sockets}/ssh-%C"',
             "    ControlPersist 15",
         ]
         if self.identity:
@@ -249,6 +260,7 @@ class Remote:
 
     def __exit__(self, *_args):
         self._temp.cleanup()
+        shutil.rmtree(self._sockets, ignore_errors=True)
 
     def _environment(self):
         environment = os.environ.copy()
@@ -293,14 +305,20 @@ class Remote:
         return result
 
     def upload(self, address, source, destination, jump=None):
-        argv = ["scp", *self._options(jump), "-P", str(self.port), str(source),
-                f"{self.user}@{address}:{destination}"]
+        # The file goes down the ssh channel rather than over scp, because the far
+        # end is dropbear on busybox: it ships no sftp-server (which is what
+        # macOS's OpenSSH 9 uses for scp by default) and no scp of its own for the
+        # legacy protocol to talk to. Nothing is lost - the channel is the same
+        # one, and the destination is quoted because it is a path on the device.
+        argv = ["ssh", *self._options(jump), "-p", str(self.port),
+                f"{self.user}@{address}", f"cat > {shlex.quote(destination)}"]
         try:
-            result = subprocess.run(
-                argv, text=True, capture_output=True, check=False,
-                env=self._environment(), stdin=subprocess.DEVNULL,
-                start_new_session=bool(self._askpass), timeout=self.operation_timeout,
-            )
+            with open(source, "rb") as payload:
+                result = subprocess.run(
+                    argv, text=True, capture_output=True, check=False,
+                    env=self._environment(), stdin=payload,
+                    start_new_session=bool(self._askpass), timeout=self.operation_timeout,
+                )
         except subprocess.TimeoutExpired as error:
             route = f" via {jump}" if jump else ""
             raise HarnessError(
@@ -311,18 +329,33 @@ class Remote:
             raise HarnessError(f"{address}{route}: upload failed: {result.stderr.strip()}")
 
     def download_tree(self, address, source, destination, jump=None):
+        # The mirror of upload, and for the same reason: no scp on the far end.
+        # The remote side tars the tree onto its stdout - tar is one of the few
+        # tools this busybox does carry - and the local side untars it into the
+        # destination. Both halves have to succeed for the tree to be complete.
         destination.mkdir(parents=True, exist_ok=True)
-        argv = ["scp", *self._options(jump), "-P", str(self.port), "-r",
-                f"{self.user}@{address}:{source}", str(destination)]
+        remote_path = PurePosixPath(source)
+        command = (f"tar -C {shlex.quote(str(remote_path.parent))} "
+                   f"-cf - {shlex.quote(remote_path.name)}")
+        argv = ["ssh", *self._options(jump), "-p", str(self.port),
+                f"{self.user}@{address}", command]
+
+        untar = subprocess.Popen(
+            ["tar", "-xf", "-", "-C", str(destination)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         try:
             result = subprocess.run(
                 argv, text=True, capture_output=True, check=False,
-                env=self._environment(), stdin=subprocess.DEVNULL,
+                env=self._environment(), stdout=untar.stdin,
                 start_new_session=bool(self._askpass), timeout=self.operation_timeout,
             )
         except subprocess.TimeoutExpired:
+            untar.kill()
+            untar.wait()
             return False
-        return result.returncode == 0
+        untar.stdin.close()
+        return result.returncode == 0 and untar.wait() == 0
 
 
 def remote_from_args(args):
@@ -512,7 +545,7 @@ def atomic_remote_file(remote, address, content, destination, jump=None):
 
 
 def command_session(args):
-    require_programs("ssh", "scp")
+    require_programs("ssh", "tar")
     session_id = args.session_id or uuid.uuid4().hex
     if len(session_id) != 32 or any(c not in "0123456789abcdefABCDEF" for c in session_id):
         raise HarnessError("session id must be exactly 32 hexadecimal characters")
@@ -551,7 +584,7 @@ def artifact_destination(name, platform):
 
 
 def command_deploy(args):
-    require_programs("ssh", "scp")
+    require_programs("ssh", "tar")
     source = args.file.resolve()
     if not source.is_file():
         raise HarnessError(f"artifact does not exist: {source}")
@@ -601,7 +634,7 @@ def command_launch_plan(args):
 
 
 def command_collect(args):
-    require_programs("ssh", "scp")
+    require_programs("ssh", "tar")
     with remote_from_args(args) as remote:
         devices = resolved_devices(remote, args)
         session_id = args.session_id

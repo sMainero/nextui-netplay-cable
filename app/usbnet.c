@@ -217,36 +217,60 @@ typedef char cp_urb_is_56_bytes[sizeof(CP_Urb) == 56 ? 1 : -1];
 #define CP_ROLE_WAIT_TICKS 20   /* ~2 s to write one sysfs attribute and leave a marker */
 #define CP_REAP_MAX        8
 
+/* How long the controller may take to let go before the teardown gives up and
+ * leaves the gadget alone, in 100 ms ticks.
+ *
+ * Five seconds rather than one, because the thing being waited for is the peer:
+ * the controller cannot be released while the other end still has the interface
+ * claimed over usbfs with transfers outstanding (the write comes back ENODEV),
+ * and the peer only lets go when *its* side tears down. Observed on hardware -
+ * the one-second version gave up while the peer was still mid-session. The
+ * ordering rule this implies is in the docs: the host end tears down first, and
+ * the gadget end finishes afterwards. */
+#define CP_UNBIND_TICKS 50
+
 /* How often the host role looks for the peer on the bus. A gadget that has just
  * been plugged or powered takes a moment to appear, and a directory scan plus a
  * control transfer is not work to do ten times a second. */
 #define CP_ATTACH_TICKS 5
 
-/* The usb_restore record's line cap: one keyed line per thing that has to be put
- * back, and the two roles need two each - the controller's previous owner and
- * the controller itself for the gadget role, the port's attribute name and its
- * previous mode for the host role. Four is exactly that, and the cap is
- * deliberate: a record that has outgrown its reason is not one this daemon
- * should be writing. */
-#define CP_RESTORE_MAX_LINES 4
+/* The usb_restore record's line cap. The gadget role's half grew when the
+ * takeover became real: riding the firmware's gadget means recording not just
+ * who held the controller but what we displaced in it - its function, the
+ * mount that function's instance lived on, the userspace that owns it, the
+ * configuration we linked into, and the identity we stamped over. Seven for the
+ * gadget role, two for the host role's port, and the cap stays deliberate: a
+ * record that has outgrown its reason is not one this daemon should be writing. */
+#define CP_RESTORE_MAX_LINES 9
 
 #define CP_RESTORE_KEY_GADGET     "gadget"
 #define CP_RESTORE_KEY_UDC        "udc"
+#define CP_RESTORE_KEY_FUNCTION   "function"   /* the firmware's, e.g. ffs.adb */
+#define CP_RESTORE_KEY_MOUNT      "mount"      /* where its functionfs was mounted */
+#define CP_RESTORE_KEY_EXE        "exe"        /* the userspace that owns it, restarted on restore */
+#define CP_RESTORE_KEY_CONFIG     "config"     /* the configuration we link our function into */
+#define CP_RESTORE_KEY_IDENTITY   "identity"   /* the firmware's vendor,product,device triple */
 #define CP_RESTORE_KEY_ROLE_NODE  "role_node"
 #define CP_RESTORE_KEY_ROLE_VALUE "role_value"
 
-/* The vendor OTG port, as three names and two values.
+/* The vendor OTG port, as one name, three modes and a rule.
  *
- * The attribute name is ours to choose: cp_role_node takes it, so the
- * transcribed directory in CP_Facts is the only platform-specific half. The two
- * values are what the attribute is compared against and written with, and both
- * are the conventional spellings. What the vendor stack actually does with
- * either is the research's Open Question 2 and is verified on hardware, not
- * here - which is why a write that does not take effect is reported as "role not
- * confirmed" rather than assumed to have worked. */
-#define CP_PORT_NODE_OTG "otg_role"
-#define CP_PORT_ROLE_HOST     "host"
-#define CP_PORT_ROLE_DEVICE   "device"
+ * otg_role *reports* the mode; it does not accept writes - a write of "host"
+ * comes back EINVAL on this BSP. Changing the mode is done by *reading* one of
+ * three sibling nodes, whose show() performs the switch and answers with a
+ * completion string: reading usb_host registers the host controllers, reading
+ * usb_device puts the port in device mode, reading usb_null takes both down.
+ * All three spellings were verified on a tg5040 (Brick) running NextUI
+ * 20260719-0, which is the only platform that carries the nodes at all - the
+ * role_dir fact is NULL elsewhere and every function below answers "no port
+ * to switch" rather than inventing a write. The one wrinkle that is not
+ * uniform: the unset mode is reported as "null" but its node is "usb_null",
+ * which is why cp_role_trigger_name exists in the pure layer rather than as a
+ * convention each caller re-derives. */
+#define CP_PORT_NODE_OTG     "otg_role"
+#define CP_PORT_MODE_NULL    "null"
+#define CP_PORT_MODE_DEVICE  "usb_device"
+#define CP_PORT_MODE_HOST    "usb_host"
 
 /* Every path this daemon drives is a fact of the platform rather than of the
  * device it runs on, so each one has an environment override. That is what lets
@@ -440,7 +464,11 @@ static CP_Facts cp_facts = {
 	.udc_dir  = "/sys/class/udc",
 	.tun_dev  = "/dev/net/tun",
 	.role_dir = NULL,
-	.gadget   = "netplay",
+	/* Empty until cp_takeover_prepare finds the gadget we ride. This kernel
+	 * allows exactly one gadget object, so the name is a fact of the boot rather
+	 * than a fact of the build, and every path built from it is built after the
+	 * discovery that sets it. */
+	.gadget   = "",
 	.function = "cable",
 	.iface    = CP_IFACE_NAME,
 };
@@ -490,7 +518,7 @@ static void cp_facts_init(void) {
 
 typedef struct {
 	char key[16];
-	char value[CP_NAME_MAX];
+	char value[CP_LINE_MAX];   /* wide enough for a mount point or a command line */
 } CP_RestoreLine;
 
 static bool cp_restore_path(char* out, size_t cap) {
@@ -619,14 +647,14 @@ static void cp_marker_put(const char* text) {
 	(void)n;
 }
 
-/* The half that can wedge, and it does nothing but this. The value is written
- * with a newline in one call, because sysfs attributes are parsed per write and
- * a two-call version could be read as a different value. */
-static void cp_role_child(const char* node, const char* value) {
-	char text[CP_NAME_MAX + 2];
-	snprintf(text, sizeof(text), "%s\n", value);
-
-	int fd = open(node, O_WRONLY);
+/* The half that can wedge, and it does nothing but this. The switch is a
+ * *read*: the node's show() performs it and answers with a completion string,
+ * so one open and one read is the entire action. A read that comes back with
+ * nothing is reported rather than assumed - the node's answer is the only
+ * evidence the switch happened, and the marker protocol exists so a wedged
+ * read costs this daemon a report and not its life. */
+static void cp_role_child(const char* node) {
+	int fd = open(node, O_RDONLY);
 	if (fd < 0) {
 		char message[CP_LINE_MAX];
 		snprintf(message, sizeof(message), "cannot open %s: %s\n", node, strerror(errno));
@@ -634,13 +662,14 @@ static void cp_role_child(const char* node, const char* value) {
 		_exit(0);
 	}
 
-	ssize_t n = write(fd, text, strlen(text));
+	char answer[128];
+	ssize_t n = read(fd, answer, sizeof(answer) - 1);
 	int saved = errno;
 	close(fd);
 
 	char message[CP_LINE_MAX];
-	if (n == (ssize_t)strlen(text)) snprintf(message, sizeof(message), "ok\n");
-	else snprintf(message, sizeof(message), "%s\n", n < 0 ? strerror(saved) : "short write");
+	if (n > 0) snprintf(message, sizeof(message), "ok\n");
+	else snprintf(message, sizeof(message), "%s\n", n < 0 ? strerror(saved) : "no answer");
 	cp_marker_put(message);
 	_exit(0);
 }
@@ -661,20 +690,31 @@ static bool cp_marker_read(void) {
 	return false;
 }
 
+/* The port's current mode, as otg_role reports it: one of null, usb_device or
+ * usb_host. False when this platform has no role nodes or the attribute cannot
+ * be read, which every caller treats as "cannot tell" and never as "the wrong
+ * mode". */
+static bool cp_port_mode(char* out, size_t cap) {
+	char path[CP_LINE_MAX];
+	if (!cp_facts.role_dir) return false;
+	if (!cp_role_node(&cp_facts, CP_PORT_NODE_OTG, path, sizeof(path))) return false;
+	return cp_read_attr(path, out, cap);
+}
+
 /* The parent's half. Every exit removes the marker, so the next attempt starts
  * from nothing rather than from the last attempt's answer.
  *
- * The attribute is named rather than assumed, because the recorded name is what
- * the restore writes back to: a key that is written but never used would be a
- * record of a decision nobody is bound by. The name is checked for a path
- * separator here rather than at the restore, so every caller is covered by one
- * test - it can come out of a file, and a name carrying a '/' would address
- * something outside the port directory. */
-static bool cp_role_write(const char* name, const char* value, char* err, int errlen) {
-	char path[CP_LINE_MAX];
+ * The mode is resolved to its trigger node here rather than by the caller, so
+ * the one spelling rule covers the force and the restore both - the restore
+ * reads its mode back out of the record, and a mode that resolves to nothing
+ * is reported rather than turned into a path that would address something
+ * outside the port directory. */
+static bool cp_role_switch(const char* mode, char* err, int errlen) {
+	char node[CP_NAME_MAX], path[CP_LINE_MAX];
 
-	if (!name || strchr(name, '/') || !cp_role_node(&cp_facts, name, path, sizeof(path))) {
-		snprintf(err, errlen, "the port's role path does not fit");
+	if (!mode || !mode[0] || !cp_role_trigger_name(mode, node, sizeof(node)) ||
+	    strchr(node, '/') || !cp_role_node(&cp_facts, node, path, sizeof(path))) {
+		snprintf(err, errlen, "this port has no %s mode", mode ? mode : "");
 		return false;
 	}
 	if (!cp_role_marker_path()) {
@@ -688,7 +728,7 @@ static bool cp_role_write(const char* name, const char* value, char* err, int er
 		snprintf(err, errlen, "cannot start the port-role helper: %s", strerror(errno));
 		return false;
 	}
-	if (child == 0) cp_role_child(path, value);
+	if (child == 0) cp_role_child(path);
 
 	/* The child is reaped with WNOHANG and abandoned if it never finishes: a
 	 * process in uninterruptible sleep cannot be reaped, and waiting for it
@@ -702,7 +742,7 @@ static bool cp_role_write(const char* name, const char* value, char* err, int er
 	remove(cp_role_marker);
 
 	if (!ok) {
-		snprintf(err, errlen, "the port did not switch to %s (role not confirmed)", value);
+		snprintf(err, errlen, "the port did not switch to %s (role not confirmed)", mode);
 		return false;
 	}
 	return true;
@@ -710,44 +750,45 @@ static bool cp_role_write(const char* name, const char* value, char* err, int er
 
 /* Switch the port, with the record written first.
  *
- * An attribute that cannot be read is refused rather than written: without the
- * mode it is in there is nothing to record, and an unrecorded write is exactly
+ * An attribute that cannot be read is refused rather than switched: without the
+ * mode it is in there is nothing to record, and an unrecorded switch is exactly
  * the case the record exists to prevent - a device left in host mode with adb
  * dead and nothing that knows how to put it back. Refusing is reported in the
- * same words as a failed write, because from the outside they are the same
+ * same words as a failed switch, because from the outside they are the same
  * answer.
  *
- * A platform with no role attribute is not a failure: the link then depends on
- * the port's own negotiation, which is what the firmware does by default, and
+ * A platform with no role nodes is not a failure: the link then depends on the
+ * port's own negotiation, which is what the firmware does by default, and
  * "no cable peer" is what the app will report. */
 static bool cp_role_force(char* err, int errlen) {
-	char path[CP_LINE_MAX], current[CP_NAME_MAX];
+	char current[CP_NAME_MAX], trigger[CP_NAME_MAX];
 
 	if (!cp_facts.role_dir) {
-		cp_log("no port-role attribute on this platform; relying on the port's own negotiation\n");
+		cp_log("no port-role nodes on this platform; relying on the port's own negotiation\n");
 		return true;
 	}
-	if (!cp_role_node(&cp_facts, CP_PORT_NODE_OTG, path, sizeof(path))) {
-		snprintf(err, errlen, "the port's role path does not fit");
+	if (!cp_port_mode(current, sizeof(current))) {
+		snprintf(err, errlen, "cannot read %s, so the port cannot be switched safely", CP_PORT_NODE_OTG);
 		return false;
 	}
-	if (!cp_read_attr(path, current, sizeof(current))) {
-		snprintf(err, errlen, "cannot read %s, so the port cannot be switched safely", path);
-		return false;
-	}
-	if (!strcmp(current, CP_PORT_ROLE_HOST)) {
+	if (!strcmp(current, CP_PORT_MODE_HOST)) {
 		cp_log("the port is already in host mode\n");
 		return true;
 	}
 
-	if (!cp_restore_put(CP_RESTORE_KEY_ROLE_NODE, CP_PORT_NODE_OTG) ||
+	/* The mode being left is what the restore returns to, and the node that
+	 * selects it is what the record names: the app's recovery reads that node
+	 * rather than re-deriving the spelling, so a key that is recorded but never
+	 * used would be a record of a decision nobody is bound by. */
+	if (!cp_role_trigger_name(current, trigger, sizeof(trigger)) ||
+	    !cp_restore_put(CP_RESTORE_KEY_ROLE_NODE, trigger) ||
 	    !cp_restore_put(CP_RESTORE_KEY_ROLE_VALUE, current)) {
 		snprintf(err, errlen, "cannot record the port's %s mode before changing it", current);
 		return false;
 	}
-	cp_log("the port is in %s mode; switching it to %s\n", current, CP_PORT_ROLE_HOST);
+	cp_log("the port is in %s mode; switching it to host\n", current);
 
-	if (!cp_role_write(CP_PORT_NODE_OTG, CP_PORT_ROLE_HOST, err, errlen)) return false;
+	if (!cp_role_switch(CP_PORT_MODE_HOST, err, errlen)) return false;
 	cp_log("the port is in host mode\n");
 	return true;
 }
@@ -757,43 +798,50 @@ static bool cp_role_force(char* err, int errlen) {
  * not the one this build prefers, because the record describes the device as it
  * was rather than as this build assumes it is. */
 static void cp_role_restore(void) {
-	char node[CP_NAME_MAX], value[CP_NAME_MAX], err[CP_ERROR_MAX];
+	char mode[CP_NAME_MAX], err[CP_ERROR_MAX];
 
-	if (!cp_restore_get(CP_RESTORE_KEY_ROLE_NODE, node, sizeof(node)) ||
-	    !cp_restore_get(CP_RESTORE_KEY_ROLE_VALUE, value, sizeof(value))) return;
+	if (!cp_restore_get(CP_RESTORE_KEY_ROLE_VALUE, mode, sizeof(mode)) || !mode[0]) return;
 
-	if (!cp_role_write(node, value, err, sizeof(err))) {
-		cp_log("could not put the port back to %s: %s\n", value, err);
+	if (!cp_role_switch(mode, err, sizeof(err))) {
+		cp_log("could not put the port back to %s: %s\n", mode, err);
 		return;
 	}
-	cp_log("the port is back in %s mode\n", value);
+	cp_log("the port is back in %s mode\n", mode);
 	cp_restore_put(CP_RESTORE_KEY_ROLE_NODE, "");
 	cp_restore_put(CP_RESTORE_KEY_ROLE_VALUE, "");
 }
 
-/* The gadget role's use of the same mechanism, and the only reason it is here:
- * this device boots into device/OTG mode, and something may have left the port
- * in host mode - an earlier session killed before its restore, another tool. A
- * gadget bound to a port that is not presenting as a device is never enumerated,
- * so the check has to come first.
+/* The gadget role's use of the same mechanism, and the reason it is no longer
+ * the near-no-op it was designed to be: the firmware boots the port into null
+ * mode, not device mode, and a port in null mode is never enumerated no matter
+ * what is on the other end of the cable - verified on hardware, and the reason
+ * a gadget end that has not switched itself to device mode presents nothing.
  *
- * This is the one port write that owes no record: device mode is what the
- * firmware already assumes, and it is where adb lives, so leaving it there after
- * a crash is leaving it where it belongs.
- *
- * An unreadable attribute is passed over rather than treated as host mode: not
- * knowing the current mode is not evidence of the wrong one, and this step's job
- * is to remove a specific obstacle, not to assert a state. */
+ * An unreadable attribute is passed over rather than treated as the wrong
+ * mode: not knowing the current mode is not evidence of the wrong one, and this
+ * step's job is to reach a specific state, not to assert one. */
 static bool cp_port_device(char* err, int errlen) {
-	char path[CP_LINE_MAX], current[CP_NAME_MAX];
+	char current[CP_NAME_MAX], trigger[CP_NAME_MAX];
 
 	if (!cp_facts.role_dir) return true;
-	if (!cp_role_node(&cp_facts, CP_PORT_NODE_OTG, path, sizeof(path))) return true;
-	if (!cp_read_attr(path, current, sizeof(current))) return true;
-	if (strcmp(current, CP_PORT_ROLE_HOST)) return true;
+	if (!cp_port_mode(current, sizeof(current))) return true;
+	if (!strcmp(current, CP_PORT_MODE_DEVICE)) return true;
 
-	cp_log("the port is in host mode; returning it to device mode\n");
-	return cp_role_write(CP_PORT_NODE_OTG, CP_PORT_ROLE_DEVICE, err, errlen);
+	/* Unlike the host role's switch this one looks like a change that could
+	 * skip the record, because null is the mode the firmware boots into. But a
+	 * port in null mode is never enumerated no matter what is on the other end
+	 * of the cable, so putting the gadget end into device mode is a real switch
+	 * and the mode it leaves is the one the restore owes - a device left in null
+	 * mode has adb dead, which is exactly the state the record exists to
+	 * prevent. */
+	if (!cp_role_trigger_name(current, trigger, sizeof(trigger)) ||
+	    !cp_restore_put(CP_RESTORE_KEY_ROLE_NODE, trigger) ||
+	    !cp_restore_put(CP_RESTORE_KEY_ROLE_VALUE, current)) {
+		snprintf(err, errlen, "cannot record the port's %s mode before changing it", current);
+		return false;
+	}
+	cp_log("the port is in %s mode; switching it to device\n", current);
+	return cp_role_switch(CP_PORT_MODE_DEVICE, err, errlen);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -858,6 +906,33 @@ static bool cp_pid_write(void) {
 	return ok;
 }
 
+/* Whether the pid in the pidfile is still a running netplay-cable.
+ *
+ * The same rule the app applies (netsetup.c cable_pid): the file names a
+ * process, and the process's own command line is what proves the number still
+ * refers to it. Without this check a daemon killed by a crash, or by a device
+ * that rebooted with the card still holding its pidfile, makes every later
+ * launch refuse to start - reporting "another cable daemon owns the session"
+ * about a process that does not exist. Observed on hardware, from exactly that
+ * sequence. */
+static bool cp_pid_live(void) {
+	char text[32];
+	if (!cp_read_attr(cp_pid_path, text, sizeof(text))) return false;
+
+	pid_t pid = (pid_t)atoi(text);
+	if (pid <= 1) return false;
+
+	char path[64], cmdline[256];
+	if (snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid) >= (int)sizeof(path)) return false;
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) return false;
+	ssize_t n = read(fd, cmdline, sizeof(cmdline) - 1);
+	close(fd);
+	if (n <= 0) return false;
+	cmdline[n] = '\0';
+	return strstr(cmdline, "netplay-cable.elf") != NULL;
+}
+
 static void cp_publish(void) {
 	char text[CP_STATUS_MAX], temporary[CP_LINE_MAX + 32];
 	int n = cp_status_write(&cp_status, text, sizeof(text));
@@ -906,6 +981,30 @@ static void cp_fail(const char* fmt, ...) {
 static void cp_stop_signal(int sig) {
 	(void)sig;
 	cp_stopping = 1;
+}
+
+/* A daemon that dies without saying so leaves a repair owed and nobody to
+ * describe it - which is what the first hardware run did, and why every step of
+ * the teardown below now says where it is. This names the signals a bug in this
+ * file would raise, so the log ends with a reason instead of mid-sentence.
+ *
+ * write() rather than cp_log: this runs in a signal handler, cp_log is not
+ * async-signal-safe, and stderr is already the log file (cp_log_open), so the
+ * bytes land in the same place a normal line would. */
+static void cp_fault_signal(int sig) {
+	const char* name = sig == SIGSEGV ? "segmentation fault"
+	                 : sig == SIGBUS  ? "bus error"
+	                 : sig == SIGABRT ? "abort"
+	                 : "fatal signal";
+	char line[160];
+	int n = snprintf(line, sizeof(line),
+	                 "fatal: %s (%d) - the repair record is still on the card\n",
+	                 name, sig);
+	if (n > 0) {
+		ssize_t ignored = write(STDERR_FILENO, line, (size_t)n);
+		(void)ignored;
+	}
+	_exit(128 + sig);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -988,14 +1087,22 @@ static bool cp_iface_up(const char* ip, char* err, int errlen) {
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// the gadget
+// taking the firmware's gadget
 //
-// The order is the kernel's, not ours: the gadget directory, its identity, a
-// function instance, a configuration with that function linked into it, and
-// only then the controller. The identity pair is deliberately unassigned
-// (app/usbnet.h): nothing binds it automatically, so the other end's host role
-// reaches the interface through usbfs without detaching a driver, which is what
-// a class the kernel knows would cost.
+// This kernel allows exactly one gadget object. The vendor's configfs
+// registers a virtual device with the hardcoded name android0 the first time
+// a gadget directory is created, and the second mkdir fails with EEXIST inside
+// gadgets_make - which surfaces to userspace as ENOMEM, an error that reads
+// like the controller is out of memory when it is only busy holding the
+// firmware's own gadget. So the gadget this daemon presents is the firmware's,
+// found rather than created, and the takeover is a swap: the firmware's
+// function comes out of its configuration for the life of the session and ours
+// goes in, and the restore puts the firmware's function - its instance, its
+// mount and the userspace that owns it - back exactly as it was found. adb is
+// that function on every device this builds for, which is also why the
+// identity attributes are stamped over and restored: the peer's host role
+// recognizes the link by the unassigned pair in app/usbnet.h, not by the
+// firmware's.
 //////////////////////////////////////////////////////////////////////////////
 
 /* <configfs>/usb_gadget/<name>/<attr> - the one path this file builds itself,
@@ -1058,104 +1165,286 @@ static bool cp_gadget_set(const char* attr, const char* value, char* err, int er
  * requires are written - no product string, no serial number: a host that shows
  * nothing next to the device is the correct answer for a link that only ever
  * has our own daemon at the other end. */
-static bool cp_gadget_build(char* err, int errlen) {
-	char dir[CP_LINE_MAX], path[CP_LINE_MAX], function[CP_LINE_MAX], value[32];
+/* The gadget we ride, discovered before any of its paths are built. Set once
+ * by cp_takeover_prepare; cp_facts.gadget points here so the pure layer's path
+ * builders stay as they are. */
+static char cp_gadget_name[CP_NAME_MAX];
 
-	if (!cp_gadget_dir(&cp_facts, dir, sizeof(dir))) {
-		snprintf(err, errlen, "the gadget path does not fit");
+/* The single non-dot entry of a directory, or a refusal that names the
+ * directory. A takeover that cannot see exactly one configuration and exactly
+ * one function is a takeover that cannot put the firmware back, so it is
+ * refused rather than guessed at. */
+static bool cp_single_entry(const char* dir_path, char* out, size_t cap,
+                            const char* what, char* err, int errlen) {
+	DIR* dir = opendir(dir_path);
+	if (!dir) {
+		snprintf(err, errlen, "cannot read %s: %s", dir_path, strerror(errno));
 		return false;
 	}
-	/* EEXIST is a gadget a previous run left behind; the boot-time pass removes
-	 * it, and until it does, reusing it is what the kernel allows. */
-	if (!cp_mkdir_p(dir)) {
-		snprintf(err, errlen, "cannot create %s: %s", dir, strerror(errno));
+	char found[CP_NAME_MAX] = "";
+	int count = 0;
+	struct dirent* entry;
+	while ((entry = readdir(dir)) != NULL) {
+		if (entry->d_name[0] == '.') continue;
+		count++;
+		snprintf(found, sizeof(found), "%s", entry->d_name);
+	}
+	closedir(dir);
+	if (count != 1) {
+		snprintf(err, errlen, "%s has %d %s(s)", dir_path, count, what);
 		return false;
 	}
-
-	snprintf(value, sizeof(value), "0x%04x", CP_VID);
-	if (!cp_gadget_set("idVendor", value, err, errlen)) return false;
-	snprintf(value, sizeof(value), "0x%04x", CP_PID);
-	if (!cp_gadget_set("idProduct", value, err, errlen)) return false;
-	snprintf(value, sizeof(value), "0x%04x", CP_BCD_DEVICE);
-	if (!cp_gadget_set("bcdDevice", value, err, errlen)) return false;
-
-	if (!cp_gadget_function_dir(&cp_facts, function, sizeof(function))) {
-		snprintf(err, errlen, "the function path does not fit");
+	if (strlen(found) >= cap) {
+		snprintf(err, errlen, "the %s name does not fit", what);
 		return false;
 	}
-	if (!cp_mkdir_p(function)) {
-		snprintf(err, errlen, "cannot create %s: %s", function, strerror(errno));
-		return false;
-	}
-
-	if (snprintf(path, sizeof(path), "%s/configs/c.1", dir) >= (int)sizeof(path)) {
-		snprintf(err, errlen, "the configuration path does not fit");
-		return false;
-	}
-	if (!cp_mkdir_p(path)) {
-		snprintf(err, errlen, "cannot create %s: %s", path, strerror(errno));
-		return false;
-	}
-
-	/* What we ask the other end for. 100 mA is the amount any USB 2.0 host must
-	 * offer before anything is negotiated, and the host here is another
-	 * battery-powered handheld rather than a powered hub: asking for more than
-	 * it can give is how a peer ends up unable to configure us at all. */
-	if (snprintf(path, sizeof(path), "%s/configs/c.1/MaxPower", dir) >= (int)sizeof(path)) {
-		snprintf(err, errlen, "the MaxPower path does not fit");
-		return false;
-	}
-	if (!cp_write_attr(path, "100")) {
-		snprintf(err, errlen, "cannot set MaxPower: %s", strerror(errno));
-		return false;
-	}
-
-	/* The link inside the configuration has to carry the function directory's
-	 * own name, so the name is taken from that path rather than spelled again
-	 * here. */
-	const char* instance = strrchr(function, '/');
-	if (!instance || !instance[1]) {
-		snprintf(err, errlen, "the function path has no instance name");
-		return false;
-	}
-	if (snprintf(path, sizeof(path), "%s/configs/c.1/%s", dir, instance + 1) >= (int)sizeof(path)) {
-		snprintf(err, errlen, "the function link path does not fit");
-		return false;
-	}
-	if (symlink(function, path) != 0 && errno != EEXIST) {
-		snprintf(err, errlen, "cannot link %s into the configuration: %s", instance + 1, strerror(errno));
-		return false;
-	}
+	snprintf(out, cap, "%s", found);
 	return true;
 }
 
-/* Which gadget holds the controller, and to which controller. Discovered rather
- * than assumed: the firmware's gadget has whatever name its build gave it, and
- * adb works today precisely because nothing here guesses. */
-static bool cp_udc_owner(char* gadget, size_t gadget_cap, char* udc, size_t udc_cap) {
+/* Where a functionfs instance is mounted, out of /proc/mounts: the instance
+ * names the mount's source, so the function about to be removed tells us
+ * which mount has to come down with it. */
+static bool cp_ffs_mount_of(const char* instance, char* out, size_t cap) {
+	FILE* f = fopen("/proc/mounts", "r");
+	if (!f) return false;
+	char line[CP_LINE_MAX];
+	bool found = false;
+	while (!found && fgets(line, sizeof(line), f)) {
+		char source[64], target[CP_LINE_MAX], type[32];
+		if (sscanf(line, "%63s %255s %31s", source, target, type) != 3) continue;
+		if (strcmp(type, "functionfs") || strcmp(source, instance)) continue;
+		snprintf(out, cap, "%s", target);
+		found = true;
+	}
+	fclose(f);
+	return found;
+}
+
+/* The process that owns a functionfs instance: the one holding any file under
+ * its mount point open. adbd is the case in point - it holds ep0, ep1 and ep2
+ * for as long as it lives, which is why the function cannot be removed until it
+ * stops and why restoring means starting it again. */
+static pid_t cp_ffs_holder(const char* mount, char* command, size_t cap) {
+	DIR* dir = opendir("/proc");
+	if (!dir) return 0;
+	size_t mount_len = strlen(mount);
+	struct dirent* entry;
+	while ((entry = readdir(dir)) != NULL) {
+		if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+		char fds[64];
+		if (snprintf(fds, sizeof(fds), "/proc/%s/fd", entry->d_name) >= (int)sizeof(fds)) continue;
+
+		DIR* fdir = opendir(fds);
+		if (!fdir) continue;
+		struct dirent* fd;
+		while ((fd = readdir(fdir)) != NULL) {
+			char link[96], target[CP_LINE_MAX];
+			if (snprintf(link, sizeof(link), "%s/%s", fds, fd->d_name) >= (int)sizeof(link)) continue;
+			ssize_t n = readlink(link, target, sizeof(target) - 1);
+			if (n <= 0) continue;
+			target[n] = '\0';
+			if (strncmp(target, mount, mount_len) ||
+			    (target[mount_len] && target[mount_len] != '/')) continue;
+			closedir(fdir);
+			closedir(dir);
+
+			pid_t pid = (pid_t)atoi(entry->d_name);
+			if (pid == getpid()) return 0;
+
+			if (command && cap) {
+				char path[64], buffer[512];
+				if (snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid) >= (int)sizeof(path)) break;
+				int cfd = open(path, O_RDONLY);
+				if (cfd >= 0) {
+					ssize_t got = read(cfd, buffer, sizeof(buffer) - 1);
+					close(cfd);
+					if (got > 0) {
+						buffer[got] = '\0';
+						for (ssize_t i = 0; i < got; i++) if (buffer[i] == '\0') buffer[i] = ' ';
+						while (got > 0 && buffer[got - 1] == ' ') buffer[--got] = '\0';
+						snprintf(command, cap, "%s", buffer);
+					}
+				}
+			}
+			return pid;
+		}
+		closedir(fdir);
+	}
+	closedir(dir);
+	return 0;
+}
+
+/* Find the gadget we ride. Prefer the one holding the controller - that is the
+ * one presenting on the port - and fall back to the only directory when
+ * nothing is bound, which is the firmware's own boot state until something is
+ * attached. Two directories and no binding is a state this daemon refuses to
+ * guess at. */
+static bool cp_owner_gadget(const char* udc, char* gadget, size_t gadget_cap) {
 	char root[CP_LINE_MAX];
 	if (snprintf(root, sizeof(root), "%s/usb_gadget", cp_facts.configfs) >= (int)sizeof(root)) return false;
 
 	DIR* dir = opendir(root);
 	if (!dir) return false;
 
-	bool found = false;
+	char single[CP_NAME_MAX] = "", bound[CP_NAME_MAX] = "";
+	int count = 0;
 	struct dirent* entry;
-	while (!found && (entry = readdir(dir)) != NULL) {
+	while ((entry = readdir(dir)) != NULL) {
 		if (entry->d_name[0] == '.') continue;
-		if (!strcmp(entry->d_name, cp_facts.gadget)) continue;   /* ours, if a previous run left it */
+		count++;
+		snprintf(single, sizeof(single), "%s", entry->d_name);
 
 		char path[CP_LINE_MAX], value[CP_NAME_MAX];
 		if (!cp_gadget_path(entry->d_name, "UDC", path, sizeof(path))) continue;
-		if (!cp_read_attr(path, value, sizeof(value)) || !value[0]) continue;
-
-		snprintf(gadget, gadget_cap, "%s", entry->d_name);
-		snprintf(udc, udc_cap, "%s", value);
-		found = true;
+		if (!cp_read_attr(path, value, sizeof(value)) || strcmp(value, udc)) continue;
+		snprintf(bound, sizeof(bound), "%s", entry->d_name);
 	}
 	closedir(dir);
-	return found;
+
+	if (bound[0]) { snprintf(gadget, gadget_cap, "%s", bound); return true; }
+	if (count == 1) { snprintf(gadget, gadget_cap, "%s", single); return true; }
+	return false;
 }
+
+/* Take the firmware's gadget over: unbind it, swap its function for ours, and
+ * leave the record that puts it back. Nothing here is invented - the gadget,
+ * its configuration and its function are discovered, and the record carries
+ * what only the running system knows: the instance's mount point and the
+ * userspace that owns it.
+ *
+ * The order is deliberate. The record is complete before anything is taken, so
+ * a failure at any later step leaves a record that describes exactly what was
+ * displaced; the controller is released before the configuration is touched,
+ * because configfs refuses to relink a bound one; and the holder is stopped
+ * before the instance's mount is taken down, because the function directory
+ * cannot go away while its endpoint files are open. */
+static bool cp_takeover_prepare(const char* udc, char* err, int errlen) {
+	char dir[CP_LINE_MAX], configs[CP_LINE_MAX], functions[CP_LINE_MAX];
+	char config[CP_NAME_MAX], function[CP_NAME_MAX], instance[CP_NAME_MAX];
+	char ours[CP_LINE_MAX], mount_point[CP_LINE_MAX] = "", command[CP_LINE_MAX] = "";
+	char path[CP_LINE_MAX], identity[CP_LINE_MAX], value[32];
+	pid_t holder = 0;
+
+	if (!cp_owner_gadget(udc, cp_gadget_name, sizeof(cp_gadget_name))) {
+		snprintf(err, errlen, "this device has no gadget to take over");
+		return false;
+	}
+	cp_facts.gadget = cp_gadget_name;
+	if (!cp_gadget_dir(&cp_facts, dir, sizeof(dir)) ||
+	    snprintf(configs, sizeof(configs), "%s/configs", dir) >= (int)sizeof(configs) ||
+	    snprintf(functions, sizeof(functions), "%s/functions", dir) >= (int)sizeof(functions)) {
+		snprintf(err, errlen, "the gadget path does not fit");
+		return false;
+	}
+
+	/* One configuration and one function, or refuse: a swap into a composite
+	 * this daemon cannot fully restore is worse than no link, and the peer's
+	 * host role takes the first vendor interface it finds, so leaving the
+	 * firmware's next to ours would hand it the wrong one anyway. */
+	if (!cp_single_entry(configs, config, sizeof(config), "configuration", err, errlen)) return false;
+	if (!cp_single_entry(functions, function, sizeof(function), "function", err, errlen)) return false;
+	if (!strcmp(function, "ffs.cable")) {
+		snprintf(err, errlen, "%s still carries our function from an earlier run", cp_gadget_name);
+		return false;
+	}
+
+	snprintf(instance, sizeof(instance), "%s", function + (strncmp(function, "ffs.", 4) ? 0 : 4));
+	if (cp_ffs_mount_of(instance, mount_point, sizeof(mount_point)))
+		holder = cp_ffs_holder(mount_point, command, sizeof(command));
+
+	/* The identity we stamp over is the firmware's own, read rather than
+	 * assumed, so it goes back exactly as it was found - whatever the next
+	 * firmware build decides to use. */
+	{
+		char vendor[CP_NAME_MAX] = "", product[CP_NAME_MAX] = "", device[CP_NAME_MAX] = "";
+		if (!cp_gadget_attr(&cp_facts, "idVendor", path, sizeof(path)) ||
+		    !cp_read_attr(path, vendor, sizeof(vendor)) ||
+		    !cp_gadget_attr(&cp_facts, "idProduct", path, sizeof(path)) ||
+		    !cp_read_attr(path, product, sizeof(product)) ||
+		    !cp_gadget_attr(&cp_facts, "bcdDevice", path, sizeof(path)) ||
+		    !cp_read_attr(path, device, sizeof(device))) {
+			snprintf(err, errlen, "cannot read %s's identity", cp_gadget_name);
+			return false;
+		}
+		if (snprintf(identity, sizeof(identity), "%s,%s,%s", vendor, product, device) >= (int)sizeof(identity)) {
+			snprintf(err, errlen, "the gadget's identity does not fit");
+			return false;
+		}
+	}
+
+	if (!cp_restore_put(CP_RESTORE_KEY_GADGET, cp_gadget_name) ||
+	    !cp_restore_put(CP_RESTORE_KEY_UDC, udc) ||
+	    !cp_restore_put(CP_RESTORE_KEY_FUNCTION, function) ||
+	    !cp_restore_put(CP_RESTORE_KEY_CONFIG, config) ||
+	    !cp_restore_put(CP_RESTORE_KEY_IDENTITY, identity) ||
+	    !cp_restore_put(CP_RESTORE_KEY_MOUNT, mount_point) ||
+	    !cp_restore_put(CP_RESTORE_KEY_EXE, command)) {
+		snprintf(err, errlen, "cannot record what is being taken over");
+		return false;
+	}
+	cp_log("taking %s over from %s\n", udc, cp_gadget_name);
+
+	/* The controller is released before the configuration is touched. */
+	if (!cp_gadget_path(cp_gadget_name, "UDC", path, sizeof(path)) || !cp_write_attr(path, "\n")) {
+		snprintf(err, errlen, "cannot release %s: %s", cp_gadget_name, strerror(errno));
+		return false;
+	}
+
+	/* The holder keeps the instance's endpoint files open, so it has to stop
+	 * before the function directory can go away. TERM rather than KILL: the
+	 * process is the firmware's, it owns nothing of ours, and the same process
+	 * is what the restore restarts. */
+	if (holder > 0) {
+		kill(holder, SIGTERM);
+		for (int tick = 0; tick < CP_ROLE_WAIT_TICKS; tick++) {
+			if (umount2(mount_point, MNT_DETACH) == 0 || errno != EBUSY) break;
+			usleep(CP_TICK_MS * 1000);
+		}
+	}
+	if (mount_point[0] && umount2(mount_point, MNT_DETACH) != 0 && errno != EINVAL)
+		cp_log("could not unmount %s: %s\n", mount_point, strerror(errno));
+
+	if (snprintf(path, sizeof(path), "%s/%s/%s", configs, config, function) >= (int)sizeof(path) ||
+	    (remove(path) != 0 && errno != ENOENT)) {
+		snprintf(err, errlen, "cannot unlink %s from %s: %s", function, config, strerror(errno));
+		return false;
+	}
+	if (snprintf(path, sizeof(path), "%s/%s", functions, function) >= (int)sizeof(path) ||
+	    rmdir(path) != 0) {
+		snprintf(err, errlen, "cannot remove the firmware's %s: %s", function, strerror(errno));
+		return false;
+	}
+
+	/* Ours, in the same slot: the instance name comes from the pure layer's one
+	 * fact, and the link carries the function directory's own name. */
+	if (!cp_gadget_function_dir(&cp_facts, ours, sizeof(ours)) || mkdir(ours, 0755) != 0) {
+		snprintf(err, errlen, "cannot create our function in %s: %s", cp_gadget_name, strerror(errno));
+		return false;
+	}
+	const char* name = strrchr(ours, '/');
+	name = name ? name + 1 : ours;
+	if (snprintf(path, sizeof(path), "%s/%s/%s", configs, config, name) >= (int)sizeof(path) ||
+	    (symlink(ours, path) != 0 && errno != EEXIST)) {
+		snprintf(err, errlen, "cannot link %s into %s: %s", name, config, strerror(errno));
+		return false;
+	}
+
+	/* Our identity, over the firmware's: the peer's host role recognizes the
+	 * link by this pair, and it is unassigned precisely so that no driver on
+	 * the other end claims it before usbfs does. */
+	snprintf(value, sizeof(value), "0x%04x", CP_VID);
+	if (!cp_gadget_set("idVendor", value, err, errlen)) return false;
+	snprintf(value, sizeof(value), "0x%04x", CP_PID);
+	if (!cp_gadget_set("idProduct", value, err, errlen)) return false;
+	snprintf(value, sizeof(value), "0x%04x", CP_BCD_DEVICE);
+	if (!cp_gadget_set("bcdDevice", value, err, errlen)) return false;
+	return true;
+}
+
+/* Which gadget holds the controller was the old question; the takeover's is
+ * the reverse - which gadget this device has at all - and it is answered by
+ * cp_owner_gadget above. */
 
 /* The controller's name, as its own attribute wants it: the directory name
  * under the UDC list. Read rather than constant, because it is the kernel's
@@ -1333,31 +1622,24 @@ static bool cp_eps_open(char* err, int errlen) {
  * crash between any two of those steps leaves a record that says what to put
  * back, which is the only thing that makes taking the controller defensible -
  * the firmware's adb lives on the other side of it. */
-static bool cp_udc_take(const char* udc, char* err, int errlen) {
-	char owner_gadget[CP_NAME_MAX], owner_udc[CP_NAME_MAX], path[CP_LINE_MAX];
+static bool cp_takeover_bind(const char* udc, char* err, int errlen) {
+	char path[CP_LINE_MAX], held[CP_NAME_MAX];
 
-	if (cp_udc_owner(owner_gadget, sizeof(owner_gadget), owner_udc, sizeof(owner_udc))) {
-		if (!cp_restore_put(CP_RESTORE_KEY_GADGET, owner_gadget) ||
-		    !cp_restore_put(CP_RESTORE_KEY_UDC, owner_udc)) {
-			snprintf(err, errlen, "cannot record who holds %s before taking it", udc);
-			return false;
-		}
-		cp_log("%s is held by %s; taking it\n", udc, owner_gadget);
-
-		/* Releasing is the empty string: the attribute is unbound by writing a
-		 * line with nothing on it. A refusal here is not fatal - the bind below
-		 * will fail with EBUSY and say so - but it is worth knowing which step
-		 * said no. */
-		if (cp_gadget_path(owner_gadget, "UDC", path, sizeof(path)) && !cp_write_attr(path, "\n"))
-			cp_log("could not release %s cleanly: %s\n", owner_gadget, strerror(errno));
-	}
-
-	if (!cp_gadget_set("UDC", udc, err, errlen)) {
-		char inside[CP_ERROR_MAX];
-		snprintf(inside, sizeof(inside), "%s", err);
-		snprintf(err, errlen, "cannot bind the gadget to %s (%s)", udc, inside);
+	/* Verified by reading the attribute rather than by the write's return code:
+	 * this UDC can bind and still come back ENODEV, which is the same behaviour
+	 * that made the teardown's release report failure on a release that had
+	 * already happened. The evidence is the attribute's content, the way
+	 * cp_iface_up reads an address back rather than trusting `ip`. */
+	if (!cp_gadget_attr(&cp_facts, "UDC", path, sizeof(path))) {
+		snprintf(err, errlen, "the path to UDC does not fit");
 		return false;
 	}
+	(void)cp_write_attr(path, udc);
+	if (!cp_read_attr(path, held, sizeof(held)) || strcmp(held, udc)) {
+		snprintf(err, errlen, "cannot bind the gadget to %s (%s)", udc, strerror(errno));
+		return false;
+	}
+
 	cp_gadget_bound = true;
 	cp_log("bound to %s\n", udc);
 	return true;
@@ -1366,38 +1648,173 @@ static bool cp_udc_take(const char* udc, char* err, int errlen) {
 /* Hands the controller back to the gadget that had it, and forgets the record
  * only once that has worked - the same keep-on-failure policy as the radio's
  * breadcrumb. */
-static void cp_udc_restore(void) {
-	char gadget[CP_NAME_MAX], udc[CP_NAME_MAX], path[CP_LINE_MAX];
+/* Restart the userspace the record names, detached the way the daemon itself
+ * was. One space-separated command, no quoting: it is what /proc/<pid>/cmdline
+ * recorded, and the case in point is a path plus flags. */
+static void cp_spawn(const char* command) {
+	char buffer[CP_LINE_MAX];
+	snprintf(buffer, sizeof(buffer), "%s", command);
 
-	if (!cp_restore_get(CP_RESTORE_KEY_GADGET, gadget, sizeof(gadget)) ||
-	    !cp_restore_get(CP_RESTORE_KEY_UDC, udc, sizeof(udc))) return;
+	char* argv[16] = {0};
+	int argc = 0;
+	for (char* p = strtok(buffer, " "); p && argc < 15; p = strtok(NULL, " "))
+		argv[argc++] = p;
+	if (!argc) return;
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		cp_log("cannot restart %s: %s\n", command, strerror(errno));
+		return;
+	}
+	if (pid == 0) {
+		setsid();
+		int null_fd = open("/dev/null", O_RDONLY);
+		int log_fd = open(cp_log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+		if (null_fd >= 0) { dup2(null_fd, STDIN_FILENO); close(null_fd); }
+		if (log_fd >= 0) {
+			dup2(log_fd, STDOUT_FILENO); dup2(log_fd, STDERR_FILENO);
+			if (log_fd > STDERR_FILENO) close(log_fd);
+		}
+		execv(argv[0], argv);
+		_exit(127);
+	}
+	cp_log("restarted %s\n", command);
+}
+
+/* Take our function out of the firmware's gadget. Ours alone: the
+ * configuration, the identity and the gadget directory itself are the
+ * firmware's and are rebuilt rather than removed. A step that never happened
+ * is a step whose removal fails harmlessly, which is why none of these is
+ * checked. */
+static void cp_ours_remove(void) {
+	char dir[CP_LINE_MAX], function[CP_LINE_MAX], config[CP_NAME_MAX], path[CP_LINE_MAX];
+
+	if (!cp_gadget_function_dir(&cp_facts, function, sizeof(function))) return;
+	cp_log("restore: unlinking our function from %s\n", cp_facts.gadget);
+
+	if (cp_restore_get(CP_RESTORE_KEY_CONFIG, config, sizeof(config)) && config[0] &&
+	    cp_gadget_dir(&cp_facts, dir, sizeof(dir))) {
+		const char* name = strrchr(function, '/');
+		name = name ? name + 1 : function;
+		if (snprintf(path, sizeof(path), "%s/configs/%s/%s", dir, config, name) < (int)sizeof(path))
+			remove(path);
+	}
+
+	/* The mount has to come down before the function directory does, and this
+	 * order is not a preference: the kernel tears the functionfs instance down
+	 * when the directory is removed, and doing that with the instance's mount
+	 * still on top of it dereferences freed, poisoned memory - ffs_release_dev
+	 * reaches PC = 0x6b6b6b6b6b6b6b6b (SLAB_POISON) and oopses, taking the daemon
+	 * with it. Verified on hardware, both ways round: the same removal succeeds
+	 * with the unmount first and oopses with it last. The app's own recovery
+	 * (netsetup.c ns_cable_function_restore) does it in this order, which is
+	 * where it was written down from the manual repair. */
+	if (cp_ffs_mounted) {
+		/* Detached rather than plain: a mount left by an earlier run may still
+		 * have a file open in a process that is not this one, and refusing to
+		 * unmount would leave the next session to inherit it. */
+		if (umount2(cp_facts.ffs_dir, MNT_DETACH) != 0 && errno != EINVAL)
+			cp_log("could not unmount %s: %s\n", cp_facts.ffs_dir, strerror(errno));
+		cp_ffs_mounted = false;
+	}
+
+	rmdir(function);
+}
+
+/* Put the firmware's gadget back: the function, its mount, its userspace and
+ * the identity, in the order the takeover took them down, and the controller
+ * last. Idempotent on purpose - this runs on the ordinary teardown and on the
+ * bring-up's own failure path, and a step that never happened has to be safe
+ * to restore.
+ *
+ * A record without a function is a record from the old build, which only took
+ * the controller: restoring that is still the rebind below and nothing else,
+ * which is exactly what the old cp_udc_restore did. */
+static void cp_owner_rebuild(void) {
+	char gadget[CP_NAME_MAX], udc[CP_NAME_MAX], function[CP_NAME_MAX];
+	char config[CP_NAME_MAX], mount_point[CP_LINE_MAX], command[CP_LINE_MAX], identity[CP_LINE_MAX];
+	char dir[CP_LINE_MAX], instance[CP_NAME_MAX], path[CP_LINE_MAX], held[CP_NAME_MAX];
+
+	if (!cp_restore_get(CP_RESTORE_KEY_GADGET, gadget, sizeof(gadget)) || !gadget[0] ||
+	    !cp_restore_get(CP_RESTORE_KEY_UDC, udc, sizeof(udc)) || !udc[0]) {
+		cp_log("restore: no gadget in the record - nothing to rebuild\n");
+		return;
+	}
+	if (snprintf(dir, sizeof(dir), "%s/usb_gadget/%s", cp_facts.configfs, gadget) >= (int)sizeof(dir)) return;
+
+	cp_log("restore: rebuilding %s on %s\n", gadget, udc);
+
+	bool has_function = cp_restore_get(CP_RESTORE_KEY_FUNCTION, function, sizeof(function)) && function[0];
+	bool has_config   = cp_restore_get(CP_RESTORE_KEY_CONFIG, config, sizeof(config)) && config[0];
+	bool has_mount    = cp_restore_get(CP_RESTORE_KEY_MOUNT, mount_point, sizeof(mount_point)) && mount_point[0];
+	bool has_command  = cp_restore_get(CP_RESTORE_KEY_EXE, command, sizeof(command)) && command[0];
+	bool has_identity = cp_restore_get(CP_RESTORE_KEY_IDENTITY, identity, sizeof(identity)) && identity[0];
+
+	if (has_function) {
+		snprintf(instance, sizeof(instance), "%s", function + (strncmp(function, "ffs.", 4) ? 0 : 4));
+
+		if (snprintf(path, sizeof(path), "%s/functions/%s", dir, function) < (int)sizeof(path) &&
+		    mkdir(path, 0755) != 0 && errno != EEXIST)
+			cp_log("cannot recreate %s: %s\n", function, strerror(errno));
+		cp_log("restore: %s in place\n", function);
+
+		if (has_mount) {
+			(void)mkdir(mount_point, 0755);
+			if (mount(instance, mount_point, "functionfs", 0, NULL) != 0)
+				cp_log("cannot remount functionfs on %s: %s\n", mount_point, strerror(errno));
+			else
+				cp_log("restore: %s mounted on %s\n", instance, mount_point);
+		}
+
+		if (has_config &&
+		    snprintf(path, sizeof(path), "%s/configs/%s/%s", dir, config, function) < (int)sizeof(path)) {
+			char target[CP_LINE_MAX];
+			if (snprintf(target, sizeof(target), "%s/functions/%s", dir, function) < (int)sizeof(target) &&
+			    symlink(target, path) != 0 && errno != EEXIST)
+				cp_log("cannot link %s back into %s: %s\n", function, config, strerror(errno));
+		}
+
+		/* First, because the userspace writes the instance's descriptors when
+		 * it starts: a function whose owner is not running is not presentable,
+		 * and the bind below would fail as if the function were broken. */
+		if (has_command) { cp_log("restore: starting %s\n", command); cp_spawn(command); }
+	}
+
+	if (has_identity) {
+		/* vendor,product,device - the three attributes the takeover stamped
+		 * over, written back exactly as they were read. */
+		char* save = NULL;
+		char* vendor  = strtok_r(identity, ",", &save);
+		char* product = strtok_r(NULL, ",", &save);
+		char* device   = strtok_r(NULL, ",", &save);
+		if (vendor && product && device) {
+			if (cp_gadget_path(gadget, "idVendor", path, sizeof(path))) cp_write_attr(path, vendor);
+			if (cp_gadget_path(gadget, "idProduct", path, sizeof(path))) cp_write_attr(path, product);
+			if (cp_gadget_path(gadget, "bcdDevice", path, sizeof(path))) cp_write_attr(path, device);
+			cp_log("restore: identity back to %s\n", identity);
+		}
+	}
+
 	if (!cp_gadget_path(gadget, "UDC", path, sizeof(path))) return;
-	if (!cp_write_attr(path, udc)) {
+
+	/* Read back, not trusted: the same ENODEV-on-success this UDC produces for
+	 * the release, and the same rule the app's own recovery applies to this very
+	 * bind (netsetup.c ns_cable_udc_restore). Reporting a repair that worked as
+	 * failed is not harmless - the record is only cleared on success, so it would
+	 * be kept and re-run at every launch. */
+	(void)cp_write_attr(path, udc);
+	if (!cp_read_attr(path, held, sizeof(held)) || strcmp(held, udc)) {
 		cp_log("could not hand %s back to %s: %s\n", udc, gadget, strerror(errno));
 		return;
 	}
 	cp_log("handed %s back to %s\n", udc, gadget);
 	cp_restore_put(CP_RESTORE_KEY_UDC, "");
 	cp_restore_put(CP_RESTORE_KEY_GADGET, "");
-}
-
-/* Removes what was built, leaving anything that predates us alone: configfs
- * refuses to remove a bound gadget's directories, so this runs after the
- * controller has been released. A step that never happened is a step whose
- * removal fails harmlessly, which is why none of these is checked. */
-static void cp_gadget_remove(void) {
-	char dir[CP_LINE_MAX], path[CP_LINE_MAX], function[CP_LINE_MAX];
-
-	if (!cp_gadget_dir(&cp_facts, dir, sizeof(dir))) return;
-	if (cp_gadget_function_dir(&cp_facts, function, sizeof(function))) {
-		const char* instance = strrchr(function, '/');
-		if (instance && instance[1] &&
-		    snprintf(path, sizeof(path), "%s/configs/c.1/%s", dir, instance + 1) < (int)sizeof(path))
-			remove(path);
-		rmdir(function);
-	}
-	if (snprintf(path, sizeof(path), "%s/configs/c.1", dir) < (int)sizeof(path)) rmdir(path);
-	rmdir(dir);
+	cp_restore_put(CP_RESTORE_KEY_FUNCTION, "");
+	cp_restore_put(CP_RESTORE_KEY_MOUNT, "");
+	cp_restore_put(CP_RESTORE_KEY_EXE, "");
+	cp_restore_put(CP_RESTORE_KEY_CONFIG, "");
+	cp_restore_put(CP_RESTORE_KEY_IDENTITY, "");
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1611,20 +2028,16 @@ static bool cp_gadget_start(char* err, int errlen) {
 	char udc[CP_NAME_MAX];
 
 	/* The port first. A gadget bound to a port that is not presenting as a
-	 * device is never enumerated, and the correction is the one port write that
-	 * owes no record. */
+	 * device is never enumerated - and on this board the firmware boots the
+	 * port into null mode, which is exactly that. The switch is recorded, so
+	 * the teardown owes the port its boot mode back. */
 	if (!cp_port_device(err, errlen)) return false;
 
 	/* The interface next, deliberately. Everything after this point takes
-	 * something away from the firmware - the controller, from its gadget - and a
-	 * device that cannot do the cheap half should not be allowed to reach the
-	 * expensive one, because adb is on the other side of it. */
-	if (!cp_status_put("gadget", cp_facts.gadget) || !cp_status_put("iface", cp_facts.iface) ||
-	    !cp_status_put("ip", NS_CABLE_HOST_IP) || !cp_status_put("peer", NS_CABLE_CLIENT_IP)) {
-		snprintf(err, errlen, "the status grammar refused this link's own fields");
-		return false;
-	}
-
+	 * something away from the firmware - its gadget's function, its identity,
+	 * the controller - and a device that cannot do the cheap half should not
+	 * be allowed to reach the expensive one, because adb is on the other side
+	 * of it. */
 	cp_tun_fd = cp_tun_open(err, errlen);
 	if (cp_tun_fd < 0) return false;
 	if (!cp_iface_up(NS_CABLE_HOST_IP, err, errlen)) return false;
@@ -1638,11 +2051,20 @@ static bool cp_gadget_start(char* err, int errlen) {
 		snprintf(err, errlen, "%s lists no controller", cp_facts.udc_dir);
 		return false;
 	}
-	if (!cp_gadget_build(err, errlen)) return false;
+	if (!cp_takeover_prepare(udc, err, errlen)) return false;
+
+	/* The link's own fields name the gadget we ride, so they are published
+	 * once the takeover has found it rather than before. */
+	if (!cp_status_put("gadget", cp_facts.gadget) || !cp_status_put("iface", cp_facts.iface) ||
+	    !cp_status_put("ip", NS_CABLE_HOST_IP) || !cp_status_put("peer", NS_CABLE_CLIENT_IP)) {
+		snprintf(err, errlen, "the status grammar refused this link's own fields");
+		return false;
+	}
+
 	if (!cp_ffs_mount(err, errlen)) return false;
 	if (!cp_ffs_open_ep0(err, errlen)) return false;
 	if (!cp_eps_open(err, errlen)) return false;
-	if (!cp_udc_take(udc, err, errlen)) return false;
+	if (!cp_takeover_bind(udc, err, errlen)) return false;
 
 	cp_status_put("udc", udc);
 	cp_status_set_state(&cp_status, CP_STATE_WAIT);
@@ -1657,33 +2079,66 @@ static bool cp_gadget_start(char* err, int errlen) {
  * last, because until the record is honoured it is the only thing that knows
  * what to put back. */
 static void cp_gadget_teardown(void) {
+	cp_log("teardown: unwinding\n");
+
+	cp_log("teardown: unwinding\n");
+
 	if (cp_ep_in >= 0)  { close(cp_ep_in);  cp_ep_in = -1; }
 	if (cp_ep_out >= 0) { close(cp_ep_out); cp_ep_out = -1; }
 	if (cp_ep0 >= 0)    { close(cp_ep0);    cp_ep0 = -1; }
 	if (cp_evfd >= 0)   { close(cp_evfd);   cp_evfd = -1; }
 	if (cp_tun_fd >= 0) { close(cp_tun_fd); cp_tun_fd = -1; }   /* the interface goes with it */
 
+	/* The controller has to be released before anything else is touched, and the
+	 * write's return code is not the answer on this UDC: an unbind can complete
+	 * and still come back ENODEV, and a write to an attribute that is already
+	 * unbound comes back the same way - so a loop that trusted the return code
+	 * could never observe success, and the first hardware run gave up on a release
+	 * that had in fact happened (g1/UDC read back empty). The attribute's own
+	 * content is the evidence, exactly as cp_iface_up reads the address back
+	 * rather than trusting `ip`'s exit status.
+	 *
+	 * If it is genuinely still held, *nothing else is done*. Removing a functionfs
+	 * function from a gadget that is still bound corrupts the kernel's functionfs
+	 * instance on this vendor kernel - ffs_release_dev then calls through freed,
+	 * poisoned memory and the machine oopses with an SP/PC alignment exception
+	 * (PC = 0x6b6b6b6b6b6b6b6b, SLAB_POISON) and takes the daemon with it, leaving
+	 * the repair half-done and undocumented. Leaving the gadget untouched keeps
+	 * the record truthful, and the next launch or a reboot - neither of which
+	 * needs this process to survive - finishes the repair. */
+	bool released = !cp_gadget_bound;
 	if (cp_gadget_bound) {
 		char path[CP_LINE_MAX];
-		if (cp_gadget_attr(&cp_facts, "UDC", path, sizeof(path))) {
-			if (cp_write_attr(path, "\n")) cp_log("released the controller\n");
-			else cp_log("could not release the controller: %s\n", strerror(errno));
+		if (!cp_gadget_attr(&cp_facts, "UDC", path, sizeof(path))) {
+			released = true;   /* no path to release through: nothing is bound */
+		} else {
+			for (int tick = 0; tick < CP_UNBIND_TICKS && !released; tick++) {
+				char held[CP_NAME_MAX];
+				(void)cp_write_attr(path, "\n");
+				if (!cp_read_attr(path, held, sizeof(held)) || !held[0]) released = true;
+				else usleep(CP_TICK_MS * 1000);
+			}
+			if (released) cp_log("released the controller\n");
+			else cp_log("the controller is still held after %d tries\n", CP_UNBIND_TICKS);
 		}
 		cp_gadget_bound = false;
 	}
 
-	cp_gadget_remove();
-
-	if (cp_ffs_mounted) {
-		/* Detached rather than plain: a mount left by an earlier run may still
-		 * have a file open in a process that is not this one, and refusing to
-		 * unmount would leave the next session to inherit it. */
-		if (umount2(cp_facts.ffs_dir, MNT_DETACH) != 0 && errno != EINVAL)
-			cp_log("could not unmount %s: %s\n", cp_facts.ffs_dir, strerror(errno));
-		cp_ffs_mounted = false;
+	if (!released) {
+		cp_log("teardown: the controller is still held, so the gadget and the record are left alone\n");
+		return;
 	}
 
-	cp_udc_restore();
+	cp_ours_remove();
+	cp_log("teardown: our function is out\n");
+	cp_owner_rebuild();
+	cp_log("teardown: the firmware's gadget is back\n");
+
+	/* The gadget role now records a port mode of its own - null is not device
+	 * mode on this board, and a gadget end that never switched is never
+	 * enumerated - so the teardown owes the port its boot mode back exactly
+	 * the way the host role does. No record, no switch, and this returns. */
+	cp_role_restore();
 }
 
 static void cp_gadget_pump(void) {
@@ -2312,6 +2767,14 @@ int main(int argc, char** argv) {
 	cp_log_open();
 	cp_log("starting as %s (pid %d)\n", cp_role_name(role), (int)getpid());
 
+	/* A pidfile left by a daemon that crashed, or by a reboot that outran its
+	 * cleanup, names nobody. It is cleared rather than obeyed, so the next
+	 * launch is not refused by a process that is not there. */
+	if (cp_file_exists(cp_pid_path) && !cp_pid_live()) {
+		cp_log("clearing a pidfile left by a daemon that is gone\n");
+		remove(cp_pid_path);
+	}
+
 	if (!cp_pid_write()) {
 		cp_log("another cable daemon owns the session: %s\n", strerror(errno));
 		return 1;
@@ -2320,6 +2783,16 @@ int main(int argc, char** argv) {
 	signal(SIGINT, cp_stop_signal);
 	signal(SIGTERM, cp_stop_signal);
 	signal(SIGHUP, cp_stop_signal);
+
+	/* Dying mid-restore is the one failure this process must not have silently:
+	 * it owns the controller and a breadcrumb naming what to put back, and the
+	 * next launch reads that breadcrumb. These say which signal it was. */
+	struct sigaction fault;
+	memset(&fault, 0, sizeof(fault));
+	fault.sa_handler = cp_fault_signal;
+	sigaction(SIGSEGV, &fault, NULL);
+	sigaction(SIGBUS, &fault, NULL);
+	sigaction(SIGABRT, &fault, NULL);
 
 	cp_status_init(&cp_status, role);
 	cp_publish();

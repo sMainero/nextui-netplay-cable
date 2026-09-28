@@ -201,35 +201,73 @@ reaps with `WNOHANG`, and treats a missing marker as **"the port did not switch
 
 `NS_cableStop` sends `SIGTERM`, waits up to two seconds, escalates to `SIGKILL`,
 reaps, and removes the pid and status files. The wait is worth it because a
-graceful stop is how the daemon hands the controller and the port back.
+graceful stop is how the daemon hands the controller, the firmware's function and
+the port back.
 
-A graceful stop unwinds in `cp_gadget_teardown`'s order: every step is safe to
-unwind when it never happened, the controller is released before the gadget
-directories are removed, and the firmware's previous owner is rebound last.
+A graceful stop unwinds in `cp_gadget_teardown`'s order, and the order is the
+kernel's rather than ours:
+
+1. the endpoint descriptors are closed;
+2. the controller is released;
+3. our function is unlinked and removed, and the firmware's is put back - its
+   directory, its functionfs mount and the userspace that owns it;
+4. the identity the takeover stamped over is written back, and the controller is
+   bound to the gadget again;
+5. the port mode is restored.
+
+**Two of those steps are load-bearing on this vendor kernel, and both were found
+by watching them fail on hardware.**
+
+*The controller must be released before the function is touched.* Removing a
+FunctionFS function from a gadget that is still bound corrupts the kernel's
+functionfs instance: `ffs_release_dev` then calls through freed and poisoned
+memory - `PC = 0x6b6b6b6b6b6b6b6b`, which is `SLAB_POISON` - and the oops takes
+the daemon with it, leaving the repair half-done and undocumented. So the
+release is retried for five seconds and, if it never succeeds, **nothing else is
+done**: the gadget is left exactly as it is and the record is kept truthful for
+the next launch or a reboot to finish.
+
+*The release can only succeed once the peer lets go.* The write comes back
+`ENODEV` while the other end still has the interface claimed over usbfs with
+transfers outstanding, because the stop cannot complete mid-transfer. That is an
+**ordering rule for a session between two devices**: the host end stops first -
+closing its usbfs descriptor makes it release the interface, the gadget end sees
+a disconnect, and its release then succeeds. Ending both ends in any other order
+leaves the gadget end with a repair owed to a reboot.
 
 A daemon that is **killed** hard leaves `usb_restore` behind, and that record is
-the entire crash story:
+the entire crash story. It names the gadget, the controller, and what of the
+firmware's gadget the takeover displaced:
 
 ```
-gadget=<the gadget dir we created>      udc=<the controller we took>
-role_node=<the port attribute>          role_value=<its previous mode>
+gadget=g1                              udc=5100000.udc-controller
+function=ffs.adb                       config=c.1
+mount=/dev/usb-ffs/adb                 exe=/bin/adbd -D
+identity=0x18d1,0xd002,0x0409
+role_node=usb_null                     role_value=null
 ```
 
 - It is written **before** the controller is taken and **before** the port is
-  switched, so a kill can never leave a mutation with nothing recorded.
+  switched, so a kill or an oops can never leave a mutation with nothing
+  recorded. Every one of those values is *read* from the running system rather
+  than assumed - including the identity, which is why a firmware build that
+  chooses different ids is still restored exactly.
 - Only a repair that **succeeded** removes it, the same policy as the radio's
   `wifi_restore`.
 - The live repair is `NS_cableRecoverIfStranded`, run at app start beside the
   radio's pass. It stops a daemon that is still running with no session, then
-  unbinds our gadget, rebinds the named owner, and puts the port mode back.
+  **releases the controller first**, swaps the firmware's function back in,
+  rebinds the controller, and puts the port mode back - in that order, for the
+  reasons above.
 - `launcher/session-cleanup.sh` drops the record only on the **previous-boot**
   path, where a reboot has already made it moot: configfs is a RAM filesystem, so
-  the gadget directories are gone and the platform's own gadget has the controller
-  again, and the port's role is a register that resets.
+  the firmware's gadget is rebuilt as it shipped, the controller is back with it,
+  and the port's role is a register that resets.
 
-The exposure if nothing repairs it is `adb` not working until the next Netplay
-launch. That is the deliberate trade for the one thing this design would not give
-up: a hard kill cannot strand the device.
+Nothing in that record is a firmware or filesystem commitment, so the exposure if
+nothing repairs it is `adb` not working until the next Netplay launch - or a
+reboot, which is always the complete repair. That is the deliberate trade for the
+one thing this design would not give up: a hard kill cannot strand the device.
 
 ## The session file
 

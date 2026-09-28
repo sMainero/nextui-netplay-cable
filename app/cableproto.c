@@ -197,6 +197,34 @@ int cp_role_node(const CP_Facts* f, const char* node, char* out, size_t cap) {
 	return cp_join(f->role_dir, node, out, cap);
 }
 
+/* The node whose *read* puts the port in `mode`. The vendor's otg_role reports
+ * the unset mode as "null" while the node that selects it is "usb_null"; the
+ * other two modes already carry the prefix and are their own node names. Pure,
+ * and in this layer for the same reason the paths are: the daemon's force, the
+ * daemon's restore and the setup app's recovery all have to agree on which
+ * word names which node, and a convention each caller re-derives is a
+ * disagreement waiting for the first caller that guesses. Returns 0 when the
+ * mode is not one this platform knows. */
+int cp_role_trigger_name(const char* mode, char* out, size_t cap) {
+	if (!mode || !mode[0] || !out || !cap) return 0;
+	if (strlen(mode) >= cap) return 0;
+
+	static const struct {
+		const char* mode;
+		const char* node;
+	} table[] = {
+		{ "null",       "usb_null"   },
+		{ "usb_device", "usb_device" },
+		{ "usb_host",   "usb_host"   },
+	};
+	for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++)
+		if (!strcmp(mode, table[i].mode)) {
+			int n = snprintf(out, cap, "%s", table[i].node);
+			return (n > 0 && (size_t)n < cap) ? n : 0;
+		}
+	return 0;
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // descriptor bytes, read the one way
 //////////////////////////////////////////////////////////////////////////////

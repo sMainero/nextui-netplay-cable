@@ -109,8 +109,9 @@ check "the daemon's four state files" \
 
 # The repair record's keys: the daemon writes them, the app's recovery reads
 # them, and a key neither of them spells the same way is a repair that never
-# happens.
-for key in gadget udc role_node role_value; do
+# happens. The three the takeover added name what it displaced in the firmware's
+# gadget, and they are read by the same recovery as the two the old record had.
+for key in gadget udc function config mount exe identity role_node role_value; do
 	if grep -qE "CP_RESTORE_KEY_[A-Z_]+[[:space:]]+\"$key\"" "$APP/usbnet.c" \
 	   && grep -q "\"$key\"" "$APP/netsetup.c"; then
 		ok "usb_restore key '$key' is written and read"
@@ -118,6 +119,14 @@ for key in gadget udc role_node role_value; do
 		bad "usb_restore key '$key' is named differently on the two sides"
 	fi
 done
+
+# The cap has to hold the widest record either role writes: the gadget role's
+# seven plus the port's two. A cap that is one short is a record the daemon
+# silently cannot write, which is a repair nobody performs.
+check "the record's line cap holds every key" \
+	"$(sed -n 's/^#define CP_RESTORE_MAX_LINES \([0-9]*\)$/\1/p' "$APP/usbnet.c")" "9"
+check "the record's keys all fit the cap" \
+	"$(grep -cE '^#define CP_RESTORE_KEY_' "$APP/usbnet.c")" "9"
 
 ###########################################################################
 echo
@@ -196,7 +205,7 @@ echo "== the repair record a reboot makes moot"
 # the firmware's own gadget and its own port mode back by itself: a record that
 # outlived its boot names a repair that no longer exists and cannot be performed.
 printf 'boot-now\n' > "$ROOT/boot-id"
-printf 'gadget=fw\nudc=abc\nrole_node=otg_role\nrole_value=device\n' > "$STATE/usb_restore"
+printf 'gadget=fw\nudc=abc\nfunction=ffs.adb\nconfig=c.1\nmount=/dev/usb-ffs/adb\nexe=/bin/adbd -D\nidentity=0x18d1,0xd002,0x0409\nrole_node=usb_null\nrole_value=null\n' > "$STATE/usb_restore"
 printf 'role=host\nboot_id=boot-now\n' > "$STATE/session"
 NETPLAY_BOOT_ID_PATH="$ROOT/boot-id" "$NP/launcher/session-cleanup.sh" >/dev/null 2>&1
 [ -e "$STATE/usb_restore" ] \
