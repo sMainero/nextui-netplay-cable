@@ -427,6 +427,11 @@ dist-base: $(BASE_DIST_CHECKS)
 		cp dist/cores-experimental/$$p/gambatte_dual_libretro.so \
 		   "$(BASE_STAGE)/$(PAK)/cores/override/$$p/"; \
 	done
+# The single-player mGBA build goes into cores/override as well, so an armed
+# session runs netplay's mGBA without the pak having to own the device's own
+# mGBA pak (Emus/<platform>/MGBA.pak): the launcher picks it up as NETPLAY_CORE
+# for the life of a session, and the installed pak is left alone otherwise. The
+# paired core below is the instanced route and is never installed by the pak.
 	@for p in $(MGBA_PLATFORMS); do \
 		mkdir -p "$(BASE_STAGE)/$(PAK)/cores/mgba/$$p/MGBA.pak" \
 		             "$(BASE_STAGE)/$(PAK)/cores/override/$$p"; \
@@ -435,6 +440,20 @@ dist-base: $(BASE_DIST_CHECKS)
 		cp dist/cores/$$p/mgba_libretro.so \
 		   "$(BASE_STAGE)/$(PAK)/cores/mgba/$$p/MGBA.pak/"; \
 		cp dist/cores-experimental/$$p/mgba_dual_libretro.so \
+		   "$(BASE_STAGE)/$(PAK)/cores/override/$$p/"; \
+		cp dist/cores/$$p/mgba_libretro.so \
+		   "$(BASE_STAGE)/$(PAK)/cores/override/$$p/"; \
+	done
+	@for p in $(MGBA_PLATFORMS); do \
+		mkdir -p "$(BASE_STAGE)/$(PAK)/cores/mgba/$$p/MGBA.pak" \
+		             "$(BASE_STAGE)/$(PAK)/cores/override/$$p"; \
+		cp testing/MGBA.pak/launch.sh testing/MGBA.pak/default.cfg testing/MGBA.pak/README.txt \
+		   "$(BASE_STAGE)/$(PAK)/cores/mgba/$$p/MGBA.pak/"; \
+		cp dist/cores/$$p/mgba_libretro.so \
+		   "$(BASE_STAGE)/$(PAK)/cores/mgba/$$p/MGBA.pak/"; \
+		cp dist/cores-experimental/$$p/mgba_dual_libretro.so \
+		   "$(BASE_STAGE)/$(PAK)/cores/override/$$p/"; \
+		cp dist/cores/$$p/mgba_libretro.so \
 		   "$(BASE_STAGE)/$(PAK)/cores/override/$$p/"; \
 	done
 	@for p in $(PLATFORMS); do \

@@ -191,6 +191,18 @@ case "$CORE_ID" in
 		fi
 		;;
 	mgba)
+		# The dual (paired) core stays the first choice for an instanced session.
+		# Failing that, an armed session runs the pak's own mGBA build for the whole
+		# of the session - the same rule gpsp and gambatte already follow.
+		#
+		# mGBA needs it more than they do: the libretro build upstream does not even
+		# compile the two lockstep SIO drivers, so netplay's mGBA is a distinct
+		# artifact and the two ends must run the same one for the shim's identity
+		# check to pass. Most devices already have an mGBA pak of their own - stock
+		# or third-party - and this route deliberately leaves it alone: with no
+		# session armed the early exec above hands the launch straight to stock
+		# minarch with the installed core, so ordinary mGBA play is untouched and
+		# netplay never has to own the device's emulator.
 		if [ -n "$NETPLAY_SESSION" ] &&
 		   [ "$NETPLAY_DUAL_DISABLE" != "1" ] &&
 		   grep -q '^instanced_mgba=1$' "$NETPLAY_SESSION" 2>/dev/null &&
@@ -199,6 +211,11 @@ case "$CORE_ID" in
 			NETPLAY_DUAL_CORE=1
 			export NETPLAY_DUAL_CORE
 			CORE_NOTICE=paired
+		elif [ -n "$NETPLAY_SESSION" ] && [ -f "$NETPLAY_CORE" ]; then
+			REAL_CORE="$NETPLAY_CORE"
+			NETPLAY_COMPAT_CORE=1
+			export NETPLAY_COMPAT_CORE
+			CORE_NOTICE=netlink
 		fi
 		;;
 esac

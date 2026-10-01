@@ -290,6 +290,7 @@ mkdir -p "$ROOT/Emus/$PLATFORM/MGBA.pak"
 cp "$PWD/testing/MGBA.pak/launch.sh" "$ROOT/Emus/$PLATFORM/MGBA.pak/launch.sh"
 echo "ordinary mGBA" > "$ROOT/Emus/$PLATFORM/MGBA.pak/mgba_libretro.so"
 echo "paired mGBA" > "$NP/cores/override/$PLATFORM/mgba_dual_libretro.so"
+echo "netplay mGBA" > "$NP/cores/override/$PLATFORM/mgba_libretro.so"
 chmod 755 "$ROOT/Emus/$PLATFORM/MGBA.pak/launch.sh"
 printf 'role=host\nport=55437\ninstanced_mgba=1\n' > "$ROOT/mgba-dual.session"
 OUT=$(NETPLAY_SESSION="$ROOT/mgba-dual.session" \
@@ -300,6 +301,29 @@ echo "$MGBA_OUT" | grep -q "real=$NP/cores/override/$PLATFORM/mgba_dual_libretro
 	&& echo "$MGBA_OUT" | grep -q "dual=1" \
 	&& ok "installed mGBA pak selected Netplay's paired override" \
 	|| bad "paired mGBA selection failed: $MGBA_OUT"
+
+# An armed session that is not instanced must still run Netplay's own mGBA build:
+# upstream's libretro build does not compile the lockstep SIO drivers, so the two
+# peers have to be on the same artifact for the shim's identity check to pass.
+printf 'role=host\nport=55437\ninstanced_mgba=0\n' > "$ROOT/mgba-plain.session"
+OUT=$(NETPLAY_SESSION="$ROOT/mgba-plain.session" \
+	BIOS_PATH="$ROOT/bios" SAVES_PATH="$ROOT/saves" CHEATS_PATH="$ROOT/cheats" \
+	LOGS_PATH="$ROOT/logs" "$ROOT/Emus/$PLATFORM/MGBA.pak/launch.sh" /roms/game.gba 2>&1)
+MGBA_OUT=$(cat "$ROOT/logs/MGBA.txt")
+echo "$MGBA_OUT" | grep -q "real=$NP/cores/override/$PLATFORM/mgba_libretro.so" \
+	&& ! echo "$MGBA_OUT" | grep -q "dual=1" \
+	&& ok "armed session ran Netplay's own mGBA core, not the installed one" \
+	|| bad "session-scoped mGBA override failed: $MGBA_OUT"
+
+# ...and with no session the wrapper exec's stock minarch with the original
+# arguments before any core selection happens, so the installed core is the one
+# that runs and netplay never has to own the device's emulator.
+OUT=$(BIOS_PATH="$ROOT/bios" SAVES_PATH="$ROOT/saves" CHEATS_PATH="$ROOT/cheats" \
+	LOGS_PATH="$ROOT/logs" "$ROOT/Emus/$PLATFORM/MGBA.pak/launch.sh" /roms/game.gba 2>&1)
+MGBA_OUT=$(cat "$ROOT/logs/MGBA.txt")
+echo "$MGBA_OUT" | grep -q "minarch core=$ROOT/Emus/$PLATFORM/MGBA.pak/mgba_libretro.so rom=/roms/game.gba real= session=$" \
+	&& ok "unarmed launch kept the device's own mGBA core" \
+	|| bad "unarmed mGBA launch was diverted: $MGBA_OUT"
 
 echo
 echo "== verbose per-game process logs"

@@ -207,6 +207,15 @@ typedef struct {
 
 bool NS_mgbaStatus(NS_MgbaStatus* out);
 bool NS_mgbaInstall(char* err, int errlen);
+
+/* Arm-time convenience, and deliberately the narrow one: installs this build's
+ * mGBA pak only when the device has none at all. A device that already carries
+ * one - stock or third-party - is never touched, because a session runs the
+ * pak's own cores/override/<platform>/mgba_libretro.so anyway and does not need
+ * to own the emulator. `installed` reports which of the two happened; a false
+ * return means the check itself failed. Logs its own outcome, so a caller that
+ * only wants the side effect can pass NULL/NULL/0. */
+bool NS_mgbaEnsure(bool* installed, char* err, int errlen);
 bool NS_mgbaIgnoreMismatch(char* err, int errlen);
 bool NS_mgbaRestore(bool pak, bool saves, bool states, char* err, int errlen);
 

@@ -55,3 +55,33 @@ test "$(cat "$STATE/mgba-restore-collisions"/*/saves/game/save.sav)" = save-curr
 test "$(cat "$STATE/mgba-restore-collisions"/*/states/game/state.st0)" = state-current
 test ! -e "$SD/Emus/h700/MGBA.pak"
 echo '  ok   restores originals and preserves overwritten progress'
+
+echo
+echo '== arm-time ensure (additive only)'
+# Start from a device with no mGBA pak at all, as a fresh card would be. The
+# .bak siblings from the phases above have to go too, or the "ensure did not
+# create a backup" assertion below would be reading their leftovers.
+rm -rf "$SD/Emus"/*/MGBA.pak "$SD/Emus"/*/MGBA.pak.bak* "$STATE/mgba"
+for p in tg5040 h700 my282; do mkdir -p "$SD/Emus/$p"; done
+OUT=$(run ensure)
+echo "$OUT" | grep -q '^ok=1$' \
+	&& test "$(cat "$SD/Emus/tg5040/MGBA.pak/mgba_libretro.so")" = new-tg5040 \
+	&& echo '  ok   ensure installs when the device has no mGBA pak'
+
+# Second call must be a no-op: an existing pak is never moved aside, which is the
+# whole reason this verb exists rather than calling install().
+ls "$SD/Emus/tg5040" | grep -q '^MGBA.pak.bak' && { echo '  FAIL backup created'; exit 1; }
+OUT=$(run ensure)
+echo "$OUT" | grep -q '^skipped=1$' \
+	&& echo "$OUT" | grep -q '^reason=.*present' \
+	&& test "$(cat "$SD/Emus/tg5040/MGBA.pak/mgba_libretro.so")" = new-tg5040 \
+	&& ! ls "$SD/Emus/tg5040" | grep -q '^MGBA.pak.bak' \
+	&& echo '  ok   ensure leaves an existing pak exactly where it is'
+
+# A build that ships no mGBA pak must not invent one.
+rm -rf "$SD/Emus"/*/MGBA.pak "$SD/Emus"/*/MGBA.pak.bak* "$NP"/cores/mgba/*/MGBA.pak "$STATE/mgba"
+OUT=$(run ensure)
+echo "$OUT" | grep -q '^skipped=1$' \
+	&& echo "$OUT" | grep -q '^reason=.*ships no mGBA pak' \
+	&& test ! -e "$SD/Emus/tg5040/MGBA.pak" \
+	&& echo '  ok   ensure does nothing when this build has no mGBA pak'

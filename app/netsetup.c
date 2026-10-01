@@ -555,6 +555,31 @@ bool NS_mgbaStatus(NS_MgbaStatus* out) {
 }
 
 bool NS_mgbaInstall(char* err, int errlen) { return mgba_helper("install", err, errlen); }
+
+bool NS_mgbaEnsure(bool* installed, char* err, int errlen) {
+	if (installed) *installed = false;
+	char local_err[128] = "";
+	if (!mgba_helper("ensure", local_err, sizeof(local_err))) {
+		if (err && errlen) snprintf(err, errlen, "%s", local_err);
+		ns_log("mGBA pak: could not check (%s)\n", local_err[0] ? local_err : "unknown");
+		return false;
+	}
+	/* The verb answers ok=1 when it installed and skipped=1 when it did not, so
+	 * the caller can say which happened rather than infer it from the exit
+	 * status - both are success. */
+	FILE* f = fopen("/tmp/netplay-mgba-result", "r");
+	if (f) {
+		char line[160];
+		while (fgets(line, sizeof(line), f))
+			if (!strncmp(line, "ok=1", 4) && installed) *installed = true;
+		fclose(f);
+	}
+	if (installed && *installed)
+		ns_log("mGBA pak: installed the copy this build ships\n");
+	else
+		ns_log("mGBA pak: left the device's own copy alone\n");
+	return true;
+}
 bool NS_mgbaIgnoreMismatch(char* err, int errlen) { return mgba_helper("ignore", err, errlen); }
 bool NS_mgbaRestore(bool pak, bool saves, bool states, char* err, int errlen) {
 	char args[64];

@@ -758,6 +758,14 @@ static void do_arm(NS_Role role, const char* peer) {
 	// up on is the single thing that decides whether it is playable, and it was
 	// previously invisible - a session that quietly fell back to the house
 	// network looked identical to one on ad hoc until the game stuttered.
+	/* mGBA is the one core whose pak is worth having on a device that lacks it,
+	 * and the one whose absence has to be fixed before a game is picked rather
+	 * than at launch: with no Emus/<platform>/MGBA.pak NextUI routes GBA roms to
+	 * another emulator entirely, so a launch-time install would come too late.
+	 * The shell side refuses to touch a pak that already exists - during a session
+	 * the launcher runs this pak's own core regardless - so this only ever adds,
+	 * and it logs which of the two happened itself. */
+	NS_mgbaEnsure(NULL, NULL, 0);
 	/* Settle the builds now, while the user is still choosing a game, rather
 	 * than in front of a launch. The detached host broker serves the exchange;
 	 * the client drives it. */

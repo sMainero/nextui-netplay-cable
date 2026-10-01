@@ -170,6 +170,37 @@ install() {
 	say "ok=1"
 }
 
+# Install, but only on a device that has no mGBA pak at all.
+#
+# This is the arm-time path, so it runs without the player asking for anything
+# and therefore may only ever add. If any platform this build has an mGBA pak
+# for already carries an Emus/<p>/MGBA.pak - stock, third-party, or a copy
+# netplay installed earlier - nothing is touched, because install() would move
+# that pak aside as a backup first, and that is a device mutation nobody asked
+# for. The half-state (one platform missing, another present) is deliberately
+# left to the explicit mGBA screen, where installing is a choice the player
+# makes.
+#
+# Says ok=1 when it installed (install()'s own line), otherwise skipped=1 with a
+# reason, so a caller can report which happened without parsing prose.
+ensure() {
+	_src_any=0
+	for _p in $(platform_dirs); do
+		_src_any=1
+		if [ -e "$SDCARD_PATH/Emus/$_p/MGBA.pak" ]; then
+			say "skipped=1"
+			say "reason=mGBA pak already present on $_p"
+			return 0
+		fi
+	done
+	if [ "$_src_any" = 0 ]; then
+		say "skipped=1"
+		say "reason=this build ships no mGBA pak"
+		return 0
+	fi
+	install
+}
+
 ignore() {
 	mkdir -p "$IGNORE_DIR" || exit 1
 	for _p in $(platform_dirs); do
@@ -234,7 +265,8 @@ restore() {
 case ${1:-status} in
 	status) status ;;
 	install|reinstall) install ;;
+	ensure) ensure ;;
 	ignore) ignore ;;
 	restore) restore "$@" ;;
-	*) say "usage: $0 status|install|reinstall|ignore|restore [pak saves states]" >&2; exit 2 ;;
+	*) say "usage: $0 status|install|reinstall|ensure|ignore|restore [pak saves states]" >&2; exit 2 ;;
 esac
