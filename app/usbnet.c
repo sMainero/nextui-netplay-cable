@@ -1434,10 +1434,32 @@ static bool cp_takeover_prepare(const char* udc, char* err, int errlen) {
 	}
 	cp_log("taking %s over from %s\n", udc, cp_gadget_name);
 
-	/* The controller is released before the configuration is touched. */
-	if (!cp_gadget_path(cp_gadget_name, "UDC", path, sizeof(path)) || !cp_write_attr(path, "\n")) {
-		snprintf(err, errlen, "cannot release %s: %s", cp_gadget_name, strerror(errno));
+	/* The controller is released before the configuration is touched, and the
+	 * release is confirmed by reading the attribute back rather than by the
+	 * write's return code - an unbind can complete and still come back ENODEV on
+	 * this UDC (AGENTS.md 2.4), which is exactly why cp_gadget_teardown loops and
+	 * reads back. The reason it matters more here than anywhere else: touching
+	 * the configuration of a gadget that is still bound is what corrupts the
+	 * kernel's functionfs instance (2.5), so no configfs write may happen until
+	 * the attribute itself reads empty. */
+	if (!cp_gadget_path(cp_gadget_name, "UDC", path, sizeof(path))) {
+		snprintf(err, errlen, "cannot find %s's controller attribute", cp_gadget_name);
 		return false;
+	}
+	{
+		bool released = false;
+		for (int tick = 0; tick < CP_UNBIND_TICKS && !released; tick++) {
+			char held[CP_NAME_MAX];
+			(void)cp_write_attr(path, "\n");
+			if (!cp_read_attr(path, held, sizeof(held)) || !held[0]) released = true;
+			else usleep(CP_TICK_MS * 1000);
+		}
+		if (!released) {
+			snprintf(err, errlen, "%s is still bound after %d tries - not touching its configuration",
+			         cp_gadget_name, CP_UNBIND_TICKS);
+			return false;
+		}
+		cp_log("released %s\n", cp_gadget_name);
 	}
 
 	/* The holder keeps the instance's endpoint files open, so it has to stop
@@ -1451,16 +1473,32 @@ static bool cp_takeover_prepare(const char* udc, char* err, int errlen) {
 			usleep(CP_TICK_MS * 1000);
 		}
 	}
-	if (mount_point[0] && umount2(mount_point, MNT_DETACH) != 0 && errno != EINVAL)
-		cp_log("could not unmount %s: %s\n", mount_point, strerror(errno));
 
+	/* Unlink, then unmount, then remove - the order 2.5 records from hardware.
+	 * The link comes out of the configuration first so the gadget stops using the
+	 * function before its instance is disturbed. */
 	if (snprintf(path, sizeof(path), "%s/%s/%s", configs, config, function) >= (int)sizeof(path) ||
 	    (remove(path) != 0 && errno != ENOENT)) {
 		snprintf(err, errlen, "cannot unlink %s from %s: %s", function, config, strerror(errno));
 		return false;
 	}
+
+	if (mount_point[0]) {
+		if (umount2(mount_point, MNT_DETACH) != 0 && errno != EINVAL && errno != ENOENT) {
+			/* Fatal, deliberately. The next step removes the function directory,
+			 * and doing that with its functionfs instance still mounted is the
+			 * documented kernel corruption. A takeover that cannot get the mount
+			 * down must stop while everything is still consistent: the record is
+			 * already written, so the app's recovery or the next launch finishes
+			 * it, and the link simply does not come up this time. */
+			snprintf(err, errlen, "cannot unmount %s (%s) - refusing to remove %s while mounted",
+			         mount_point, strerror(errno), function);
+			return false;
+		}
+	}
+
 	if (snprintf(path, sizeof(path), "%s/%s", functions, function) >= (int)sizeof(path) ||
-	    rmdir(path) != 0) {
+	    (rmdir(path) != 0 && errno != ENOENT)) {
 		snprintf(err, errlen, "cannot remove the firmware's %s: %s", function, strerror(errno));
 		return false;
 	}
@@ -1741,30 +1779,45 @@ static void cp_ours_remove(void) {
 	if (!cp_gadget_function_dir(&cp_facts, function, sizeof(function))) return;
 	cp_log("restore: unlinking our function from %s\n", cp_facts.gadget);
 
+	const char* name = strrchr(function, '/');
+	name = name ? name + 1 : function;
+
 	if (cp_restore_get(CP_RESTORE_KEY_CONFIG, config, sizeof(config)) && config[0] &&
 	    cp_gadget_dir(&cp_facts, dir, sizeof(dir))) {
-		const char* name = strrchr(function, '/');
-		name = name ? name + 1 : function;
 		if (snprintf(path, sizeof(path), "%s/configs/%s/%s", dir, config, name) < (int)sizeof(path))
 			remove(path);
 	}
 
-	/* The mount has to come down before the function directory does, and this
-	 * order is not a preference: the kernel tears the functionfs instance down
-	 * when the directory is removed, and doing that with the instance's mount
-	 * still on top of it dereferences freed, poisoned memory - ffs_release_dev
-	 * reaches PC = 0x6b6b6b6b6b6b6b6b (SLAB_POISON) and oopses, taking the daemon
-	 * with it. Verified on hardware, both ways round: the same removal succeeds
-	 * with the unmount first and oopses with it last. The app's own recovery
-	 * (netsetup.c ns_cable_function_restore) does it in this order, which is
-	 * where it was written down from the manual repair. */
-	if (cp_ffs_mounted) {
-		/* Detached rather than plain: a mount left by an earlier run may still
-		 * have a file open in a process that is not this one, and refusing to
-		 * unmount would leave the next session to inherit it. */
-		if (umount2(cp_facts.ffs_dir, MNT_DETACH) != 0 && errno != EINVAL)
-			cp_log("could not unmount %s: %s\n", cp_facts.ffs_dir, strerror(errno));
-		cp_ffs_mounted = false;
+	/* The mount has to come down before the function directory does, and the order
+	 * is not a preference: the kernel tears the functionfs instance down when the
+	 * directory is removed, and doing that with the instance's mount still on top
+	 * of it dereferences freed, poisoned memory - ffs_release_dev reaches
+	 * PC = 0x6b6b6b6b6b6b6b6b (SLAB_POISON) and oopses, taking the daemon with it.
+	 * Verified on hardware, both ways round. So the unmount is *checked* rather
+	 * than attempted: a failed one cancels the removal, leaving the function for
+	 * the app's recovery or a reboot and the next takeover to refuse on. That is
+	 * the visible gap this codebase prefers over a corrupted kernel, and it is the
+	 * same policy cp_gadget_teardown applies to a controller it cannot release.
+	 *
+	 * Whether the instance is still mounted is asked of /proc/mounts, not of
+	 * cp_ffs_mounted: a mount left behind by an earlier run is not something this
+	 * process remembers making. */
+	{
+		char instance[CP_NAME_MAX] = "", where[CP_LINE_MAX];
+		if (!strncmp(name, "ffs.", 4)) snprintf(instance, sizeof(instance), "%s", name + 4);
+		bool mounted = instance[0] && cp_ffs_mount_of(instance, where, sizeof(where));
+
+		if (cp_ffs_mounted || mounted) {
+			/* Detached rather than plain: a mount left by an earlier run may still
+			 * have a file open in a process that is not this one, and refusing to
+			 * unmount would leave the next session to inherit it. */
+			if (umount2(cp_facts.ffs_dir, MNT_DETACH) != 0 && errno != EINVAL && errno != ENOENT) {
+				cp_log("could not unmount %s (%s) - leaving %s in place rather than "
+				       "removing a mounted function\n", cp_facts.ffs_dir, strerror(errno), function);
+				return;
+			}
+			cp_ffs_mounted = false;
+		}
 	}
 
 	rmdir(function);
@@ -2929,6 +2982,25 @@ int main(int argc, char** argv) {
 
 	cp_status_init(&cp_status, role);
 	cp_publish();
+
+	/* A takeover this device already owes a repair for is not a state to build a
+	 * second takeover on top of. The record is written before anything is taken
+	 * and removed only by a repair that succeeded, so its presence here means the
+	 * last run died or failed mid-way - and the kernel log from the freeze shows
+	 * what stacking on that state does: a bind failing -19 against a functionfs
+	 * instance that had already been freed, and then a kernfs use-after-free that
+	 * took nextui.elf down with it. Refusing is the policy cp_gadget_teardown
+	 * already applies to a controller it cannot release - stop while everything is
+	 * still consistent, keep the record truthful, and let the app's recovery pass
+	 * or a reboot finish the repair. */
+	{
+		char restore[CP_LINE_MAX];
+		if (cp_restore_path(restore, sizeof(restore)) && cp_file_exists(restore)) {
+			cp_fail("the last session left the USB port to repair - reopen the app");
+			remove(cp_pid_path);
+			return 1;
+		}
+	}
 
 	if (role == CP_ROLE_GADGET) cp_gadget_run();
 	else cp_host_run();
