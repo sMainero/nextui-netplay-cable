@@ -261,9 +261,10 @@ typedef char cp_urb_is_56_bytes[sizeof(CP_Urb) == 56 ? 1 : -1];
  * completion string: reading usb_host registers the host controllers, reading
  * usb_device puts the port in device mode, reading usb_null takes both down.
  * All three spellings were verified on a tg5040 (Brick) running NextUI
- * 20260719-0, which is the only platform that carries the nodes at all - the
- * role_dir fact is NULL elsewhere and every function below answers "no port
- * to switch" rather than inventing a write. The one wrinkle that is not
+ * 20260719-0, and again on an h700 (RG34XX) running BaseOS 1.2.1 / kernel
+ * 4.9.170, which carries the same four nodes under the same path. A platform
+ * without them records no role_dir and every function below answers "no port to
+ * switch" rather than inventing a write. The one wrinkle that is not
  * uniform: the unset mode is reported as "null" but its node is "usb_null",
  * which is why cp_role_trigger_name exists in the pure layer rather than as a
  * convention each caller re-derives. */
@@ -285,6 +286,7 @@ typedef char cp_urb_is_56_bytes[sizeof(CP_Urb) == 56 ? 1 : -1];
 #define CP_ENV_UDC_DIR  "NP_CABLE_UDC_DIR"
 #define CP_ENV_TUN      "NP_CABLE_TUN"
 #define CP_ENV_ROLE_DIR "NP_CABLE_ROLE_DIR"
+#define CP_ENV_TOP_HCD  "NP_CABLE_TOP_HCD"
 #define CP_ENV_USB_DIR  "NP_CABLE_USB_DIR"
 #define CP_ENV_USB_SYSFS "NP_CABLE_USB_SYSFS"
 #define CP_ROLE_NONE    "none"
@@ -477,6 +479,7 @@ static CP_Facts cp_facts = {
 	.udc_dir  = "/sys/class/udc",
 	.tun_dev  = "/dev/net/tun",
 	.role_dir = NULL,
+	.top_hcd  = NULL,
 	/* Empty until cp_takeover_prepare finds the gadget we ride. This kernel
 	 * allows exactly one gadget object, so the name is a fact of the boot rather
 	 * than a fact of the build, and every path built from it is built after the
@@ -492,11 +495,39 @@ static CP_Facts cp_facts = {
  * rather than something to probe, and a platform without them records no role
  * directory at all - which the pure layer answers with "no such node" and the
  * caller reports as "this device cannot force the port" instead of inventing a
- * path.) */
+ * path.)
+ *
+ * h700 (Anbernic XX / RG34XX, BaseOS 1.2.1, kernel 4.9.170) was measured to
+ * carry the same nodes at the same spelling: usbc0/{otg_role,usb_device,
+ * usb_host,usb_null}, with otg_role reading usb_device and the same
+ * sunxi_usb_udc stack behind them. So the list is the Allwinner parts rather
+ * than one board. */
 static const char* cp_role_dir_default(void) {
 #ifdef PLATFORM
-	if (!strcmp(PLATFORM, "tg5040") || !strcmp(PLATFORM, "tg5050"))
+	if (!strcmp(PLATFORM, "tg5040") || !strcmp(PLATFORM, "tg5050") ||
+	    !strcmp(PLATFORM, "h700"))
 		return "/sys/devices/platform/soc/usbc0";
+#endif
+	return NULL;
+}
+
+/* The controller a host-only socket is permanently bound to, which is what makes
+ * "the peer is reachable without the switch" a fact rather than a guess.
+ *
+ * tg5040 only. The Brick has two USB-C sockets and the top one is host-only:
+ * 5200000.ehci1 plus its companion are bound from boot and nothing can take them
+ * away, so a peer seen there was enumerable without any role write.
+ *
+ * h700 has a single USB-C that is both charge and OTG, so there is no such
+ * socket and this fact is NULL. That is not a formality: 5200000.ehci1 exists on
+ * the RG34XX as well (buses 1 and 2), so carrying the Brick's constant over
+ * would let the host role hand back a switch it actually needed and lose the
+ * link. With NULL, cp_bus_is_top_host always answers false and a forced switch
+ * is kept for the whole session. */
+static const char* cp_top_hcd_default(void) {
+#ifdef PLATFORM
+	if (!strcmp(PLATFORM, "tg5040"))
+		return "5200000.ehci1";
 #endif
 	return NULL;
 }
@@ -512,6 +543,10 @@ static void cp_facts_init(void) {
 	cp_facts.role_dir = cp_role_dir_default();
 	if ((env = getenv(CP_ENV_ROLE_DIR)) && env[0])
 		cp_facts.role_dir = strcmp(env, CP_ROLE_NONE) ? env : NULL;
+
+	cp_facts.top_hcd = cp_top_hcd_default();
+	if ((env = getenv(CP_ENV_TOP_HCD)) && env[0])
+		cp_facts.top_hcd = strcmp(env, CP_ROLE_NONE) ? env : NULL;
 
 	if ((env = getenv(CP_ENV_USB_DIR)) && env[0]) cp_usb_dir = env;
 	if ((env = getenv(CP_ENV_USB_SYSFS)) && env[0]) cp_usb_sysfs = env;
@@ -2413,16 +2448,16 @@ static bool cp_host_scan(char* node_out, size_t cap, unsigned* bus_out) {
  * nothing. That is the case worth detecting, because the switch is not free: it
  * turns the bottom socket into a 5 V source, and that socket is also the charge
  * socket (§3). */
-#define CP_TOP_HCD "5200000.ehci1"
-
 static bool cp_bus_is_top_host(unsigned bus) {
 	char dir[CP_LINE_MAX], target[CP_LINE_MAX];
 
+	/* No host-only socket on this platform, so no bus can be "already reachable". */
+	if (!cp_facts.top_hcd) return false;
 	if (!bus || snprintf(dir, sizeof(dir), "%s/usb%u", cp_usb_sysfs, bus) >= (int)sizeof(dir)) return false;
 	ssize_t n = readlink(dir, target, sizeof(target) - 1);
 	if (n <= 0) return false;
 	target[n] = '\0';
-	return strstr(target, CP_TOP_HCD) != NULL;
+	return strstr(target, cp_facts.top_hcd) != NULL;
 }
 
 /* Claim the interface and learn the two endpoints.

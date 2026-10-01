@@ -162,6 +162,8 @@ typedef struct {
 	const char* udc_dir;    /* the controller list */
 	const char* tun_dev;    /* the tun clone device */
 	const char* role_dir;   /* vendor OTG role nodes, or NULL */
+	const char* top_hcd;    /* controller behind a host-only socket, or NULL when
+	                         * the device has one shared USB port */
 	const char* gadget;     /* the gadget we ride: discovered at run time, never created - the vendor kernel allows exactly one */
 	const char* function;   /* the functionfs instance name: ffs.<function> */
 	const char* iface;      /* the point-to-point interface we bring up */
