@@ -264,6 +264,46 @@ because `f_fs` sizes a read request up to a maxpacket multiple and **drops**
 anything the controller delivers beyond that: a request that is not a multiple can
 only ever be one that ends in the middle of what the peer is sending.
 
+## Four players
+
+The link is a bus, and always was: the GBA multi-play cable it emulates carried
+four consoles, and gpSP's Advance Wars protocol is written for exactly that
+(`peer[4]`, `MAX_SERMULT_NETPLAYERS 4`, broadcasting every packet). Two players
+was a transport limitation, not a hardware one.
+
+The transport keeps a **peer table** of four slots - `NETLINK_MAX_PEERS` - and
+the slot *is* the console number:
+
+- the **host** is slot 0 and keeps the listener. It accepts into the lowest free
+  slot from 1 to 3, and that slot is the console number the guest plays as;
+- a **guest** has one connection, to the host, and occupies the slot the host
+  gave it. The slot travels in the greeting (`NetLinkHello.client_id`, protocol
+  14), so a guest knows which console it is before its core starts;
+- every frame carries its **sender's** slot in `NetLinkHeader.client_id`, and
+  that is the number the receiving core is told when the packet is delivered;
+- the host **relays**: a packet from one guest is delivered to its own core and
+  copied to every other guest, still marked with the original sender. That is
+  what carries guest-to-guest traffic, and it is the emulated equivalent of the
+  adapter rather than a general-purpose router. Only `CMD_DATA` is relayed -
+  input, state, hashes, resync and the RTT probes are host-to-guest
+  conversations, and a copy of one reaching a third console would be a bug.
+
+How many guests a session admits is the shim's decision, because capacity follows
+the core and the mode: link-cable play asks for three guests, while shared-screen
+netplay stays a single partner (docs/features.md section 11). The app keeps its
+own table of guests and still answers a fourth with `CORE_BUSY`.
+
+For a host this means a session is no longer one connection: a single `poll`
+covers the whole set, and liveness, the heartbeat, the RTT probe and the
+frontend-stall notice all run per peer. A guest leaving ends the session only
+when the last peer is gone; until then the core is told which slot left and the
+others keep playing.
+
+Verified by the harness, not yet on two handhelds: `CLIENTS=3 sh
+shim/test/link.sh` runs four instances - one host, three guests, real TCP - and
+checks the per-console ids, packet flow in every direction, and the relay (a
+guest hearing another guest through the host).
+
 ## Bring-up
 
 **Gadget role** (the netplay host). Strictly ordered, and the order is the point:
@@ -527,7 +567,11 @@ is almost always faster than reasoning about the screen.
 strings blobs byte for byte, the framing codec and the terminator rule, the
 configfs path spellings, the status grammar and its truncation property; every
 shared name compared across the daemon, the app, the shell and the harness; the
-launcher guards; and the session writer.
+launcher guards; and the session writer. The four-player link belongs here too:
+`shim/test/link.sh` with `CLIENTS=3` runs a host and three guests over real TCP
+and checks the slot assignment, the ids each packet is attributed to, and the
+host's relay between guests - the transport half of four-player play, with the
+core half resting on gpSP's own Advance Wars protocol.
 
 **On the device**: everything above, plus the two-device checklist below. The
 daemon is cross-built and links `netsetup.c`, so there is no host build of it —

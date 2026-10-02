@@ -245,9 +245,18 @@ input cannot control two ports or disappear for different frames on each peer.
 This is the prerequisite for multi-controller sessions and is much smaller than
 multi-peer transport.
 
-### 11. Three or more simultaneous players — Planned, substantial refactor
+### 11. Three or more simultaneous players — link-cable implemented, shared-screen planned
 
-Shared-screen play becomes a host-hub topology:
+**Link-cable play carries four consoles today.** The transport keeps a four-slot
+peer table, the host assigns each guest its console number and sends it in the
+greeting, frames keep their sender's id, and the host relays `CMD_DATA` to every
+other guest while the control conversation stays host-to-guest. The shim decides
+capacity by mode, so only link-cable play asks for three guests. Which cores can
+use it is a separate question with a separate answer: gpSP's Advance Wars
+protocol is written for four players, while the Game Boy link is two-player
+hardware and stays that way. See `docs/cable.md` § Four players.
+
+**Shared-screen play is still the planned piece, and is a host-hub topology:**
 
 - host maintains a peer table rather than one global connection;
 - each guest receives a stable client/controller ID;
@@ -263,9 +272,11 @@ Until this exists, the protocol must explicitly admit one gameplay peer and
 reject extras with `BUSY` rather than leaving them queued ambiguously.
 
 Link-mode capacity follows emulated hardware and core support. GB link remains
-two-player. GBA RFU can potentially support more, but NetLink must first retain
-and route libretro client IDs/broadcasts instead of collapsing everything to one
-peer.
+two-player, and the transport's four slots are a GBA multi-play ceiling rather
+than a promise every core can meet. The client ids and broadcasts this item
+needed for link play - a peer table, a console number per guest, and routing
+that keeps them - are the ones now implemented; extending the same to
+shared-screen mode is the work described above.
 
 ### 12. Hotseat/drop-in sessions — Planned
 

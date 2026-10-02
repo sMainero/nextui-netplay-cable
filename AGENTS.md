@@ -391,6 +391,16 @@ left alone`).
 - **macOS has no `timeout(1)`.** A long ssh command hangs the caller with no
   bound. Use a background-and-kill wrapper; there is one at `/tmp/np/rshbounded`
   in the author's sessions but it is scratch — rewrite it if needed.
+- **`make test` on macOS skips one check rather than failing it.** `shim/test/dual.sh`
+  gives the client a clock nine seconds off the host's by interposing `time(2)`
+  through `LD_PRELOAD`, which Darwin ignores; both roles then read one machine
+  clock, so the *differ* check cannot hold there. It now reports that as an
+  explicit skip on Darwin (`uname -s`), while Linux still runs it in full — the
+  check that both sides install the *same* pair runs everywhere.
+  `DYLD_INSERT_LIBRARIES` with `DYLD_FORCE_FLAT_NAMESPACE` does not interpose a
+  `time` call there either (tried), and `__interpose` was not worth a mach-o-only
+  branch for a Linux product. `shim/test/link.sh` — including `CLIENTS=3` — does
+  run natively, which is the suite that covers the transport.
 - **The device has no `scp`, `sftp` or `sftp-server`** — only `tar` and `base64`.
   `tools/netplay-harness.py` therefore moves files **over the ssh channel**
   (`ssh … "cat > file"` up, `tar -C … -cf - | tar -xf -` down). It used `scp`,
@@ -557,12 +567,146 @@ are worth recognising):
 
 All three were then **confirmed in play** on two Bricks: a deliberate cable bump
 left both daemons alive and the link came back without re-arming, and the delay
-change removed the lag that had been reported. The remaining item below has *not*
-been executed.
+change removed the lag that had been reported. The items below have not been
+executed or observed.
 
 Still open:
 
-1. **H700 freezes after a couple of cable sessions, and the cause is the vendor
+1. **Four-player play works, and is shipped as `v3.2.6-cable`** (the transport
+   half; AW2's link remains unplayable and is documented below).
+   The transport is complete: a four-slot peer table, the host
+   assigning each guest its console number and sending it in the greeting
+   (protocol **14**, bumped - an older build refuses the greeting rather than
+   mis-attributing packets), every frame carrying its sender's id, and `CMD_DATA`
+   relayed to every other guest while the control conversation stays
+   host-to-guest. The app accepts up to three guests; capacity is the shim's
+   decision per mode, so shared-screen play is still 1:1 with `CORE_BUSY` for
+   extras. `CLIENTS=3 sh shim/test/link.sh` passes: four instances on one machine,
+   ids, every direction of flow, and the relay.
+
+   **On hardware (Bricks `.45`/`.52` + h700 `.53`, ad-hoc link, input delay 3):**
+   AW1 multi-player played fine. AW2 (`AW2P`) reaches the point of confirming
+   Multi-Pak multiplayer and then sits on a black screen with the music playing,
+   while the host's log shows a textbook session - peers 1 and 2 connected,
+   60.0-60.2 fps, ~2400 packets per 10 s, `0 dropped`, `0 frames peer-paused`, for
+   the two minutes it was left. So the transport is exonerated; the *game* is
+   waiting for something. Two candidates, and the cheap test separates them:
+   (a) a player-count mismatch in the game itself (a 4-player Multi-Pak game with
+   three consoles present waits forever for the fourth, and the consoles that are
+   present still chatter), or (b) gpSP's AW2 protocol only ever having been
+   validated with two consoles - `docs/implementation.md` records 213 s unbroken
+   for AW2, but that was a two-Brick session, and `serialaw_net_receive` indexes
+   its peers by the sender's id, so the three-console path is genuinely unproven.
+   Next: run AW2 with exactly two consoles (should reproduce the 213 s result),
+   then with the number of players the game was set up for. If it persists,
+   `serial_proto.c` has the trace for it - `SERIALPROTO_DEBUG` is a
+   commented-out `#define` in `.cache/cores/gpsp/serial_proto.c`, and a core
+   built with it logs every AW packet state and command to stderr, which lands in
+   `.userdata/<platform>/logs/GBA.txt` next to the shim's pacing lines.
+   `docs/cable.md` § Four players has the design.
+
+   **What three devices then measured (Bricks `.45`/`.52` + h700 `.53`, ad-hoc
+   link, AW2 `AW2P`, ~90 s sessions):** the link layer is not the problem. The
+   core's own accounting reported `we are client 0/1/2`, `netpacket_connected:
+   peer 1`, `peer 2`, `2 client(s) now, max 3` on the host and `peer 0` on each
+   guest; the per-packet trace showed every console's send count arriving at
+   *both* other consoles - `.53` sent 44486 and `.52` received 44317 of them,
+   `.52` sent 44811 and `.53` received 44810, the host's 19073 arriving as
+   19072/19077 - so the relay is confirmed on hardware, not just in the harness.
+   Zero drops everywhere, 60 fps throughout, and all three games listed each
+   other (three players, no empty fourth slot). The deadlock is above the
+   transport: all three screens black, music playing, packets still flowing.
+   The suspicion that fits is gpSP's own AW path discarding a packet shape it
+   does not expect - `serialaw_net_receive` only buffers when `cnt >= 2` and
+   `len == cnt*2 + 8`, silently in the INTERSYNC case, and AW2 is the one game
+   that differs here (`PACK_TAIL_SZ` is 2 for AW2, 1 for AW1).
+
+   **AW2 also hangs with two consoles**, with the third device idle: so it is not
+   a multi-peer problem, not the relay, and not this refactor's per-peer work -
+   the two-console link path is behaviourally identical to what preceded it
+   (host `start(0)` + `connected(1)`, guest `start(1)` + `connected(0)`). That
+   leaves timing. The sessions tested so far all ran the **ad-hoc** link, whose
+   app-chosen floor is 3 frames (50 ms); house Wi-Fi's floor is 10 (166 ms) and
+   the cable's is 1 (16.7 ms), and neither of those has been tried for AW2.
+   AW1 tolerating a 3-frame link while AW2 does not fits every observation:
+   AW2 syncs, passes its connection screen, and then waits for a packet that
+   arrives a few frames later than it will accept. Next test is therefore AW2 on
+   the **house Wi-Fi** link kind (10-frame floor), then over the cable if that
+   fails - not another instrumentation run.
+
+   **Refuted: ROM, save and region.** All three devices carry the identical AW2
+   ROM (`ada32bcc…`), the identical save (`e533c45e…`, 64 KB) and the same
+   `AW2P` gamepak code, so a region or save mismatch cannot explain it. (gpSP maps
+   both `AW2P` and `AW2E` to `mul_aw2`, so a mismatch would have synced and then
+   diverged - worth ruling out, and now it is.)
+
+   **The one question left: regression or pre-existing?** Build the shim from the
+   released commit (`git -C nextui-netplay worktree add --detach <path> 7e2fc6c`,
+   then build `shim/` for the platform inside the toolchain container - it mounts
+   the whole worktree, because the makefile writes to `../bin`). That shim is
+   protocol 13 where the current one is 14, so both ends of a test session must
+   run it. It is the cheapest way to ask whether the multi-peer work broke AW2's
+   two-console path or whether AW2 never worked here: run AW2 on two Bricks with
+   the released shim and the same untraced cores.
+
+   **AW1 works, AW2 does not**: identical transport, identical settings, identical
+   three devices. Whatever AW2's problem is, it is inside the emulation of that
+   game's link, not in the link.
+
+   **Parked by the operator** (Oct 2026): AW2 stays unplayable on the gpSP link
+   for now, and mGBA's instanced pairing is the route to a two-console AW2 game.
+   Reopening it means either building the released shim
+   (`shim_v3.2.5_tg5040.so`, kept in `.rpiv/tmp/np/`) to answer regression-vs-pre-
+   existing, or taking it upstream to gpSP, whose AW2 path is what is failing.
+   Please instrument only once behaviour is known to be wrong without it: three
+   runs were spent on a traced core whose per-packet SD writes were themselves a
+   plausible cause.
+
+   **Refuted: input delay as the cause.** House Wi-Fi's 10-frame floor hangs
+   exactly as ad-hoc's 3 does, with three consoles and with two. More slack is
+   not what AW2 wants.
+
+   **Confound to remove before the next run:** every timing test above ran on the
+   traced core, and the trace writes a line to the SD card *per packet on the
+   emulation thread* - `serialaw_net_receive` is called straight from the shim's
+   delivery path, so each packet pays a synchronous FAT write, proportional to
+   the packet rate. That is a real perturbation for a handshake this tight. The
+   untraced core has only ever been tried at ad-hoc's floor of 3, so
+   **untraced + Wi-Fi (delay 10) is the one untested cell**, and it is the
+   configuration the 213 s AW2 record was most likely made in. Restore the
+   originals from `.userdata/shared/Netplay/backup-compat-core-<platform>/`
+   before retrying, and do not deploy a traced build for a timing question again:
+   instrument only once the behaviour is known to be wrong without it.
+
+   **Refuted: silent packet drops in the core.** A traced build that logs every
+   packet `serialaw_net_receive` refuses showed 21569 refusals, all of them
+   `state 0 cnt 0 len 8` - the zero-payload state heartbeat, which is consumed as
+   a state update by design and never buffered. Not one packet with `cnt >= 1`
+   and not one length mismatch: AW2's payload packets are accepted exactly as
+   AW1's, so `PACK_TAIL_SZ` is not the difference. What remains is the core's
+   AW2 serial emulation itself or AW2's own requirements from the SIO registers -
+   `SLAVE_IRQ_CYCLES_2P` in `serial_proto.c` is a slave serial-IRQ cadence whose
+   name admits it was calibrated for two players, and `serial.c` builds SIOCNT's
+   device-id/parent-child bits from `netplay_client_id`, which is the other thing
+   AW2 can inspect about the bus. Neither is a transport question.
+
+   **Trace tooling, ready to reuse:** build the compatibility core with
+   `SERIALPROTO_DEBUG` uncommented in `.cache/cores/gpsp/serial_proto.c`
+   (plus the `[np]` lines in `libretro/libretro.c` for client ids and peer
+   counts). A debug build lands at `gpsp_libretro.so` for
+   `make platform=tg5040` (aarch64) and runs on the Bricks *and* the h700. It
+   goes on each device as
+   `Tools/<platform>/Netplay.pak/cores/compatibility/aarch64/gpsp_libretro.so`
+   because `force_compatibility` (and the installed-cores-differ fallback) means
+   that is the core a session actually wraps; the originals are on-card at
+   `.userdata/shared/Netplay/backup-compat-core-<platform>/`. **All three must
+   carry the identical build** - the shim compares core fingerprints and refuses
+   a peer whose build differs, so a partial deploy breaks the session.
+
+   To watch logs while a session runs, arm the **house Wi-Fi** link kind rather
+   than ad-hoc: the ad-hoc network moves the guests off the LAN, so they are
+   unreachable from a laptop until they leave the session.
+2. **H700 freezes after a couple of cable sessions, and the cause is the vendor
    kernel rather than the pak.** §2.11 has the three captures, the two red-herring
    log lines, and the two candidate fixes (one takeover held for the boot; or this
    pak's function linked alongside the firmware's instead of swapped). Until one is
@@ -571,14 +715,14 @@ Still open:
    cycles on hardware that has already taken three hard freezes and one filesystem
    corruption, so budget for that and keep the card backed up (§5) — and note that
    both only *reduce* how often the buggy path is exercised.
-2. **A launch with an armed session and no link waits ~30 s and then reports
+3. **A launch with an armed session and no link waits ~30 s and then reports
    `Peer unavailable.`** The shim has a timeout, so it is not an infinite hang —
    but the message reaches the player only after half a minute of a
    "Starting instanced link…" overlay, and the state that produced it (an armed
    session whose peer is gone) is silent until then. The earlier "waiting for
    core…" report is almost certainly this same class. Worth a shorter path to the
    same sentence.
-3. **The app's crash recovery has still not been observed doing its job.** Its two
+4. **The app's crash recovery has still not been observed doing its job.** Its two
    controller writes were rewritten in v3.2.5 to be retried and read back
    (`netsetup.c`: `ns_cable_release_controller`, `ns_cable_udc_restore`), and both
    now wait for the functionfs instance's endpoints first — but every stale
