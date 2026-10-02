@@ -67,6 +67,54 @@ The hosting end is charged through the cable, so it needs nothing.
 controller from the firmware's own gadget. It returns when the session ends, and a
 reboot always restores it.
 
+### USB-C cable on H700 (experimental)
+
+The cable works on Anbernic H700 devices running BaseOS — the link comes up, sessions
+play at full speed — but **it is experimental, and repeated cable sessions will
+eventually freeze the device.** Please read this before using it.
+
+**What happens.** After a couple of arm/stop cycles the device locks up: the screen
+stops responding and SSH dies. Hold power for ~10 seconds to force it off, then boot
+it again. Two wrinkles worth knowing, both seen on real hardware:
+
+- the next boot can stall on the BaseOS splash screen — power-cycle once more and it
+  comes up;
+- an unclean shutdown can leave the card dirty, and the kernel then remounts it
+  **read-only**, which shows up as every write failing (`Tools` not saving, the app not
+  arming). That is the FAT being protected, not a dead card: run a filesystem check on
+  a PC (`fsck_msdos -y` on the data partition) and it comes back.
+
+**Why it happens.** Taking the firmware's USB gadget over, and handing it back
+again, means creating and destroying configfs/functionfs objects on this device's
+vendor kernel — and that kernel corrupts its own heap while doing it. Three freezes
+were captured, each a slab corruption fault in a *different* unrelated subsystem
+(`kernfs_fop_open`, a mali mmap, and an Ion CMA allocation), which is what a
+corrupted allocator looks like: whoever allocates next dies. It is a kernel bug, in
+code this pak cannot change or verify around. The steps the pak already takes —
+verifying every attribute write by reading it back, retrying the controller bind,
+and waiting for the functionfs instance's endpoints to appear before offering the
+controller — removed the observable error messages from every cycle
+(`failed to start g1: -19`, `sunxi_udc_dequeue: driver is null`) but not the
+corruption itself.
+
+**What to do about it.** One or two cable sessions per boot, then reboot before
+another. WiFi and ad hoc are unaffected on H700 — use those if you want to play
+without thinking about it.
+
+**The fix, when someone gets to it.** Stop touching those kernel objects: either
+take the gadget over once and hold it for the whole boot (which means `adb` is
+unavailable while it is held, until a reboot or an explicit hand-back), or link this
+pak's function *alongside* the firmware's `ffs.adb` and leave both in place, so
+nothing is ever swapped. The second keeps `adb` working throughout, but changes what
+every host sees on that port and needs the joining end to identify this pak's
+interface specifically rather than "the first vendor-class interface with two bulk
+endpoints".
+
+**Sockets are different here too.** H700 handhelds have a single USB-C that is both
+charge and OTG, so there is no host-only top socket: the H700 end presents the
+gadget on its only port, and the other end (a Brick, say) takes the cable in its top
+socket with its charger in the bottom one.
+
 ## Compatibility
 
 The .pak will check each installed core's build for shared-screen netplay. Matching builds = maximum compatibility. If the builds don't match, it can attempt to fall back on specially compiled "compatibility cores" that should work regardless.

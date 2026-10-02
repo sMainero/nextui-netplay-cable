@@ -45,6 +45,21 @@
  * that can wait forever (see ns_role_restore_node). */
 #define NS_CABLE_ROLE_TICKS 20
 
+/* How long one UDC attribute write is offered before it is called a failure:
+ * 50 x 100 ms, the same budget the daemon uses (CP_BIND_TICKS). Two things make
+ * a single attempt wrong on this vendor controller.
+ *
+ * A release can complete and still come back ENODEV, and a bind can too - which
+ * is why both are read back instead of believed. More seriously, a bind offered
+ * too early does not merely fail: the kernel log from a freeze on h700 shows
+ * "configfs-gadget 5100000.udc-controller: failed to start g1: -19" followed by
+ * the kernel's heap being corrupted - kmem_cache_alloc faulting on a wild
+ * address, and then kernfs_fop_open, kbase_context_mmap and
+ * power_supply_changed_work all dying on it, minutes later, in unrelated
+ * processes. Retrying is therefore correct behaviour rather than a courtesy. */
+#define NS_UDC_TICKS 50
+#define NS_UDC_TICK_US (100 * 1000)
+
 /* The two paths this side has to know in order to undo a record the daemon
  * wrote: where configfs is mounted, and the override the daemon honours for the
  * port's role nodes. Both are the daemon's own facts, taken from its own
@@ -2343,6 +2358,31 @@ static bool ns_record_name_ok(const char* name) {
  * half of the repair is gone with it, which is what lets the boot-time pass drop
  * the record (launcher/session-cleanup.sh). Only a write the kernel refused is a
  * failure, and it leaves the record in place for the next attempt. */
+/* Is a functionfs instance presentable yet? Its endpoint files are the only
+ * readiness signal this kernel offers - 4.9 has no `ready` attribute on the
+ * function directory - and the daemon's takeover waits for its own the same way.
+ *
+ * This is the fix for the failing bind, not a courtesy. The kernel log from the
+ * h700 freeze shows `read descriptors` only *after* `failed to start g1: -19`,
+ * i.e. the controller was offered before the userspace had written them, and that
+ * failing path is what corrupted the kernel's heap a few seconds later
+ * (kmem_cache_alloc faulting on a wild address, then kernfs_fop_open,
+ * kbase_context_mmap and power_supply_changed_work all dying on it). Retrying the
+ * bind repairs the aftermath; waiting for the endpoints is what avoids it. */
+static bool ns_wait_ffs_endpoints(const char* mount_point) {
+	char path[700];
+
+	for (int tick = 0; tick < NS_UDC_TICKS; tick++) {
+		for (int ep = 1; ep <= 4; ep++) {
+			if (snprintf(path, sizeof(path), "%s/ep%d", mount_point, ep) < (int)sizeof(path) &&
+			    access(path, F_OK) == 0)
+				return true;
+		}
+		usleep(NS_UDC_TICK_US);
+	}
+	return false;
+}
+
 static bool ns_cable_udc_restore(const char* owner, const char* udc) {
 	char gadgets[600];
 
@@ -2384,7 +2424,18 @@ static bool ns_cable_udc_restore(const char* owner, const char* udc) {
 		ns_log("%s is not on this device: a reboot already put the controller back\n", owner);
 		return true;
 	}
-	if (!ns_attr_write(owner_attr, udc)) {
+	/* Offered repeatedly, and read back rather than believed. The write can come
+	 * back ENODEV having worked, and a bind offered before the instance is
+	 * presentable - which for the firmware's own userspace means before that
+	 * process has written its descriptors - is the failure the freeze log shows
+	 * leaving the kernel's heap corrupted (NS_UDC_TICKS has the details). */
+	bool handed = false;
+	for (int tick = 0; tick < NS_UDC_TICKS && !handed; tick++) {
+		(void)ns_attr_write(owner_attr, udc);
+		usleep(NS_UDC_TICK_US);
+		if (ns_attr_read(owner_attr, held, sizeof(held)) && !strcmp(held, udc)) handed = true;
+	}
+	if (!handed) {
 		ns_log("could not hand %s back to %s\n", udc, owner);
 		return false;
 	}
@@ -2570,11 +2621,16 @@ static bool ns_cable_release_controller(const char* owner) {
 	/* The write's return code is not the answer on this UDC: an unbind can
 	 * complete and still come back ENODEV, so the attribute is read back rather
 	 * than trusted - the same rule the daemon applies (cp_gadget_teardown), and
-	 * the same one NS_cableUdcRestore already uses for the bind. */
-	ns_attr_write(attr, "");
-	if (!ns_attr_read(attr, held, sizeof(held)) || !held[0]) {
-		ns_log("released the controller from %s\n", owner);
-		return true;
+	 * the same one NS_cableUdcRestore already uses for the bind. It is offered
+	 * repeatedly because a controller can take a moment to let go, and reporting
+	 * a release that had not happened would leave the gadget alone for no reason. */
+	for (int tick = 0; tick < NS_UDC_TICKS; tick++) {
+		ns_attr_write(attr, "");
+		usleep(NS_UDC_TICK_US);
+		if (!ns_attr_read(attr, held, sizeof(held)) || !held[0]) {
+			ns_log("released the controller from %s\n", owner);
+			return true;
+		}
 	}
 
 	ns_log("could not release the controller from %s - leaving the gadget alone\n", owner);
@@ -2673,9 +2729,13 @@ static bool ns_cable_function_restore(const NS_UsbRestore* record) {
 			ns_log("cannot link %s back into %s: %s\n", record->function, record->config, strerror(errno));
 	}
 
-	/* The userspace writes the instance's descriptors when it starts, so it
-	 * goes before the rebind that follows this in the caller. */
+	/* The userspace writes the instance's descriptors when it starts, so it goes
+	 * before the rebind that follows this in the caller - and this waits for them,
+	 * because the bind is what fails (and what corrupts the kernel's heap) when it
+	 * is offered too early. */
 	if (record->exe[0]) ns_spawn_detached(record->exe);
+	if (record->mount[0] && !ns_wait_ffs_endpoints(record->mount))
+		ns_log("%s has no endpoints yet - the controller write will have to retry\n", record->mount);
 
 	return ok;
 }

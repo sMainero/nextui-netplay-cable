@@ -228,6 +228,23 @@ typedef char cp_urb_is_56_bytes[sizeof(CP_Urb) == 56 ? 1 : -1];
  * ordering rule this implies is in the docs: the host end tears down first, and
  * the gadget end finishes afterwards. */
 #define CP_UNBIND_TICKS 50
+/* How long to keep offering the controller to the gadget before calling the bind a
+ * failure: 50 x 100 ms. A bind is not instantaneous even when everything is right
+ * - the controller has to start the gadget, and its functionfs instance must
+ * already carry descriptors, which for the firmware's own userspace means waiting
+ * for a process that was started microseconds earlier. The kernel log from the
+ * h700 freeze is what makes this a rule rather than a nicety:
+ *
+ *   ffs_data_put(): freeing
+ *   ERR: sunxi_udc_dequeue: driver is null
+ *   configfs-gadget 5100000.udc-controller: failed to start g1: -19
+ *   ... and then kmem_cache_alloc faulting on a wild address, with every
+ *   allocation afterwards in every subsystem dying on it
+ *
+ * i.e. a bind attempted against a descriptorless instance did not merely fail,
+ * it left the kernel's heap corrupted. So the write is offered repeatedly and the
+ * attribute is read back, instead of being written once and believed. */
+#define CP_BIND_TICKS 50
 
 /* How often the host role looks for the peer on the bus. A gadget that has just
  * been plugged or powered takes a moment to appear, and a directory scan plus a
@@ -1709,23 +1726,70 @@ static bool cp_eps_open(char* err, int errlen) {
  * crash between any two of those steps leaves a record that says what to put
  * back, which is the only thing that makes taking the controller defensible -
  * the firmware's adb lives on the other side of it. */
-static bool cp_takeover_bind(const char* udc, char* err, int errlen) {
-	char path[CP_LINE_MAX], held[CP_NAME_MAX];
+/* Offer the controller to a gadget until the gadget takes it.
+ *
+ * The write's return code says nothing useful on this UDC (2.4), and neither
+ * does a single read-back: a bind that is too early - the common case being the
+ * firmware's userspace restarted by the teardown, which writes the instance's
+ * descriptors as it starts - fails with ENODEV and leaves the attribute empty.
+ * Retrying is therefore the correct behaviour and not a workaround, and the tick
+ * count is logged when it takes more than one so the next reader can see whether
+ * the race is real. */
+static bool cp_udc_bind(const char* gadget, const char* udc, char* err, int errlen) {
+	char path[CP_LINE_MAX], held[CP_NAME_MAX] = "";
+	int ticks = 0;
 
-	/* Verified by reading the attribute rather than by the write's return code:
-	 * this UDC can bind and still come back ENODEV, which is the same behaviour
-	 * that made the teardown's release report failure on a release that had
-	 * already happened. The evidence is the attribute's content, the way
-	 * cp_iface_up reads an address back rather than trusting `ip`. */
-	if (!cp_gadget_attr(&cp_facts, "UDC", path, sizeof(path))) {
-		snprintf(err, errlen, "the path to UDC does not fit");
+	if (!cp_gadget_path(gadget, "UDC", path, sizeof(path))) {
+		snprintf(err, errlen, "the path to %s's controller attribute does not fit", gadget);
 		return false;
 	}
-	(void)cp_write_attr(path, udc);
-	if (!cp_read_attr(path, held, sizeof(held)) || strcmp(held, udc)) {
-		snprintf(err, errlen, "cannot bind the gadget to %s (%s)", udc, strerror(errno));
+	for (ticks = 0; ticks < CP_BIND_TICKS; ticks++) {
+		(void)cp_write_attr(path, udc);
+		usleep(CP_TICK_MS * 1000);
+		if (cp_read_attr(path, held, sizeof(held)) && held[0]) break;
+	}
+	if (!held[0]) {
+		snprintf(err, errlen, "cannot bind %s to %s (%s)", gadget, udc, strerror(errno));
 		return false;
 	}
+	if (ticks > 0)
+		cp_log("%s took %d ticks to accept %s\n", gadget, ticks + 1, udc);
+	return true;
+}
+
+/* The firmware's instance is presentable when its endpoint files have appeared.
+ *
+ * That is the only readiness signal this kernel offers: 4.9 has no `ready`
+ * attribute on the function directory - it arrived in 4.12 - which is the same
+ * reason the takeover waits for its own endpoint files instead of reading a flag.
+ *
+ * Why waiting is the fix rather than a nicety: offering the controller to an
+ * instance that cannot take it is not a harmless failure here. The freeze log
+ * shows `ffs_data_put(): freeing` then `failed to start g1: -19`, and the heap
+ * corrupted afterwards - which is what the retrying bind repairs the aftermath
+ * of. Not writing the controller until the instance has its endpoints is what
+ * stops the failing attempt from happening at all. */
+static bool cp_wait_ffs_endpoints(const char* mount_point, int ticks) {
+	char path[CP_LINE_MAX];
+
+	for (int tick = 0; tick < ticks; tick++) {
+		for (int ep = 1; ep <= 4; ep++) {
+			if (snprintf(path, sizeof(path), "%s/ep%d", mount_point, ep) < (int)sizeof(path) &&
+			    access(path, F_OK) == 0)
+				return true;
+		}
+		usleep(CP_TICK_MS * 1000);
+	}
+	return false;
+}
+
+static bool cp_takeover_bind(const char* udc, char* err, int errlen) {
+	/* Verified by reading the attribute back rather than by the write's return
+	 * code: this UDC can bind and still come back ENODEV, the same behaviour that
+	 * made the teardown's release report failure on a release that had already
+	 * happened. The evidence is the attribute's content, the way cp_iface_up reads
+	 * an address back rather than trusting `ip`. */
+	if (!cp_udc_bind(cp_facts.gadget, udc, err, errlen)) return false;
 
 	cp_gadget_bound = true;
 	cp_log("bound to %s\n", udc);
@@ -1835,7 +1899,7 @@ static void cp_ours_remove(void) {
 static void cp_owner_rebuild(void) {
 	char gadget[CP_NAME_MAX], udc[CP_NAME_MAX], function[CP_NAME_MAX];
 	char config[CP_NAME_MAX], mount_point[CP_LINE_MAX], command[CP_LINE_MAX], identity[CP_LINE_MAX];
-	char dir[CP_LINE_MAX], instance[CP_NAME_MAX], path[CP_LINE_MAX], held[CP_NAME_MAX];
+	char dir[CP_LINE_MAX], instance[CP_NAME_MAX], path[CP_LINE_MAX];
 
 	if (!cp_restore_get(CP_RESTORE_KEY_GADGET, gadget, sizeof(gadget)) || !gadget[0] ||
 	    !cp_restore_get(CP_RESTORE_KEY_UDC, udc, sizeof(udc)) || !udc[0]) {
@@ -1876,10 +1940,14 @@ static void cp_owner_rebuild(void) {
 				cp_log("cannot link %s back into %s: %s\n", function, config, strerror(errno));
 		}
 
-		/* First, because the userspace writes the instance's descriptors when
-		 * it starts: a function whose owner is not running is not presentable,
-		 * and the bind below would fail as if the function were broken. */
-		if (has_command) { cp_log("restore: starting %s\n", command); cp_spawn(command); }
+	/* First, because the userspace writes the instance's descriptors when it
+	 * starts: a function whose owner is not running is not presentable, and the
+	 * bind below would fail - with the heap corruption the freeze log shows - as if
+	 * the function were broken. So the userspace is started and then *waited for*:
+	 * the bind retries below only repair the aftermath of a bind offered too early. */
+	if (has_command) { cp_log("restore: starting %s\n", command); cp_spawn(command); }
+	if (has_mount && !cp_wait_ffs_endpoints(mount_point, CP_BIND_TICKS))
+		cp_log("restore: %s has no endpoints yet - the bind below will have to retry\n", mount_point);
 	}
 
 	if (has_identity) {
@@ -1897,16 +1965,18 @@ static void cp_owner_rebuild(void) {
 		}
 	}
 
-	if (!cp_gadget_path(gadget, "UDC", path, sizeof(path))) return;
-
-	/* Read back, not trusted: the same ENODEV-on-success this UDC produces for
-	 * the release, and the same rule the app's own recovery applies to this very
-	 * bind (netsetup.c ns_cable_udc_restore). Reporting a repair that worked as
-	 * failed is not harmless - the record is only cleared on success, so it would
-	 * be kept and re-run at every launch. */
-	(void)cp_write_attr(path, udc);
-	if (!cp_read_attr(path, held, sizeof(held)) || strcmp(held, udc)) {
-		cp_log("could not hand %s back to %s: %s\n", udc, gadget, strerror(errno));
+	/* Read back, not trusted - and retried, because this bind happens right after
+	 * the firmware's userspace was restarted and the instance is empty until that
+	 * process writes descriptors. Reporting a repair that worked as failed is not
+	 * harmless either: the record is only cleared on success, so it would be kept
+	 * and re-run at every launch. */
+	char bind_err[CP_ERROR_MAX] = "";
+	if (!cp_udc_bind(gadget, udc, bind_err, sizeof(bind_err))) {
+		/* Deliberately logged rather than routed through cp_fail: the repair runs
+		 * inside the daemon, whose status file the app reads, and a failure here
+		 * keeps the record for the app's own recovery or a reboot to finish. */
+		cp_log("could not hand %s back to %s: %s\n", udc, gadget,
+		       bind_err[0] ? bind_err : strerror(errno));
 		return;
 	}
 	cp_log("handed %s back to %s\n", udc, gadget);
