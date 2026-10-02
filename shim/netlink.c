@@ -1,4 +1,5 @@
 #include "netlink.h"
+#include "libretro.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -21,7 +22,7 @@
  *     CMD_LINK_VERDICT added.
  * 11: CMD_RTT_PROBE/CMD_RTT_ECHO added; input delay is negotiated from the
  *     measured round trip above the session's transport-specific floor. */
-#define NETLINK_PROTOCOL 13
+#define NETLINK_PROTOCOL 14
 
 #define QUEUE_SIZE    512
 /* Inputs are indexed by frame; the ring only has to outlast the input delay
@@ -79,7 +80,7 @@ enum {
  * rather than from a compile-time guess.
  *
  * A separate message rather than timing CMD_PING: that heartbeat is only sent
- * when the link is otherwise idle (`ms_since(&nl.last_tx) > HEARTBEAT_MS`), so
+ * when the link is otherwise idle (`ms_since(&NL_PRIMARY->last_tx) > HEARTBEAT_MS`), so
  * during a session carrying per-frame input it never fires, and nothing echoes
  * it in any case. Probes are cheap - 5 header bytes and 4 payload, a few times
  * a second - and are what the delay negotiation is derived from. */
@@ -95,26 +96,41 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
 	uint32_t magic;
 	uint32_t protocol;
+	/* The host fills this with the slot it gave the guest, so a guest knows which
+	 * console it is playing as before its core starts. A guest's own greeting
+	 * carries 0: its slot is the host's to assign, by arrival order. */
+	uint16_t client_id;
 } NetLinkHello;
 
 typedef struct {
-	uint8_t data[NETLINK_MAX_PACKET];
-	size_t  len;
+	uint8_t  data[NETLINK_MAX_PACKET];
+	size_t   len;
+	/* Which console sent it: the slot of the peer it arrived from, or our own
+	 * slot for a packet our own core sent. Four-player link play needs this -
+	 * every console sees every packet, and the core tells them apart by id. */
+	uint16_t client_id;
 } QueuedPacket;
 
-static struct {
-	NetLinkRole role;
-	uint16_t    port;
-	char        peer[64];
-	bool        configured;
+/* One connected peer.
+ *
+ * The transport used to have exactly one - a single fd, a single queue, and one
+ * peer's worth of session state, all in nl below. The emulated GBA multi-play link
+ * is four slots (SIOCNT carries the slot, and gpSP's Advance Wars protocol is
+ * written for slots 0..3), so the per-connection state lives here and nl keeps only
+ * what is true of the link as a whole. Slot 0 is the host; 1..3 are guests, in the
+ * order they were accepted.
+ *
+ * This is stage one of that change and deliberately a pure refactor: the machinery
+ * below still names one peer, through NL_PRIMARY, so behaviour is byte-identical
+ * with a single connection and shim/test/link.sh proves it. The table is what the
+ * per-guest routing and the relay are built on next. */
+typedef struct {
 
-	int  listen_fd;
-	int  fd;
-	bool connected;
-	bool running;
+	int      fd;
+	/* This peer's own slot: 0 for the host, 1..3 for a host's guests. */
+	uint16_t client_id;
+	bool     connected;
 
-	pthread_t       thread;
-	pthread_mutex_t lock;
 
 	QueuedPacket queue[QUEUE_SIZE];
 	unsigned     q_head, q_tail;
@@ -172,10 +188,8 @@ static struct {
 	bool     rtt_outstanding;
 	struct timeval rtt_last_probe;
 
-	struct timeval last_run;      /* last retro_run, per NetLink_markFrame */
 	struct timeval peer_paused_at;
 	bool           told_peer_paused;
-	bool           core_running;
 	bool           peer_paused;
 
 	bool connect_event;
@@ -194,7 +208,28 @@ static struct {
 
 	struct timeval last_rx;
 	struct timeval last_tx;
+} NetLinkPeer;
+
+static struct {
+	NetLinkRole role;
+	uint16_t    port;
+	char        peer[64];
+	bool        configured;
+	int  listen_fd;
+	bool running;
+	pthread_t       thread;
+	pthread_mutex_t lock;
+	struct timeval last_run;      /* last retro_run, per NetLink_markFrame */
+	bool           core_running;
+
+	/* The peers. peers[0] is the primary: the connection the session machinery
+	 * below talks to, and the only one it uses while shared-screen play is 1:1. */
+	NetLinkPeer    peers[NETLINK_MAX_PEERS];
+	unsigned       primary;
+	/* Our own slot: 0 on the host, assigned by the host on a guest. */
+	uint16_t       local_client_id;
 } nl;
+#define NL_PRIMARY (&nl.peers[nl.primary])
 
 /* Every line carries milliseconds since the link started. Without it a log
  * shows only ordering, which is not enough to tell a prompt failure from one
@@ -279,8 +314,8 @@ static void configure_socket(int fd) {
 }
 
 /* Caller must hold the lock. */
-static bool send_framed(uint8_t cmd, const void* data, size_t len, uint16_t client_id) {
-	if (nl.fd < 0) return false;
+static bool send_framed(NetLinkPeer* p, uint8_t cmd, const void* data, size_t len, uint16_t client_id) {
+	if (p->fd < 0) return false;
 
 	NetLinkHeader hdr = {
 		.cmd       = cmd,
@@ -288,10 +323,10 @@ static bool send_framed(uint8_t cmd, const void* data, size_t len, uint16_t clie
 		.client_id = htons(client_id),
 	};
 
-	if (!write_all(nl.fd, &hdr, sizeof(hdr))) return false;
-	if (len && data && !write_all(nl.fd, data, len)) return false;
+	if (!write_all(p->fd, &hdr, sizeof(hdr))) return false;
+	if (len && data && !write_all(p->fd, data, len)) return false;
 
-	gettimeofday(&nl.last_tx, NULL);
+	gettimeofday(&p->last_tx, NULL);
 	return true;
 }
 
@@ -301,8 +336,13 @@ static bool send_framed(uint8_t cmd, const void* data, size_t len, uint16_t clie
 
 bool NetLink_configure(const char* session_path) {
 	memset(&nl, 0, sizeof(nl));
+	for (unsigned i = 0; i < NETLINK_MAX_PEERS; i++) nl.peers[i].fd = -1;
 	nl.listen_fd = -1;
-	nl.fd = -1;
+	/* Which slot the session machinery talks through. A guest has exactly one
+	 * connection and it is to the host, whose slot is 0; a host talks to its
+	 * first guest, slot 1. Both are the same peer the single-connection
+	 * transport used to keep in nl, so everything below is unchanged. */
+	nl.primary = 0;
 	nl.port = NETLINK_DEFAULT_PORT;
 	pthread_mutex_init(&nl.lock, NULL);
 
@@ -348,6 +388,10 @@ bool NetLink_configure(const char* session_path) {
 	}
 
 	nl.configured = true;
+	/* Both roles have exactly one slot the session machinery talks through: a guest
+	 * talks to the host (slot 0), a host talks to its first guest (slot 1). That is
+	 * the peer the single-connection transport used to keep in nl. */
+	nl.primary = (nl.role == NETLINK_ROLE_HOST) ? 1 : 0;
 	nl_log("session: role=%s port=%u%s%s\n",
 	       nl.role == NETLINK_ROLE_HOST ? "host" : "client",
 	       nl.port, nl.peer[0] ? " peer=" : "", nl.peer[0] ? nl.peer : "");
@@ -358,7 +402,11 @@ bool NetLink_isConfigured(void)  { return nl.configured; }
 NetLinkRole NetLink_getRole(void) { return nl.role; }
 
 uint16_t NetLink_localClientId(void) {
-	return nl.role == NETLINK_ROLE_HOST ? 0 : 1;
+	/* The host is slot 0. A guest's slot is assigned by the host in the greeting,
+	 * so until that arrives the answer is 1 - which is what a two-device session
+	 * has always used, and what the session machinery below assumes. */
+	if (nl.role == NETLINK_ROLE_HOST) return 0;
+	return nl.local_client_id ? nl.local_client_id : 1;
 }
 uint16_t NetLink_remoteClientId(void) {
 	return nl.role == NETLINK_ROLE_HOST ? 1 : 0;
@@ -368,9 +416,10 @@ uint16_t NetLink_remoteClientId(void) {
 // connection setup, on the worker thread
 //////////////////////////////////////////////////////////////////////////////
 
-static bool exchange_hello(int fd) {
+static bool exchange_hello(int fd, uint16_t assign_client_id) {
 	NetLinkHello mine = {
 		.magic = htonl(NETLINK_MAGIC), .protocol = htonl(NETLINK_PROTOCOL),
+		.client_id = htons(assign_client_id),
 	};
 	NetLinkHeader hdr = { .cmd = CMD_HELLO, .size = htons(sizeof(mine)), .client_id = 0 };
 
@@ -392,6 +441,21 @@ static bool exchange_hello(int fd) {
 	if (ntohl(theirs.protocol) != NETLINK_PROTOCOL) {
 		nl_log("protocol mismatch: peer=%u ours=%u\n", ntohl(theirs.protocol), NETLINK_PROTOCOL);
 		return false;
+	}
+
+	/* A guest plays as the console the host assigned it. The host decided that
+	 * slot when it accepted the connection - it knows which of its slots is free
+	 * - so this is the guest's only way to learn it, and it must arrive before
+	 * anything of the guest's is attributed to a console number. The host reads
+	 * the field and ignores it: what a guest asks for is not what it gets. */
+	if (nl.role != NETLINK_ROLE_HOST) {
+		uint16_t slot = ntohs(theirs.client_id);
+		if (slot < 1 || slot >= NETLINK_MAX_PEERS) {
+			nl_log("host offered no slot (%u)\n", slot);
+			return false;
+		}
+		nl.local_client_id = slot;
+		nl_log("host assigned slot %u\n", slot);
 	}
 
 	return true;
@@ -475,157 +539,216 @@ static int do_connect(void) {
 // worker thread
 //////////////////////////////////////////////////////////////////////////////
 
-static void queue_push(const uint8_t* data, size_t len) {
-	unsigned next = (nl.q_tail + 1) % QUEUE_SIZE;
-	if (next == nl.q_head) {
+/* from is the console the packet is attributed to, which is the sender's slot as
+ * carried in the frame - not the peer it happened to arrive from. They differ
+ * when the host relays: a guest hears another guest's packet through the host,
+ * and it must still be the other guest's console number. */
+static void queue_push(NetLinkPeer* p, const uint8_t* data, size_t len, uint16_t from) {
+	unsigned next = (p->q_tail + 1) % QUEUE_SIZE;
+	if (next == p->q_head) {
 		/* Full. Dropping is better than blocking the reader, but it means the
 		 * core missed data, so make it visible. */
-		nl.dropped++;
+		p->dropped++;
 		return;
 	}
-	memcpy(nl.queue[nl.q_tail].data, data, len);
-	nl.queue[nl.q_tail].len = len;
-	nl.q_tail = next;
+	memcpy(p->queue[p->q_tail].data, data, len);
+	p->queue[p->q_tail].len = len;
+	p->queue[p->q_tail].client_id = from;
+	p->q_tail = next;
 }
 
 /* Hand a finished transfer to the emulator thread. Takes ownership of buf on
  * success. Caller holds nl.lock. */
-static bool push_state_locked(uint8_t* buf, size_t len, uint32_t kind) {
-	if (nl.state_done_count >= STATE_QUEUE) return false;
-	unsigned slot = (nl.state_done_head + nl.state_done_count) % STATE_QUEUE;
-	nl.state_done[slot].buf = buf;
-	nl.state_done[slot].len = len;
-	nl.state_done[slot].kind = kind;
-	nl.state_done_count++;
+static bool push_state_locked(NetLinkPeer* p, uint8_t* buf, size_t len, uint32_t kind) {
+	if (p->state_done_count >= STATE_QUEUE) return false;
+	unsigned slot = (p->state_done_head + p->state_done_count) % STATE_QUEUE;
+	p->state_done[slot].buf = buf;
+	p->state_done[slot].len = len;
+	p->state_done[slot].kind = kind;
+	p->state_done_count++;
 	return true;
 }
 
-static void clear_states_locked(void) {
-	while (nl.state_done_count) {
-		free(nl.state_done[nl.state_done_head].buf);
-		nl.state_done[nl.state_done_head].buf = NULL;
-		nl.state_done_head = (nl.state_done_head + 1) % STATE_QUEUE;
-		nl.state_done_count--;
+static void clear_states_locked(NetLinkPeer* p) {
+	while (p->state_done_count) {
+		free(p->state_done[p->state_done_head].buf);
+		p->state_done[p->state_done_head].buf = NULL;
+		p->state_done_head = (p->state_done_head + 1) % STATE_QUEUE;
+		p->state_done_count--;
 	}
-	free(nl.state_buf);
-	nl.state_buf = NULL;
-	nl.state_len = nl.state_have = 0;
-	nl.state_kind = 0;
+	free(p->state_buf);
+	p->state_buf = NULL;
+	p->state_len = p->state_have = 0;
+	p->state_kind = 0;
 }
 
 // Always say why. "peer lost" alone is not diagnosable after the fact, and the
 // interesting failures here are all distinguishable at the point of detection.
-static void drop_connection(const char* reason) {
+static void drop_connection(NetLinkPeer* p, const char* reason) {
 	pthread_mutex_lock(&nl.lock);
-	if (nl.fd >= 0) { close(nl.fd); nl.fd = -1; }
-	if (nl.connected) {
-		nl.connected = false;
-		nl.disconnect_event = true;
+	if (p->fd >= 0) { close(p->fd); p->fd = -1; }
+	if (p->connected) {
+		p->connected = false;
+		p->disconnect_event = true;
 		/* Whatever the peer's last state was, it is gone now. Leaving this set
 		 * strands us waiting for a CMD_RESUME that can never arrive. */
-		nl.peer_paused = false;
-		nl.told_peer_paused = false;
-		nl.rtt_count = nl.rtt_next = 0;
-		nl.rtt_outstanding = false;
+		p->peer_paused = false;
+		p->told_peer_paused = false;
+		p->rtt_count = p->rtt_next = 0;
+		p->rtt_outstanding = false;
 		/* Everything the departed peer told us dies with it, so a reconnecting
 		 * process cannot be accepted on the strength of its predecessor's
 		 * handshake. This runs on the worker thread, ahead of any byte of the
 		 * next connection. */
-		clear_states_locked();
-		nl.peer_session_identity_ready = false;
-		nl.link_verdict_ready = false;
-		nl.resync_request_ready = nl.resync_begin_ready = false;
-		nl.resync_ack_ready = nl.resync_commit_ready = false;
+		clear_states_locked(p);
+		p->peer_session_identity_ready = false;
+		p->link_verdict_ready = false;
+		p->resync_request_ready = p->resync_begin_ready = false;
+		p->resync_ack_ready = p->resync_commit_ready = false;
 		nl_log("peer lost: %s (rx %ldms ago, tx %ldms ago, %u pkts in, %u dropped)\n",
-		       reason, ms_since(&nl.last_rx), ms_since(&nl.last_tx),
-		       nl.rx_count, nl.dropped);
+		       reason, ms_since(&p->last_rx), ms_since(&p->last_tx),
+		       p->rx_count, p->dropped);
 	}
 	pthread_mutex_unlock(&nl.lock);
+}
+
+/* How many guests this session allows. One unless the shim raises it: the
+ * emulated GBA multi-play link is four slots, but shared-screen play is a single
+ * partner by design (docs/features.md section 11), and only the shim knows which
+ * mode the core chose. */
+static unsigned nl_max_guests = 1;
+
+void NetLink_setMaxGuests(unsigned n) {
+	if (n >= 1 && n <= NETLINK_MAX_PEERS - 1) nl_max_guests = n;
+}
+
+static void service_peer(NetLinkPeer* p, short revents);
+
+/* Take a connection into a slot and note that it is live. The slot number is the
+ * peer's client id: 0 for the host (a guest's only connection), 1..3 for the
+ * guests a host has accepted, in the order they arrived. */
+static void peer_attach(NetLinkPeer* p, int fd) {
+	pthread_mutex_lock(&nl.lock);
+	p->fd = fd;
+	p->connected = true;
+	p->connect_event = true;
+	p->connection_generation++;
+	if (!p->connection_generation) p->connection_generation++;
+	p->peer_session_identity_ready = false;
+	p->checkpoint_ack_ready = false;
+	gettimeofday(&p->last_rx, NULL);
+	gettimeofday(&p->last_tx, NULL);
+	pthread_mutex_unlock(&nl.lock);
+	nl_log("peer %u connected (%s)\n", p->client_id,
+	       nl.role == NETLINK_ROLE_HOST ? "guest" : "host");
 }
 
 static void* worker(void* arg) {
 	(void)arg;
 
 	while (nl.running) {
-		/* --- not connected: keep trying --- */
-		if (!nl.connected) {
-			int fd = (nl.role == NETLINK_ROLE_HOST) ? do_listen_accept() : do_connect();
-			if (fd < 0) {
-				usleep(ACCEPT_POLL_MS * 1000);
-				continue;
+		/* The host keeps its listener and fills free slots; a guest has exactly one
+		 * connection to make, to the host. */
+		if (nl.role == NETLINK_ROLE_HOST) {
+			for (unsigned slot = 1; slot <= nl_max_guests; slot++) {
+				NetLinkPeer* p = &nl.peers[slot];
+				if (p->connected) continue;
+				int fd = do_listen_accept();
+				if (fd < 0) break;               /* nothing waiting - normal */
+				configure_socket(fd);
+				/* The lowest free slot is the id this guest plays as. */
+				if (!exchange_hello(fd, (uint16_t)slot)) { close(fd); continue; }
+				p->client_id = (uint16_t)slot;
+				peer_attach(p, fd);
 			}
-
+		} else if (!nl.peers[0].connected) {
+			NetLinkPeer* p = &nl.peers[0];
+			int fd = do_connect();
+			if (fd < 0) { usleep(ACCEPT_POLL_MS * 1000); continue; }
 			configure_socket(fd);
-			if (!exchange_hello(fd)) {
-				close(fd);
-				usleep(ACCEPT_POLL_MS * 1000);
-				continue;
-			}
-
-			pthread_mutex_lock(&nl.lock);
-			nl.fd = fd;
-			nl.peer_session_identity_ready = false;
-			nl.checkpoint_ack_ready = false;
-			nl.connected = true;
-			nl.connect_event = true;
-			nl.connection_generation++;
-			if (!nl.connection_generation) nl.connection_generation++;
-			gettimeofday(&nl.last_rx, NULL);
-			gettimeofday(&nl.last_tx, NULL);
-			pthread_mutex_unlock(&nl.lock);
-
-			nl_log("connected as %s (client_id %u)\n",
-			       nl.role == NETLINK_ROLE_HOST ? "host" : "client",
-			       NetLink_localClientId());
-			continue;
+			if (!exchange_hello(fd, 0)) { close(fd); usleep(ACCEPT_POLL_MS * 1000); continue; }
+			p->client_id = 0;                        /* the host's slot */
+			peer_attach(p, fd);
 		}
 
-		/* --- connected: wait for a frame, or wake to heartbeat --- */
-		struct pollfd pfd = { .fd = nl.fd, .events = POLLIN, .revents = 0 };
-		int pr = poll(&pfd, 1, POLL_WAIT_MS);
+		/* One poll for the whole set rather than one per peer: polling them in turn
+		 * would let the last guest wait a full timeout behind a poll that had
+		 * already reported the others' data. */
+		struct pollfd pfds[NETLINK_MAX_PEERS];
+		NetLinkPeer* ready[NETLINK_MAX_PEERS];
+		nfds_t n = 0;
+		for (unsigned i = 0; i < NETLINK_MAX_PEERS; i++) {
+			if (!nl.peers[i].connected) continue;
+			pfds[n].fd = nl.peers[i].fd;
+			pfds[n].events = POLLIN;
+			pfds[n].revents = 0;
+			ready[n] = &nl.peers[i];
+			n++;
+		}
+		if (!n) { usleep(ACCEPT_POLL_MS * 1000); continue; }
 
+		int pr = poll(pfds, n, POLL_WAIT_MS);
 		if (pr < 0 && errno != EINTR) {
 			char why[64];
 			snprintf(why, sizeof(why), "poll error: %s", strerror(errno));
-			drop_connection(why);
+			for (nfds_t k = 0; k < n; k++) drop_connection(ready[k], why);
 			continue;
 		}
+		/* Every peer is serviced every pass, not only those poll() reported:
+		 * liveness, the heartbeat and the RTT probe are timely work, and the
+		 * single-peer loop this replaces had the same property for the same
+		 * reason. */
+		for (nfds_t k = 0; k < n; k++) service_peer(ready[k], pfds[k].revents);
+	}
 
-		if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-			drop_connection("socket error from poll");
-			continue;
+	/* The worker is on its way out: every peer is dropped from here, the way
+	 * the single-peer loop dropped its one connection when NetLink_stop asked
+	 * it to stop. */
+	for (unsigned i = 0; i < NETLINK_MAX_PEERS; i++)
+		if (nl.peers[i].connected) drop_connection(&nl.peers[i], "worker stopping");
+	return NULL;
+}
+
+static void service_peer(NetLinkPeer* p, short revents) {
+/* Everything one connection needs doing: liveness, heartbeat, RTT probe, the
+ * frontend-stall notice, then whatever the peer sent. Called once per connected
+ * peer every pass, with revents from the poll the worker ran over the whole
+ * set (0 when that peer had nothing). */
+		if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+			drop_connection(p, "socket error from poll");
+			return;
 		}
 
 		/* Liveness is checked every iteration, not only when the socket is idle.
 		 * Putting the heartbeat in the idle branch starves it exactly when the
 		 * peer is sending steadily: poll() always reports POLLIN, the idle
 		 * branch never runs, and the peer times us out mid-session. */
-		if (ms_since(&nl.last_rx) > TIMEOUT_MS) {
-			drop_connection("silence timeout");
-			continue;
+		if (ms_since(&p->last_rx) > TIMEOUT_MS) {
+			drop_connection(p, "silence timeout");
+			return;
 		}
-		if (ms_since(&nl.last_tx) > HEARTBEAT_MS) {
+		if (ms_since(&p->last_tx) > HEARTBEAT_MS) {
 			pthread_mutex_lock(&nl.lock);
-			bool sent = send_framed(CMD_PING, NULL, 0, NetLink_localClientId());
+			bool sent = send_framed(p, CMD_PING, NULL, 0, NetLink_localClientId());
 			pthread_mutex_unlock(&nl.lock);
-			if (!sent) { drop_connection("heartbeat send failed"); continue; }
+			if (!sent) { drop_connection(p, "heartbeat send failed"); return; }
 		}
 
 		/* One probe in flight at a time: a lost echo costs one sample rather
 		 * than corrupting the estimate with a mismatched pair. */
-		if (!nl.rtt_outstanding && ms_since(&nl.rtt_last_probe) > RTT_PROBE_MS) {
+		if (!p->rtt_outstanding && ms_since(&p->rtt_last_probe) > RTT_PROBE_MS) {
 			pthread_mutex_lock(&nl.lock);
-			uint32_t token = ++nl.rtt_token;
+			uint32_t token = ++p->rtt_token;
 			uint32_t wire = htonl(token);
-			bool sent = send_framed(CMD_RTT_PROBE, &wire, sizeof(wire),
+			bool sent = send_framed(p, CMD_RTT_PROBE, &wire, sizeof(wire),
 			                        NetLink_localClientId());
 			if (sent) {
-				nl.rtt_outstanding = true;
-				gettimeofday(&nl.rtt_sent_at, NULL);
+				p->rtt_outstanding = true;
+				gettimeofday(&p->rtt_sent_at, NULL);
 			}
-			gettimeofday(&nl.rtt_last_probe, NULL);
+			gettimeofday(&p->rtt_last_probe, NULL);
 			pthread_mutex_unlock(&nl.lock);
-			if (!sent) { drop_connection("rtt probe send failed"); continue; }
+			if (!sent) { drop_connection(p, "rtt probe send failed"); return; }
 		}
 
 		/* Tell the peer when our frontend stalls, and when it comes back. The
@@ -633,65 +756,65 @@ static void* worker(void* arg) {
 		if (nl.last_run.tv_sec) {
 			/* Inside the core is not stalled, no matter how long it takes. */
 			bool stalled = !nl.core_running && ms_since(&nl.last_run) > STALL_MS;
-			if (stalled != nl.told_peer_paused) {
+			if (stalled != p->told_peer_paused) {
 				pthread_mutex_lock(&nl.lock);
 				uint8_t reason = NETLINK_PAUSE_FRONTEND;
-				bool sent = send_framed(stalled ? CMD_PAUSE : CMD_RESUME,
+				bool sent = send_framed(p, stalled ? CMD_PAUSE : CMD_RESUME,
 				                        stalled ? &reason : NULL, stalled ? 1 : 0,
 				                        NetLink_localClientId());
 				pthread_mutex_unlock(&nl.lock);
 				if (sent) {
-					nl.told_peer_paused = stalled;
+					p->told_peer_paused = stalled;
 					nl_log("frontend %s - told peer\n", stalled ? "stalled" : "resumed");
 				}
 			}
 		}
 
-		if (pr <= 0 || !(pfd.revents & POLLIN)) continue;
+		if (!(revents & POLLIN)) return;
 
 		/* Backpressure instead of discarding. When the frontend stalls - a menu,
 		 * a sleep - nothing drains the queue, so stop taking data off the socket
 		 * and let TCP throttle the peer. The bytes wait in the kernel and the
 		 * session resumes intact rather than with a hole in it. */
 		pthread_mutex_lock(&nl.lock);
-		unsigned queued = (nl.q_tail - nl.q_head + QUEUE_SIZE) % QUEUE_SIZE;
+		unsigned queued = (p->q_tail - p->q_head + QUEUE_SIZE) % QUEUE_SIZE;
 		pthread_mutex_unlock(&nl.lock);
 		if (queued >= QUEUE_HIGH_WATER) {
-			if (!nl.backpressure) {
-				nl.backpressure = true;
+			if (!p->backpressure) {
+				p->backpressure = true;
 				nl_log("queue at %u/%u - applying backpressure\n", queued, QUEUE_SIZE);
 			}
 			usleep(2000);
-			continue;
+			return;
 		}
-		if (nl.backpressure) {
-			nl.backpressure = false;
+		if (p->backpressure) {
+			p->backpressure = false;
 			nl_log("queue drained to %u - resuming\n", queued);
 		}
 
 		NetLinkHeader hdr;
 		const char* why = "header read failed";
-		if (!read_all_why(nl.fd, &hdr, sizeof(hdr), TIMEOUT_MS, &why)) {
-			drop_connection(why);
-			continue;
+		if (!read_all_why(p->fd, &hdr, sizeof(hdr), TIMEOUT_MS, &why)) {
+			drop_connection(p, why);
+			return;
 		}
 
 		uint16_t size = ntohs(hdr.size);
 		if (size > NETLINK_MAX_PACKET) {
 			nl_log("oversized packet (%u bytes)\n", size);
-			drop_connection("framing lost");
-			continue;
+			drop_connection(p, "framing lost");
+			return;
 		}
 
 		uint8_t buf[NETLINK_MAX_PACKET];
-		if (size && !read_all(nl.fd, buf, size, TIMEOUT_MS)) { drop_connection("payload read failed"); continue; }
+		if (size && !read_all(p->fd, buf, size, TIMEOUT_MS)) { drop_connection(p, "payload read failed"); return; }
 
-		gettimeofday(&nl.last_rx, NULL);
+		gettimeofday(&p->last_rx, NULL);
 
 		if (hdr.cmd == CMD_PAUSE || hdr.cmd == CMD_RESUME) {
 			pthread_mutex_lock(&nl.lock);
-			nl.peer_paused = (hdr.cmd == CMD_PAUSE);
-			if (nl.peer_paused) gettimeofday(&nl.peer_paused_at, NULL);
+			p->peer_paused = (hdr.cmd == CMD_PAUSE);
+			if (p->peer_paused) gettimeofday(&p->peer_paused_at, NULL);
 			pthread_mutex_unlock(&nl.lock);
 			if (hdr.cmd == CMD_PAUSE) {
 				const char* why = (size && buf[0] == NETLINK_PAUSE_FRONTEND)
@@ -707,9 +830,9 @@ static void* worker(void* arg) {
 			uint32_t b = ntohl(*(uint32_t*)(buf + 4));
 			pthread_mutex_lock(&nl.lock);
 			unsigned slot = f % INPUT_RING;
-			nl.inputs[slot].frame = f;
-			nl.inputs[slot].buttons = b;
-			nl.inputs[slot].valid = true;
+			p->inputs[slot].frame = f;
+			p->inputs[slot].buttons = b;
+			p->inputs[slot].valid = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
 
@@ -727,31 +850,31 @@ static void* worker(void* arg) {
 			} else if (off == 0) {
 				/* A new transfer starts. Anything half-received is abandoned; a
 				 * transfer that already completed is safe on the done queue. */
-				free(nl.state_buf);
-				nl.state_buf = malloc(total);
-				nl.state_len = nl.state_buf ? total : 0;
-				nl.state_have = 0;
-				nl.state_kind = kind;
+				free(p->state_buf);
+				p->state_buf = malloc(total);
+				p->state_len = p->state_buf ? total : 0;
+				p->state_have = 0;
+				p->state_kind = kind;
 			}
-			if (valid && nl.state_buf && nl.state_len == total &&
-			    nl.state_kind == kind && off == nl.state_have) {
-				memcpy(nl.state_buf + off, buf + STATE_HEADER, n);
-				nl.state_have += n;
-				if (nl.state_have >= total) {
-					if (!push_state_locked(nl.state_buf, total, kind)) {
+			if (valid && p->state_buf && p->state_len == total &&
+			    p->state_kind == kind && off == p->state_have) {
+				memcpy(p->state_buf + off, buf + STATE_HEADER, n);
+				p->state_have += n;
+				if (p->state_have >= total) {
+					if (!push_state_locked(p, p->state_buf, total, kind)) {
 						nl_log("state queue full - dropping a %u-byte kind=%u transfer\n",
 						       total, kind);
-						free(nl.state_buf);
+						free(p->state_buf);
 					}
-					nl.state_buf = NULL;
-					nl.state_len = nl.state_have = 0;
+					p->state_buf = NULL;
+					p->state_len = p->state_have = 0;
 				}
-			} else if (valid && nl.state_buf) {
+			} else if (valid && p->state_buf) {
 				nl_log("out-of-order state chunk (wanted=%zu/kind=%u got=%u/kind=%u)"
-				       " - discarding\n", nl.state_have, nl.state_kind, off, kind);
-				free(nl.state_buf);
-				nl.state_buf = NULL;
-				nl.state_len = nl.state_have = 0;
+				       " - discarding\n", p->state_have, p->state_kind, off, kind);
+				free(p->state_buf);
+				p->state_buf = NULL;
+				p->state_len = p->state_have = 0;
 			}
 			pthread_mutex_unlock(&nl.lock);
 		}
@@ -761,36 +884,36 @@ static void* worker(void* arg) {
 			 * the turnaround does not wait on the frontend and the number stays
 			 * a measure of the link rather than of the peer's frame loop. */
 			pthread_mutex_lock(&nl.lock);
-			bool sent = nl.connected &&
-			            send_framed(CMD_RTT_ECHO, buf, 4, NetLink_localClientId());
+			bool sent = p->connected &&
+			            send_framed(p, CMD_RTT_ECHO, buf, 4, NetLink_localClientId());
 			pthread_mutex_unlock(&nl.lock);
-			if (!sent && nl.connected) drop_connection("rtt echo send failed");
+			if (!sent && p->connected) drop_connection(p, "rtt echo send failed");
 		}
 
 		if (hdr.cmd == CMD_RTT_ECHO && size == 4) {
 			uint32_t token = ntohl(*(uint32_t*)buf);
 			pthread_mutex_lock(&nl.lock);
-			if (nl.rtt_outstanding && token == nl.rtt_token) {
+			if (p->rtt_outstanding && token == p->rtt_token) {
 				struct timeval now;
 				gettimeofday(&now, NULL);
-				long sec = now.tv_sec - nl.rtt_sent_at.tv_sec;
-				long usec = now.tv_usec - nl.rtt_sent_at.tv_usec;
+				long sec = now.tv_sec - p->rtt_sent_at.tv_sec;
+				long usec = now.tv_usec - p->rtt_sent_at.tv_usec;
 				long long total = (long long)sec * 1000000LL + usec;
 				if (total < 0) total = 0;
 				if (total > UINT32_MAX) total = UINT32_MAX;
-				nl.rtt_us[nl.rtt_next] = (uint32_t)total;
-				nl.rtt_next = (nl.rtt_next + 1) % RTT_SAMPLES;
-				if (nl.rtt_count < RTT_SAMPLES) nl.rtt_count++;
-				nl.rtt_outstanding = false;
+				p->rtt_us[p->rtt_next] = (uint32_t)total;
+				p->rtt_next = (p->rtt_next + 1) % RTT_SAMPLES;
+				if (p->rtt_count < RTT_SAMPLES) p->rtt_count++;
+				p->rtt_outstanding = false;
 			}
 			pthread_mutex_unlock(&nl.lock);
 		}
 
 		if (hdr.cmd == CMD_LINK_VERDICT && size == 8) {
 			pthread_mutex_lock(&nl.lock);
-			nl.link_verdict_can_pair = ntohl(*(uint32_t*)buf) != 0;
-			nl.link_verdict_reason = ntohl(*(uint32_t*)(buf + 4));
-			nl.link_verdict_ready = true;
+			p->link_verdict_can_pair = ntohl(*(uint32_t*)buf) != 0;
+			p->link_verdict_reason = ntohl(*(uint32_t*)(buf + 4));
+			p->link_verdict_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
 
@@ -832,93 +955,116 @@ static void* worker(void* arg) {
 			uint32_t hv = ntohl(*(uint32_t*)(buf + 4));
 			/* Keep every checkpoint until the emulator thread consumes it.
 				 * A single slot let a newer hash overwrite a late older one. */
-				if (nl.peer_hash_count == HASH_RING) {
-					nl.peer_hash_head = (nl.peer_hash_head + 1) % HASH_RING;
-					nl.peer_hash_count--;
+				if (p->peer_hash_count == HASH_RING) {
+					p->peer_hash_head = (p->peer_hash_head + 1) % HASH_RING;
+					p->peer_hash_count--;
 					nl_log("state-hash queue full - dropped oldest checkpoint\n");
 				}
-				unsigned slot = (nl.peer_hash_head + nl.peer_hash_count) % HASH_RING;
-				nl.peer_hashes[slot].frame = hf;
-				nl.peer_hashes[slot].hash = hv;
-			nl.peer_hash_count++;
+				unsigned slot = (p->peer_hash_head + p->peer_hash_count) % HASH_RING;
+				p->peer_hashes[slot].frame = hf;
+				p->peer_hashes[slot].hash = hv;
+			p->peer_hash_count++;
 			pthread_mutex_unlock(&nl.lock);
 		}
 
 		if (hdr.cmd == CMD_RESYNC_REQUEST && size == 4) {
 			pthread_mutex_lock(&nl.lock);
-			nl.resync_request_frame = ntohl(*(uint32_t*)buf);
-			nl.resync_request_ready = true;
+			p->resync_request_frame = ntohl(*(uint32_t*)buf);
+			p->resync_request_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
 
 		if (hdr.cmd == CMD_RESYNC_BEGIN && size == 12) {
 			pthread_mutex_lock(&nl.lock);
-			nl.resync_begin_epoch = ntohl(*(uint32_t*)buf);
-			nl.resync_begin_frame = ntohl(*(uint32_t*)(buf + 4));
+			p->resync_begin_epoch = ntohl(*(uint32_t*)buf);
+			p->resync_begin_frame = ntohl(*(uint32_t*)(buf + 4));
 			uint32_t kind = ntohl(*(uint32_t*)(buf + 8));
-			nl.resync_begin_kind = kind == NETLINK_RECOVERY_RESET
+			p->resync_begin_kind = kind == NETLINK_RECOVERY_RESET
 			                     ? NETLINK_RECOVERY_RESET : NETLINK_RECOVERY_SYNC;
-			nl.resync_begin_ready = true;
+			p->resync_begin_ready = true;
 			/* BEGIN owns the state stream which follows it: anything still
 			 * queued or half-received belongs to an abandoned attempt. */
-			clear_states_locked();
+			clear_states_locked(p);
 			pthread_mutex_unlock(&nl.lock);
 		}
 
 		if (hdr.cmd == CMD_RESYNC_ACK && size == 8) {
 			pthread_mutex_lock(&nl.lock);
-			nl.resync_ack_epoch = ntohl(*(uint32_t*)buf);
-			nl.resync_ack_loaded = ntohl(*(uint32_t*)(buf + 4)) != 0;
-			nl.resync_ack_ready = true;
+			p->resync_ack_epoch = ntohl(*(uint32_t*)buf);
+			p->resync_ack_loaded = ntohl(*(uint32_t*)(buf + 4)) != 0;
+			p->resync_ack_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
 
 		if (hdr.cmd == CMD_RESYNC_COMMIT && size == 4) {
 			pthread_mutex_lock(&nl.lock);
-			nl.resync_commit_epoch = ntohl(*(uint32_t*)buf);
-			nl.resync_commit_ready = true;
+			p->resync_commit_epoch = ntohl(*(uint32_t*)buf);
+			p->resync_commit_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
 
 		if (hdr.cmd == CMD_SESSION_IDENTITY && size == 72) {
 			pthread_mutex_lock(&nl.lock);
-			memcpy(nl.peer_session_identity.rom_sha256, buf, 32);
-			nl.peer_session_identity.mode = ntohl(*(uint32_t*)(buf + 32));
-			nl.peer_session_identity.input_delay = ntohl(*(uint32_t*)(buf + 36));
-			nl.peer_session_identity.core_identity = ntohl(*(uint32_t*)(buf + 40));
-			nl.peer_session_identity.state_size = ntohl(*(uint32_t*)(buf + 44));
-			nl.peer_session_identity.sram_size = ntohl(*(uint32_t*)(buf + 48));
-			nl.peer_session_identity.rtc_size = ntohl(*(uint32_t*)(buf + 52));
-			nl.peer_session_identity.rom_size = ntohl(*(uint32_t*)(buf + 56));
-			nl.peer_session_identity.wall_clock_utc =
+			memcpy(p->peer_session_identity.rom_sha256, buf, 32);
+			p->peer_session_identity.mode = ntohl(*(uint32_t*)(buf + 32));
+			p->peer_session_identity.input_delay = ntohl(*(uint32_t*)(buf + 36));
+			p->peer_session_identity.core_identity = ntohl(*(uint32_t*)(buf + 40));
+			p->peer_session_identity.state_size = ntohl(*(uint32_t*)(buf + 44));
+			p->peer_session_identity.sram_size = ntohl(*(uint32_t*)(buf + 48));
+			p->peer_session_identity.rtc_size = ntohl(*(uint32_t*)(buf + 52));
+			p->peer_session_identity.rom_size = ntohl(*(uint32_t*)(buf + 56));
+			p->peer_session_identity.wall_clock_utc =
 				((uint64_t)ntohl(*(uint32_t*)(buf + 60)) << 32) |
 				ntohl(*(uint32_t*)(buf + 64));
-			nl.peer_session_identity.rom_crc32 = ntohl(*(uint32_t*)(buf + 68));
-			nl.peer_session_identity_ready = true;
+			p->peer_session_identity.rom_crc32 = ntohl(*(uint32_t*)(buf + 68));
+			p->peer_session_identity_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
 
 		if (hdr.cmd == CMD_CHECKPOINT_ACK && size == 12) {
 			pthread_mutex_lock(&nl.lock);
-			nl.checkpoint_ack_frame = ntohl(*(uint32_t*)buf);
-			nl.checkpoint_ack_hash = ntohl(*(uint32_t*)(buf + 4));
-			nl.checkpoint_ack_matched = ntohl(*(uint32_t*)(buf + 8)) != 0;
-			nl.checkpoint_ack_ready = true;
+			p->checkpoint_ack_frame = ntohl(*(uint32_t*)buf);
+			p->checkpoint_ack_hash = ntohl(*(uint32_t*)(buf + 4));
+			p->checkpoint_ack_matched = ntohl(*(uint32_t*)(buf + 8)) != 0;
+			p->checkpoint_ack_ready = true;
 			pthread_mutex_unlock(&nl.lock);
 		}
 
 		if (hdr.cmd == CMD_DATA && size) {
+			uint16_t from = ntohs(hdr.client_id);
+			NetLinkPeer* broken[NETLINK_MAX_PEERS];
+			unsigned broken_n = 0;
+
 			pthread_mutex_lock(&nl.lock);
-			nl.rx_count++;
-			queue_push(buf, size);
+			p->rx_count++;
+			queue_push(p, buf, size, from);
+			/* Link play is a bus: what one console sends, every console sees. The
+			 * host is the hub, so it copies the packet on to the other guests,
+			 * still marked with the sender's slot - which is what the four-player
+			 * adapter did, and what gpSP's Advance Wars protocol expects. A guest
+			 * has nobody to relay to; the host does the relaying for all of them.
+			 * The queue_push above already gave our own core its copy. */
+			if (nl.role == NETLINK_ROLE_HOST) {
+				for (unsigned i = 1; i < NETLINK_MAX_PEERS; i++) {
+					NetLinkPeer* other = &nl.peers[i];
+					if (other == p || !other->connected) continue;
+					if (!send_framed(other, CMD_DATA, buf, size, from) &&
+					    broken_n < NETLINK_MAX_PEERS)
+						broken[broken_n++] = other;
+				}
+			}
 			pthread_mutex_unlock(&nl.lock);
+
+			/* A relay that did not finish leaves that guest's stream broken
+			 * mid-frame: write_all never reports a half-written frame as success, so
+			 * this is a dead connection rather than a dropped packet. Dropped out
+			 * here because drop_connection() takes the lock itself. */
+			for (unsigned i = 0; i < broken_n; i++)
+				drop_connection(broken[i], "relay send failed");
 		}
 		/* CMD_PING needs no handling beyond refreshing last_rx above. */
-	}
-
-	drop_connection("worker stopping");
-	return NULL;
 }
+
 
 //////////////////////////////////////////////////////////////////////////////
 // public
@@ -943,10 +1089,10 @@ void NetLink_stop(void) {
 	pthread_join(nl.thread, NULL);
 
 	if (nl.listen_fd >= 0) { close(nl.listen_fd); nl.listen_fd = -1; }
-	if (nl.fd >= 0)        { close(nl.fd);        nl.fd = -1; }
-	nl.connected = false;
+	if (NL_PRIMARY->fd >= 0)        { close(NL_PRIMARY->fd);        NL_PRIMARY->fd = -1; }
+	NL_PRIMARY->connected = false;
 
-	if (nl.dropped) nl_log("%u packet(s) were dropped this session\n", nl.dropped);
+	if (NL_PRIMARY->dropped) nl_log("%u packet(s) were dropped this session\n", NL_PRIMARY->dropped);
 }
 
 void NetLink_markFrame(void) {
@@ -960,7 +1106,7 @@ void NetLink_setCoreRunning(bool running) {
 
 bool NetLink_isPeerPaused(void) {
 	pthread_mutex_lock(&nl.lock);
-	bool p = nl.peer_paused;
+	bool p = NL_PRIMARY->peer_paused;
 	/* A live peer may legitimately remain in its menu indefinitely. The worker
 	 * keeps exchanging heartbeats while both frontends are paused, and
 	 * drop_connection() clears this flag if the process/device actually dies.
@@ -972,30 +1118,55 @@ bool NetLink_isPeerPaused(void) {
 
 bool NetLink_isConnected(void) {
 	pthread_mutex_lock(&nl.lock);
-	bool c = nl.connected;
+	bool c = NL_PRIMARY->connected;
 	pthread_mutex_unlock(&nl.lock);
 	return c;
 }
 
-bool NetLink_consumeConnectEvent(void) {
+/* Connecting and disconnecting concern one console at a time, so the event says
+ * which one. A host running four players sees guests arrive and leave while the
+ * session continues; the shim tells its core which slot each event was about. */
+bool NetLink_consumeConnectEvent(uint16_t* client_id) {
 	pthread_mutex_lock(&nl.lock);
-	bool e = nl.connect_event;
-	nl.connect_event = false;
+	for (unsigned i = 0; i < NETLINK_MAX_PEERS; i++) {
+		if (!nl.peers[i].connect_event) continue;
+		nl.peers[i].connect_event = false;
+		if (client_id) *client_id = nl.peers[i].client_id;
+		pthread_mutex_unlock(&nl.lock);
+		return true;
+	}
 	pthread_mutex_unlock(&nl.lock);
-	return e;
+	return false;
 }
 
-bool NetLink_consumeDisconnectEvent(void) {
+/* The slots that are connected right now. A caller that must address each peer -
+ * a teardown telling every console the session is over - needs the list, because
+ * any of them can be the only one left. Returns how many were written. */
+unsigned NetLink_connectedIds(uint16_t* out, unsigned cap) {
+	unsigned n = 0;
 	pthread_mutex_lock(&nl.lock);
-	bool e = nl.disconnect_event;
-	nl.disconnect_event = false;
+	for (unsigned i = 0; i < NETLINK_MAX_PEERS && n < cap; i++)
+		if (nl.peers[i].connected) out[n++] = nl.peers[i].client_id;
 	pthread_mutex_unlock(&nl.lock);
-	return e;
+	return n;
+}
+
+bool NetLink_consumeDisconnectEvent(uint16_t* client_id) {
+	pthread_mutex_lock(&nl.lock);
+	for (unsigned i = 0; i < NETLINK_MAX_PEERS; i++) {
+		if (!nl.peers[i].disconnect_event) continue;
+		nl.peers[i].disconnect_event = false;
+		if (client_id) *client_id = nl.peers[i].client_id;
+		pthread_mutex_unlock(&nl.lock);
+		return true;
+	}
+	pthread_mutex_unlock(&nl.lock);
+	return false;
 }
 
 uint32_t NetLink_connectionGeneration(void) {
 	pthread_mutex_lock(&nl.lock);
-	uint32_t generation = nl.connection_generation;
+	uint32_t generation = NL_PRIMARY->connection_generation;
 	pthread_mutex_unlock(&nl.lock);
 	return generation;
 }
@@ -1005,9 +1176,9 @@ uint32_t NetLink_connectionGeneration(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 static void reset_timeline_locked(void) {
-	memset(nl.inputs, 0, sizeof(nl.inputs));
-	nl.peer_hash_head = nl.peer_hash_count = 0;
-	nl.checkpoint_ack_ready = false;
+	memset(NL_PRIMARY->inputs, 0, sizeof(NL_PRIMARY->inputs));
+	NL_PRIMARY->peer_hash_head = NL_PRIMARY->peer_hash_count = 0;
+	NL_PRIMARY->checkpoint_ack_ready = false;
 }
 
 void NetLink_resetTimeline(void) {
@@ -1019,9 +1190,9 @@ void NetLink_resetTimeline(void) {
 void NetLink_resetSync(void) {
 	pthread_mutex_lock(&nl.lock);
 	reset_timeline_locked();
-	clear_states_locked();
-	nl.resync_request_ready = nl.resync_begin_ready = false;
-	nl.resync_ack_ready = nl.resync_commit_ready = false;
+	clear_states_locked(NL_PRIMARY);
+	NL_PRIMARY->resync_request_ready = NL_PRIMARY->resync_begin_ready = false;
+	NL_PRIMARY->resync_ack_ready = NL_PRIMARY->resync_commit_ready = false;
 	/* Deliberately not the peer identity or the link verdict. Both peers detect
 	 * a new connection at different moments - the client is connected as soon as
 	 * connect() returns, the host only once its greeting completes - so the peer
@@ -1035,13 +1206,19 @@ void NetLink_resetSync(void) {
 /* Every framed send has the same failure semantics. A partial control/state
  * transaction cannot be repaired on the same byte stream; close it and let the
  * next connection generation start from a clean identity/state handshake. */
-static bool send_command(uint8_t cmd, const void* data, size_t len) {
+static bool send_command_to(NetLinkPeer* peer, uint8_t cmd, const void* data, size_t len) {
 	pthread_mutex_lock(&nl.lock);
-	bool connected = nl.connected;
-	bool ok = connected && send_framed(cmd, data, len, NetLink_localClientId());
+	bool connected = peer->connected;
+	bool ok = connected && send_framed(peer, cmd, data, len, NetLink_localClientId());
 	pthread_mutex_unlock(&nl.lock);
-	if (!ok && connected) drop_connection("protocol send failed");
+	if (!ok && connected) drop_connection(peer, "protocol send failed");
 	return ok;
+}
+
+/* The control conversation is between the session and its one peer in both roles
+ * - a guest's host, a host's first guest - so the primary is the right peer. */
+static bool send_command(uint8_t cmd, const void* data, size_t len) {
+	return send_command_to(NL_PRIMARY, cmd, data, len);
 }
 
 bool NetLink_sendInput(uint32_t frame, uint32_t buttons) {
@@ -1052,8 +1229,8 @@ bool NetLink_sendInput(uint32_t frame, uint32_t buttons) {
 bool NetLink_getRemoteInput(uint32_t frame, uint32_t* buttons) {
 	pthread_mutex_lock(&nl.lock);
 	unsigned slot = frame % INPUT_RING;
-	bool ok = nl.inputs[slot].valid && nl.inputs[slot].frame == frame;
-	if (ok && buttons) *buttons = nl.inputs[slot].buttons;
+	bool ok = NL_PRIMARY->inputs[slot].valid && NL_PRIMARY->inputs[slot].frame == frame;
+	if (ok && buttons) *buttons = NL_PRIMARY->inputs[slot].buttons;
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
 }
@@ -1085,8 +1262,8 @@ bool NetLink_rttStats(uint32_t* median_us, uint32_t* max_us, unsigned* samples) 
 	uint32_t sorted[RTT_SAMPLES];
 	unsigned n;
 	pthread_mutex_lock(&nl.lock);
-	n = nl.rtt_count;
-	memcpy(sorted, nl.rtt_us, sizeof(sorted));
+	n = NL_PRIMARY->rtt_count;
+	memcpy(sorted, NL_PRIMARY->rtt_us, sizeof(sorted));
 	pthread_mutex_unlock(&nl.lock);
 	if (samples) *samples = n;
 	if (!n) return false;
@@ -1108,11 +1285,11 @@ bool NetLink_sendLinkVerdict(bool can_pair, uint32_t reason) {
 
 bool NetLink_takeLinkVerdict(bool* can_pair, uint32_t* reason) {
 	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.link_verdict_ready;
+	bool ok = NL_PRIMARY->link_verdict_ready;
 	if (ok) {
-		if (can_pair) *can_pair = nl.link_verdict_can_pair;
-		if (reason) *reason = nl.link_verdict_reason;
-		nl.link_verdict_ready = false;
+		if (can_pair) *can_pair = NL_PRIMARY->link_verdict_can_pair;
+		if (reason) *reason = NL_PRIMARY->link_verdict_reason;
+		NL_PRIMARY->link_verdict_ready = false;
 	}
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
@@ -1146,7 +1323,7 @@ bool NetLink_sendCore(const void* data, size_t len) {
 		memcpy(pkt + 8, p + off, n);
 
 		pthread_mutex_lock(&nl.lock);
-		bool ok = nl.connected && send_framed(CMD_CORE, pkt, n + 8, NetLink_localClientId());
+		bool ok = NL_PRIMARY->connected && send_framed(NL_PRIMARY, CMD_CORE, pkt, n + 8, NetLink_localClientId());
 		pthread_mutex_unlock(&nl.lock);
 		if (!ok) return false;
 	}
@@ -1172,13 +1349,13 @@ bool NetLink_takeCore(void** data, size_t* len) {
  * caller that would reject it and fail the session. */
 bool NetLink_takeState(NetLinkStateKind kind, void** data, size_t* len) {
 	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.state_done_count && nl.state_done[nl.state_done_head].kind == (uint32_t)kind;
+	bool ok = NL_PRIMARY->state_done_count && NL_PRIMARY->state_done[NL_PRIMARY->state_done_head].kind == (uint32_t)kind;
 	if (ok) {
-		*data = nl.state_done[nl.state_done_head].buf;
-		*len  = nl.state_done[nl.state_done_head].len;
-		nl.state_done[nl.state_done_head].buf = NULL;
-		nl.state_done_head = (nl.state_done_head + 1) % STATE_QUEUE;
-		nl.state_done_count--;
+		*data = NL_PRIMARY->state_done[NL_PRIMARY->state_done_head].buf;
+		*len  = NL_PRIMARY->state_done[NL_PRIMARY->state_done_head].len;
+		NL_PRIMARY->state_done[NL_PRIMARY->state_done_head].buf = NULL;
+		NL_PRIMARY->state_done_head = (NL_PRIMARY->state_done_head + 1) % STATE_QUEUE;
+		NL_PRIMARY->state_done_count--;
 	}
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
@@ -1210,8 +1387,8 @@ bool NetLink_sendSessionIdentity(const NetLinkSessionIdentity* identity) {
 
 bool NetLink_takeSessionIdentity(NetLinkSessionIdentity* identity) {
 	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.peer_session_identity_ready;
-	if (ok) { *identity = nl.peer_session_identity; nl.peer_session_identity_ready = false; }
+	bool ok = NL_PRIMARY->peer_session_identity_ready;
+	if (ok) { *identity = NL_PRIMARY->peer_session_identity; NL_PRIMARY->peer_session_identity_ready = false; }
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
 }
@@ -1223,12 +1400,12 @@ bool NetLink_ackCheckpoint(uint32_t frame, uint32_t hash, bool matched) {
 
 bool NetLink_takeCheckpointAck(uint32_t* frame, uint32_t* hash, bool* matched) {
 	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.checkpoint_ack_ready;
+	bool ok = NL_PRIMARY->checkpoint_ack_ready;
 	if (ok) {
-		*frame = nl.checkpoint_ack_frame;
-		*hash = nl.checkpoint_ack_hash;
-		*matched = nl.checkpoint_ack_matched;
-		nl.checkpoint_ack_ready = false;
+		*frame = NL_PRIMARY->checkpoint_ack_frame;
+		*hash = NL_PRIMARY->checkpoint_ack_hash;
+		*matched = NL_PRIMARY->checkpoint_ack_matched;
+		NL_PRIMARY->checkpoint_ack_ready = false;
 	}
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
@@ -1236,12 +1413,12 @@ bool NetLink_takeCheckpointAck(uint32_t* frame, uint32_t* hash, bool* matched) {
 
 bool NetLink_takeHash(uint32_t* frame, uint32_t* hash) {
 	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.peer_hash_count != 0;
+	bool ok = NL_PRIMARY->peer_hash_count != 0;
 	if (ok) {
-		*frame = nl.peer_hashes[nl.peer_hash_head].frame;
-		*hash  = nl.peer_hashes[nl.peer_hash_head].hash;
-		nl.peer_hash_head = (nl.peer_hash_head + 1) % HASH_RING;
-		nl.peer_hash_count--;
+		*frame = NL_PRIMARY->peer_hashes[NL_PRIMARY->peer_hash_head].frame;
+		*hash  = NL_PRIMARY->peer_hashes[NL_PRIMARY->peer_hash_head].hash;
+		NL_PRIMARY->peer_hash_head = (NL_PRIMARY->peer_hash_head + 1) % HASH_RING;
+		NL_PRIMARY->peer_hash_count--;
 	}
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
@@ -1267,20 +1444,20 @@ bool NetLink_ackResync(uint32_t epoch, bool loaded) {
 
 bool NetLink_takeResyncRequest(uint32_t* frame) {
 	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.resync_request_ready;
-	if (ok) { *frame = nl.resync_request_frame; nl.resync_request_ready = false; }
+	bool ok = NL_PRIMARY->resync_request_ready;
+	if (ok) { *frame = NL_PRIMARY->resync_request_frame; NL_PRIMARY->resync_request_ready = false; }
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
 }
 
 bool NetLink_takeResyncBegin(uint32_t* epoch, uint32_t* resume_frame, NetLinkRecoveryKind* kind) {
 	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.resync_begin_ready;
+	bool ok = NL_PRIMARY->resync_begin_ready;
 	if (ok) {
-		*epoch = nl.resync_begin_epoch;
-		*resume_frame = nl.resync_begin_frame;
-		*kind = nl.resync_begin_kind;
-		nl.resync_begin_ready = false;
+		*epoch = NL_PRIMARY->resync_begin_epoch;
+		*resume_frame = NL_PRIMARY->resync_begin_frame;
+		*kind = NL_PRIMARY->resync_begin_kind;
+		NL_PRIMARY->resync_begin_ready = false;
 	}
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
@@ -1288,11 +1465,11 @@ bool NetLink_takeResyncBegin(uint32_t* epoch, uint32_t* resume_frame, NetLinkRec
 
 bool NetLink_takeResyncAck(uint32_t* epoch, bool* loaded) {
 	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.resync_ack_ready;
+	bool ok = NL_PRIMARY->resync_ack_ready;
 	if (ok) {
-		*epoch = nl.resync_ack_epoch;
-		*loaded = nl.resync_ack_loaded;
-		nl.resync_ack_ready = false;
+		*epoch = NL_PRIMARY->resync_ack_epoch;
+		*loaded = NL_PRIMARY->resync_ack_loaded;
+		NL_PRIMARY->resync_ack_ready = false;
 	}
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
@@ -1300,15 +1477,14 @@ bool NetLink_takeResyncAck(uint32_t* epoch, bool* loaded) {
 
 bool NetLink_takeResyncCommit(uint32_t* epoch) {
 	pthread_mutex_lock(&nl.lock);
-	bool ok = nl.resync_commit_ready;
-	if (ok) { *epoch = nl.resync_commit_epoch; nl.resync_commit_ready = false; }
+	bool ok = NL_PRIMARY->resync_commit_ready;
+	if (ok) { *epoch = NL_PRIMARY->resync_commit_epoch; NL_PRIMARY->resync_commit_ready = false; }
 	pthread_mutex_unlock(&nl.lock);
 	return ok;
 }
 
 bool NetLink_send(int flags, const void* buf, size_t len, uint16_t client_id) {
 	(void)flags;     /* TCP_NODELAY means every packet is already flushed. */
-	(void)client_id; /* Two players: the only destination is the peer. */
 
 	if (!buf || !len) return true; /* flush-only request */
 	if (len > NETLINK_MAX_PACKET) {
@@ -1316,23 +1492,47 @@ bool NetLink_send(int flags, const void* buf, size_t len, uint16_t client_id) {
 		return false;
 	}
 
-	return send_command(CMD_DATA, buf, len);
-}
+	/* A guest's only peer is the host, so whatever its core addressed, the packet
+	 * has one place to go. The host is the hub: it addresses a guest by slot, or
+	 * every guest at once for a broadcast. The header carries the sender's slot
+	 * either way, which is how the receiving core attributes the packet. */
+	if (nl.role != NETLINK_ROLE_HOST) return send_command(CMD_DATA, buf, len);
 
-bool NetLink_popPacket(void* out, size_t out_cap, size_t* out_len) {
-	pthread_mutex_lock(&nl.lock);
-	if (nl.q_head == nl.q_tail) {
-		pthread_mutex_unlock(&nl.lock);
+	if (client_id == RETRO_NETPACKET_BROADCAST) {
+		bool ok = true;
+		for (unsigned i = 1; i < NETLINK_MAX_PEERS; i++) {
+			NetLinkPeer* peer = &nl.peers[i];
+			if (!peer->connected) continue;
+			if (!send_command_to(peer, CMD_DATA, buf, len)) ok = false;
+		}
+		return ok;
+	}
+	/* Slot 0 is the host itself, and one past the table is nobody. */
+	if (client_id == 0 || client_id >= NETLINK_MAX_PEERS) {
+		nl_log("no such peer %u to send %zu bytes to\n", client_id, len);
 		return false;
 	}
-
-	QueuedPacket* p = &nl.queue[nl.q_head];
-	size_t n = p->len < out_cap ? p->len : out_cap;
-	memcpy(out, p->data, n);
-	*out_len = n;
-	nl.q_head = (nl.q_head + 1) % QUEUE_SIZE;
-	pthread_mutex_unlock(&nl.lock);
-	return true;
+	return send_command_to(&nl.peers[client_id], CMD_DATA, buf, len);
 }
 
-unsigned NetLink_droppedPackets(void) { return nl.dropped; }
+bool NetLink_popPacket(void* out, size_t out_cap, size_t* out_len, uint16_t* client_id) {
+	pthread_mutex_lock(&nl.lock);
+	/* Every peer queues its own arrivals. Within one peer the order is the order
+	 * it arrived; across peers there is no meaningful order to preserve - the
+	 * cores key on the sender's id, not on a global sequence. */
+	for (unsigned i = 0; i < NETLINK_MAX_PEERS; i++) {
+		QueuedPacket* q = &nl.peers[i].queue[nl.peers[i].q_head];
+		if (nl.peers[i].q_head == nl.peers[i].q_tail) continue;
+		size_t n = q->len < out_cap ? q->len : out_cap;
+		memcpy(out, q->data, n);
+		*out_len = n;
+		if (client_id) *client_id = q->client_id;
+		nl.peers[i].q_head = (nl.peers[i].q_head + 1) % QUEUE_SIZE;
+		pthread_mutex_unlock(&nl.lock);
+		return true;
+	}
+	pthread_mutex_unlock(&nl.lock);
+	return false;
+}
+
+unsigned NetLink_droppedPackets(void) { return NL_PRIMARY->dropped; }

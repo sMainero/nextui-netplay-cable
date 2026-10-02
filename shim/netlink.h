@@ -53,13 +53,31 @@ bool NetLink_isConnected(void);
 
 /* libretro netpacket assigns the host client_id 0 and clients ids above it.
  * Two players, so the remote is simply the other one. */
+/* Four slots: the host and up to three guests. gpSP's Advance Wars protocol is
+ * written for exactly this many (peer[4], MAX_SERMULT_NETPLAYERS), and the GBA
+ * multi-play adapter the link emulates carried four consoles. */
+#define NETLINK_MAX_PEERS 4
+
 uint16_t NetLink_localClientId(void);
+
+/* How many guests this session may hold: 1 (one partner) unless the shim raises
+ * it, which it does for link-cable play because the emulated GBA multi-play link
+ * is four slots (SIOCNT carries the slot, and gpSP's Advance Wars protocol is
+ * written for slots 0..3). Shared-screen play stays 1:1 by design - see
+ * docs/features.md section 11 - so a caller that never sets it keeps exactly the
+ * behaviour it had when there was one connection. */
+void NetLink_setMaxGuests(unsigned guests);
 uint16_t NetLink_remoteClientId(void);
 
 /* Edge-triggered: each transition is reported exactly once, so the caller can
  * drive the core's start/connected and stop/disconnected callbacks. */
-bool NetLink_consumeConnectEvent(void);
-bool NetLink_consumeDisconnectEvent(void);
+/* Both carry the slot the event was about: with four players a host sees guests
+ * arrive and leave while the session runs, and its core needs to know which. */
+bool NetLink_consumeConnectEvent(uint16_t* client_id);
+bool NetLink_consumeDisconnectEvent(uint16_t* client_id);
+
+/* How many peers are connected, written into out (up to cap). */
+unsigned NetLink_connectedIds(uint16_t* out, unsigned cap);
 
 /* Increments after every successful TCP greeting. The emulator thread uses it
  * to distinguish a replacement process from the peer it originally synced. */
@@ -263,7 +281,9 @@ bool NetLink_takeCore(void** data, size_t* len);   /* caller frees */
 #endif
 
 /* Copy the oldest queued packet out. False when the queue is empty. */
-bool NetLink_popPacket(void* out, size_t out_cap, size_t* out_len);
+/* The last parameter is the slot the packet came from, so a core with several
+ * peers can tell which console sent it. */
+bool NetLink_popPacket(void* out, size_t out_cap, size_t* out_len, uint16_t* client_id);
 
 /* Number of packets dropped because the queue was full - a desync warning
  * sign worth logging rather than hiding. */

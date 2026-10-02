@@ -27,7 +27,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#if defined(__GLIBC__)
 #include <gnu/libc-version.h>
+#endif
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -1116,6 +1118,17 @@ static uint32_t glibc_floor(const char* path) {
 }
 
 /* What this device provides. gnu_get_libc_version is glibc-specific, which is
+ * fine on every device this shim is deployed to, and not fine on a developer's
+ * macOS - where the host-side test suite (shim/test/link.sh) builds and loads
+ * this thing natively. The version is only ever compared against a core's ELF
+ * notes, and a Mach-O core has none, so 0 is the honest answer there: it makes
+ * "can this peer load our core" agree with "this core declares no floor". */
+static uint32_t runtime_glibc(void) {
+#if defined(__GLIBC__)
+	const char* v = gnu_get_libc_version();
+#else
+	const char* v = NULL;
+#endif
  * fine - these platforms are all glibc. */
 static uint32_t runtime_glibc(void) {
 	const char* v = gnu_get_libc_version();
@@ -1423,6 +1436,12 @@ static void ensure_loaded(void) {
 		         info.library_name ? info.library_name : "unknown core",
 		         override >= 0 ? "from session" : "from core");
 
+		/* Only link-cable play is multi-player: the emulated GBA multi-play link
+		 * carries four consoles, and the mode is the whole point of the cable.
+		 * Shared-screen play stays a single partner (docs/features.md section
+		 * 11), so the transport keeps the one connection it always had. */
+		if (!netplay_mode) NetLink_setMaxGuests(NETLINK_MAX_PEERS - 1);
+
 		input_delay = session_input_delay(session);
 		/* NETPLAY_DUAL_DISABLE is set by the launcher when a previous process of
 		 * this game demoted itself: the paired core is not even staged, so this
@@ -1501,10 +1520,14 @@ static void link_note_delivery(void);
 static void deliver_packets(void) {
 	uint8_t buf[NETLINK_MAX_PACKET];
 	size_t len;
-	while (netpacket_budget > 0 && NetLink_popPacket(buf, sizeof(buf), &len)) {
+	uint16_t from;
+	/* The slot travels with the packet: a four-player core must be able to tell
+	 * which console sent it, and with the host relaying on the bus there are
+	 * several sources. */
+	while (netpacket_budget > 0 && NetLink_popPacket(buf, sizeof(buf), &len, &from)) {
 		netpacket_budget--;
 		link_note_delivery();
-		core_netpacket.receive(buf, len, NetLink_remoteClientId());
+		core_netpacket.receive(buf, len, from);
 	}
 }
 
@@ -2808,32 +2831,34 @@ static void pump_netpacket(void) {
 	if (!have_netpacket || !session_active) return;
 
 	/* A disconnect and reconnect can both happen while MinArch is in its menu.
-	 * Retire the old core session before starting the new one; doing this in the
-	 * opposite order leaves the newly connected core immediately stopped. */
-	if (NetLink_consumeDisconnectEvent() && netpacket_started) {
-		if (core_netpacket.disconnected)
-			core_netpacket.disconnected(NetLink_remoteClientId());
+	 * The session here is the whole link rather than one partner, though: with
+	 * four players a host sees a guest leave while the others carry on, so that
+	 * guest is told to the core and the session runs on. It stops only when the
+	 * last peer is gone - which for a guest, having exactly one peer, is the
+	 * same moment it always was. Disconnects are handled before connects so a
+	 * retiring session is stopped before a fresh one starts, as before. */
+	uint16_t event_id;
+	while (NetLink_consumeDisconnectEvent(&event_id)) {
+		if (!netpacket_started) continue;
+		if (core_netpacket.disconnected) core_netpacket.disconnected(event_id);
+		uint16_t live[NETLINK_MAX_PEERS];
+		if (NetLink_connectedIds(live, NETLINK_MAX_PEERS) > 0) continue;
 		if (core_netpacket.stop) core_netpacket.stop();
 		netpacket_started = 0;
 		shim_log("netpacket session stopped\n");
 	}
 
-	if (NetLink_consumeConnectEvent()) {
-		if (netpacket_started) {
-			if (core_netpacket.disconnected)
-				core_netpacket.disconnected(NetLink_remoteClientId());
-			if (core_netpacket.stop) core_netpacket.stop();
+	while (NetLink_consumeConnectEvent(&event_id)) {
+		if (!netpacket_started) {
+			core_netpacket.start(NetLink_localClientId(),
+			                     shim_netpacket_send,
+			                     shim_netpacket_poll_receive);
+			netpacket_started = 1;
+			shim_log("netpacket session started\n");
 		}
-		core_netpacket.start(NetLink_localClientId(),
-		                     shim_netpacket_send,
-		                     shim_netpacket_poll_receive);
-		netpacket_started = 1;
-
-		// Two players, and the peer is present the moment we are connected.
-		if (core_netpacket.connected) {
-			core_netpacket.connected(NetLink_remoteClientId());
-		}
-		shim_log("netpacket session started\n");
+		/* Every console is present as soon as it is connected, and a later guest
+		 * joins the running session rather than replacing it. */
+		if (core_netpacket.connected) core_netpacket.connected(event_id);
 	}
 
 	if (!netpacket_started) return;
@@ -3104,7 +3129,10 @@ void retro_deinit(void) {
 	}
 
 	if (netpacket_started) {
-		if (core_netpacket.disconnected) core_netpacket.disconnected(NetLink_remoteClientId());
+		uint16_t ids[NETLINK_MAX_PEERS];
+		unsigned peers = NetLink_connectedIds(ids, NETLINK_MAX_PEERS);
+		if (core_netpacket.disconnected)
+			for (unsigned i = 0; i < peers; i++) core_netpacket.disconnected(ids[i]);
 		if (core_netpacket.stop)         core_netpacket.stop();
 		netpacket_started = 0;
 	}

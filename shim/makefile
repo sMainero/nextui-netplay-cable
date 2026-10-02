@@ -80,10 +80,21 @@ all:
 # host build - not installable, just proves the C is sound
 ###########################################################
 
+# The unresolved-symbol check has one spelling under GNU ld and another under
+# Darwin's, and the host build is the only one that runs on a developer's machine.
+# macOS is also where shim/test/link.sh runs, which is the acceptance test for the
+# multi-peer transport - so this has to work there. The device build keeps the GNU
+# spelling it has always used.
+ifeq ($(shell uname -s),Darwin)
+NATIVE_NO_UNDEFINED := -Wl,-undefined,error
+else
+NATIVE_NO_UNDEFINED := -Wl,--no-undefined
+endif
+
 native:
 	@mkdir -p ../bin/native
 	$(CC) $(SOURCES) -o ../bin/native/$(TARGET) \
-		-shared -Wl,--no-undefined -fPIC $(INCDIR) $(WARN) -O2 -std=gnu99 -ldl -lpthread -lz
+		-shared $(NATIVE_NO_UNDEFINED) -fPIC $(INCDIR) $(WARN) -O2 -std=gnu99 -ldl -lpthread -lz
 
 clean:
 	rm -f $(foreach p,$(SUPPORTED_PLATFORMS),../bin/$(p)/$(TARGET)) ../bin/native/$(TARGET)
