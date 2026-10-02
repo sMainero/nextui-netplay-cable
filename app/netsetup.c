@@ -795,6 +795,45 @@ typedef struct __attribute__((packed)) {
 static int core_listen_fd = -1;
 static char core_last_peer[NS_IP_LEN];
 
+/* Who this host has admitted for the compatibility exchange.
+ *
+ * It used to be one IP: the first device to exchange manifests owned the host and
+ * every other one got CORE_BUSY, which is the app-layer half of the "one gameplay
+ * peer" policy (docs/features.md section 11) and what stopped a third handheld
+ * from reaching the arming screen at all. Each exchange is transactional - the
+ * guest connects, the two swap manifests, the socket closes - so admitting several
+ * is a matter of remembering more than one address, not of serving them at once.
+ *
+ * Three guests, because the fourth player is this device. The emulated link is the
+ * GBA multi-play mode, where SIOCNT carries the slot number, and gpSP's Advance
+ * Wars protocol (serial_proto.c) is written for slots 0..3 with 0 as the parent.
+ * A fourth guest gets the same CORE_BUSY the client already understands rather
+ * than being queued ambiguously. */
+#define NS_COMPAT_GUESTS 3
+static char core_peers[NS_COMPAT_GUESTS][NS_IP_LEN];
+static int  core_peer_count;
+
+static int core_peer_index(const char* ip) {
+	for (int i = 0; i < core_peer_count; i++)
+		if (!strcmp(core_peers[i], ip)) return i;
+	return -1;
+}
+
+static bool core_peer_remember(const char* ip) {
+	if (core_peer_index(ip) >= 0) return true;
+	if (core_peer_count >= NS_COMPAT_GUESTS) return false;
+	snprintf(core_peers[core_peer_count], sizeof(core_peers[0]), "%s", ip);
+	core_peer_count++;
+	return true;
+}
+
+/* A new session starts with no guests: the table describes who this run of the
+ * server has admitted, and the server is started and stopped around a session. */
+static void core_peers_forget(void) {
+	memset(core_peers, 0, sizeof(core_peers));
+	core_peer_count = 0;
+}
+
 /* Bounded, so neither side can be parked forever by a peer that stops talking
  * mid-transfer - the failure that has bitten this codebase repeatedly.
  *
@@ -1061,6 +1100,11 @@ static int select_compatibility(NS_CoreInfo* mine, int mn, NS_CoreInfo* theirs, 
 bool NS_compatServeStart(void) {
 	if (core_listen_fd >= 0) return true;
 
+	/* A fresh session admits a fresh set of guests: the table describes who *this*
+	 * run of the server has exchanged manifests with, and a device that has since
+	 * gone away must not hold a slot. */
+	core_peers_forget();
+
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
 		ns_log("core compatibility negotiation: socket failed: %s\n", strerror(errno));
@@ -1076,7 +1120,9 @@ bool NS_compatServeStart(void) {
 	a.sin_family = AF_INET;
 	a.sin_addr.s_addr = INADDR_ANY;
 	a.sin_port = htons(NS_CORE_PORT);
-	if (bind(fd, (struct sockaddr*)&a, sizeof(a)) != 0 || listen(fd, 2) != 0) {
+	/* Backlog for every guest at once: they exchange within seconds of each other, and
+	 * a full backlog turns a guest's connect() into a failure it cannot retry. */
+	if (bind(fd, (struct sockaddr*)&a, sizeof(a)) != 0 || listen(fd, NS_COMPAT_GUESTS + 1) != 0) {
 		ns_log("core compatibility negotiation: listen failed: %s\n", strerror(errno));
 		close(fd);
 		return false;
@@ -1087,6 +1133,7 @@ bool NS_compatServeStart(void) {
 }
 
 void NS_compatServeStop(void) {
+	core_peers_forget();
 	if (core_listen_fd >= 0) { close(core_listen_fd); core_listen_fd = -1; }
 }
 
@@ -1105,11 +1152,11 @@ void NS_compatServeTick(void) {
 	core_socket_deadline(fd, CORE_SERVE_IO_MS);
 	char peer_ip[NS_IP_LEN] = "";
 	inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
-	if (core_last_peer[0] && strcmp(core_last_peer, peer_ip)) {
+	if (core_peer_index(peer_ip) < 0 && core_peer_count >= NS_COMPAT_GUESTS) {
 		uint32_t busy[5] = { htonl(CORE_BUSY), 0, 0, 0, 0 };
 		io_all_to(fd, busy, sizeof(busy), true, CORE_SERVE_IO_MS);
-		ns_log("core compatibility negotiation: %s rejected BUSY; admitted peer is %s\n",
-		       peer_ip, core_last_peer);
+		ns_log("core compatibility negotiation: %s rejected BUSY; %d guest(s) already admitted\n",
+		       peer_ip, core_peer_count);
 		close(fd);
 		return;
 	}
@@ -1132,6 +1179,9 @@ void NS_compatServeTick(void) {
 		return;
 	}
 	snprintf(core_last_peer, sizeof(core_last_peer), "%s", peer_ip);
+	if (!core_peer_remember(peer_ip))
+		ns_log("core compatibility negotiation: %s exchanged manifests but there was no slot for it\n",
+		       peer_ip);
 	int selected = select_compatibility(mine, n, theirs, tn,
 	                                    peer_compat_enabled, peer_force_compatibility,
 	                                    peer_instanced);
