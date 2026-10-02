@@ -1,10 +1,17 @@
 #!/bin/sh
-# Two shim instances over loopback, one host one client, each with a core that
-# uses the netpacket interface. Asserts the interface is accepted, the session
-# starts on both sides with the right client ids, real packets cross in both
-# directions, and teardown reaches the core.
+# Shim instances over loopback, one host and N clients, each with a core that uses
+# the netpacket interface. Asserts the interface is accepted, every session starts
+# with the right client id (0 for the host, 1..N for the guests), real packets cross
+# in both directions, the host relays a guest's broadcast to the other guests, and
+# teardown reaches every core.
 #
-#   ./link.sh
+#   ./link.sh                 # the two-device case (one guest)
+#   CLIENTS=3 ./link.sh       # four players, which is what Advance Wars needs
+#
+# The multi-guest case is the acceptance test for the peer table in netlink.c: the
+# GBA multi-play link is four slots, gpSP's Advance Wars protocol is written for
+# slots 0..3 (serial_proto.c: peer[4], netpacket_send(BROADCAST)), and this is
+# where that can be exercised without two handhelds and a cable.
 #
 # Host-only. No device, no NextUI, no frontend that knows netplay exists - which
 # is the point: a stock minarch would answer SET_NETPACKET_INTERFACE with false
@@ -16,8 +23,10 @@ cd "$(dirname "$0")"
 CC="${CC:-cc}"
 OUT=$(mktemp -d)
 PORT=${PORT:-$((40000 + ($$ % 20000)))}
+CLIENTS=${CLIENTS:-1}
+CLIENT_PIDS=""
 cleanup() {
-	kill $HOST_PID $CLIENT_PID $MFH_PID $MFC_PID 2>/dev/null || true
+	kill $HOST_PID $CLIENT_PIDS $MFH_PID $MFC_PID 2>/dev/null || true
 	if [ -n "$KEEP_TEST_OUTPUT" ]; then echo "test logs kept at $OUT"; else rm -rf "$OUT"; fi
 }
 trap cleanup EXIT
@@ -30,21 +39,29 @@ $CC harness.c   -o "$OUT/harness"          -I../include -O0 -std=gnu99 -ldl
 SHIM=../../bin/native/netplay_shim.so
 
 printf 'role=host\nport=%s\nmode=link\noption.gpsp_serial=mul_aw2\n' "$PORT" > "$OUT/host.session"
-printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\n' "$PORT" > "$OUT/client.session"
+for k in $(seq 1 $CLIENTS); do
+	printf 'role=client\nport=%s\npeer=127.0.0.1\nmode=link\n' "$PORT" > "$OUT/client$k.session"
+done
 
-echo "== running host and client for ~3s"
+echo "== running host and $CLIENTS client(s) for ~3s"
 NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/host.session" \
 	"$OUT/harness" "$SHIM" 200 15 > "$OUT/host.log" 2>&1 &
 HOST_PID=$!
 
-sleep 0.5   # let the host bind before the client dials
+sleep 0.5   # let the host bind before the guests dial
 
-NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/client.session" \
-	"$OUT/harness" "$SHIM" 200 15 > "$OUT/client.log" 2>&1 &
-CLIENT_PID=$!
+# Staggered, because that is how handhelds arm: a guest at a time, each one taking
+# its slot before the next asks for one.
+for k in $(seq 1 $CLIENTS); do
+	NETPLAY_REAL_CORE="$OUT/fake_libretro.so" NETPLAY_SESSION="$OUT/client$k.session" \
+		"$OUT/harness" "$SHIM" 200 15 > "$OUT/client$k.log" 2>&1 &
+	CLIENT_PIDS="$CLIENT_PIDS $!"
+	sleep 0.2
+done
 
 HOST_RC=0;   wait $HOST_PID   || HOST_RC=$?
-CLIENT_RC=0; wait $CLIENT_PID || CLIENT_RC=$?
+CLIENT_RC=0
+for p in $CLIENT_PIDS; do wait $p || CLIENT_RC=$?; done
 
 fail=0
 expect() { # <file> <pattern> <description>
@@ -59,26 +76,48 @@ expect() { # <file> <pattern> <description>
 echo
 echo "== interface"
 expect "$OUT/host.log"   "core:netpacket_accepted" "host: core's interface accepted"
-expect "$OUT/client.log" "core:netpacket_accepted" "client: core's interface accepted"
+for k in $(seq 1 $CLIENTS); do
+	expect "$OUT/client$k.log" "core:netpacket_accepted" "client $k: core's interface accepted"
+done
 
 echo
 echo "== session"
-# libretro assigns the host client_id 0; the other side must see the peer's id.
+# libretro assigns the host client_id 0; every guest must be told its own slot, and
+# the host must be told who joined.
 expect "$OUT/host.log"   "core:np_start id=0"      "host: started as client_id 0"
-expect "$OUT/client.log" "core:np_start id=1"      "client: started as client_id 1"
-expect "$OUT/host.log"   "core:np_connected id=1"  "host: told the client joined"
-expect "$OUT/client.log" "core:np_connected id=0"  "client: told the host is there"
+for k in $(seq 1 $CLIENTS); do
+	expect "$OUT/client$k.log" "core:np_start id=$k"      "client $k: started as client_id $k"
+	expect "$OUT/client$k.log" "core:np_connected id=0"   "client $k: told the host is there"
+	expect "$OUT/host.log"     "core:np_connected id=$k"  "host: told client $k joined"
+done
 
 echo
 echo "== data actually crossed"
-# The client sends P1-*, so seeing it in the host's log means it went out over
-# TCP, through the shim, and into the peer core's receive callback.
-expect "$OUT/host.log"   "core:np_recv from=1 .*data=P1-" "host received the client's packets"
-expect "$OUT/client.log" "core:np_recv from=0 .*data=P0-" "client received the host's packets"
+# Each instance tags what it sends with its own id, and sends it to
+# RETRO_NETPACKET_BROADCAST - the shape gpSP's Advance Wars protocol uses. Seeing a
+# guest's tag in the host's log means it went out over TCP and through the shim.
+for k in $(seq 1 $CLIENTS); do
+	expect "$OUT/host.log" "core:np_recv from=$k .*data=P$k-" "host received client $k's packets"
+expect "$OUT/client$k.log" "core:np_recv from=0 .*data=P0-" "client $k received the host's packets"
+done
+
+if [ "$CLIENTS" -gt 1 ]; then
+	echo
+	echo "== the host relays a guest's broadcast to the other guests"
+	# This is the part that makes four players work: AW broadcasts every packet, so
+	# the host has to pass a guest's packet on rather than consuming it. Without the
+	# relay the guests only ever hear the host.
+	expect "$OUT/client1.log" "core:np_recv from=2 .*data=P2-" "client 1 heard client 2 through the host"
+	expect "$OUT/client$CLIENTS.log" "core:np_recv from=1 .*data=P1-" "client $CLIENTS heard client 1 through the host"
+fi
 
 HOST_RX=$(grep -c "core:np_recv" "$OUT/host.log" || true)
-CLIENT_RX=$(grep -c "core:np_recv" "$OUT/client.log" || true)
-echo "  ..   host received $HOST_RX packets, client received $CLIENT_RX"
+CLIENT_RX=0
+for k in $(seq 1 $CLIENTS); do
+	n=$(grep -c "core:np_recv" "$OUT/client$k.log" || true)
+	CLIENT_RX=$((CLIENT_RX + n))
+done
+echo "  ..   host received $HOST_RX packets, guests received $CLIENT_RX between them"
 [ "$HOST_RX" -gt 10 ] && [ "$CLIENT_RX" -gt 10 ] \
 	&& echo "  ok   sustained both directions" \
 	|| { echo "  MISS expected a sustained stream"; fail=1; }
@@ -88,17 +127,21 @@ echo "== core option forced by the session"
 # gpSP link modes are per-game; both peers must agree, and the frontend's own
 # value (typically "auto") must not win.
 expect "$OUT/host.log"   "core:option gpsp_serial=mul_aw2" "host: shim answered the option"
-expect "$OUT/client.log" "core:option gpsp_serial=<unset>" "client: no override, frontend answers"
+for k in $(seq 1 $CLIENTS); do
+	expect "$OUT/client$k.log" "core:option gpsp_serial=<unset>" "client $k: no override, frontend answers"
+done
 
 echo
 echo "== teardown"
 expect "$OUT/host.log"   "core:np_stop" "host: core told the session ended"
-expect "$OUT/client.log" "core:np_stop" "client: core told the session ended"
+for k in $(seq 1 $CLIENTS); do
+	expect "$OUT/client$k.log" "core:np_stop" "client $k: core told the session ended"
+done
 
 echo
 echo "== no packets dropped"
-if grep -q "were dropped" "$OUT/host.log" "$OUT/client.log"; then
-	grep -h "were dropped" "$OUT/host.log" "$OUT/client.log" | sed 's/^/  WARN /'
+if grep -q "were dropped" "$OUT/host.log" $OUT/client*.log; then
+	grep -h "were dropped" "$OUT/host.log" $OUT/client*.log | sed 's/^/  WARN /'
 	fail=1
 else
 	echo "  ok   queue never overflowed"
@@ -768,6 +811,8 @@ if [ "$fail" -eq 0 ]; then
 else
 	echo "FAIL"
 	echo "--- host ---";   tail -25 "$OUT/host.log"
-	echo "--- client ---"; tail -25 "$OUT/client.log"
+	for k in $(seq 1 $CLIENTS); do
+		echo "--- client $k ---"; tail -25 "$OUT/client$k.log"
+	done
 fi
 exit $fail

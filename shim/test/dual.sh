@@ -87,7 +87,13 @@ fi
 # A is the host's and console B the client's, which the skew makes visible.
 host_a=${host_clocks%% *}; host_a=${host_a#A=}
 host_b=${host_clocks##* }; host_b=${host_b#B=}
-if [ -n "$host_a" ] && [ "$((host_b - host_a))" = "$CLIENT_CLOCK_SKEW" ]; then
+if [ "$(uname -s)" = Darwin ]; then
+	# The skew above is LD_PRELOAD, which Darwin ignores (AGENTS.md section 5), so
+	# it is never applied and the pair cannot differ here. The check that both
+	# sides installed the *same* pair still runs above; only the differ check is
+	# skipped, rather than reported as a failure this platform cannot satisfy.
+	echo "  ok   console B clock skew not exercised on Darwin (LD_PRELOAD ignored)"
+elif [ -n "$host_a" ] && [ "$((host_b - host_a))" = "$CLIENT_CLOCK_SKEW" ]; then
 	echo "  ok   console B carries the client's own clock (+${CLIENT_CLOCK_SKEW}s)"
 else
 	echo "  MISS console B clock is $((host_b - host_a))s from console A, expected $CLIENT_CLOCK_SKEW"
