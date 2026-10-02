@@ -1,6 +1,6 @@
 {
   "name": "Netplay",
-  "version": "v3.2.5-cable",
+  "version": "v3.2.6-cable",
   "type": "TOOL",
   "description": "Shared-screen netplay and link-cable play between two handhelds, over an ad hoc network the devices create themselves.",
   "author": "bmpriest",
