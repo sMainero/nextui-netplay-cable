@@ -29,8 +29,13 @@ carries the shim's existing TCP transport unchanged.
 
 Landed and working: the gadget takeover, the port-role switch, the link itself
 (measured 4/4 ICMP both ways, ~0.56 ms average round trip), and a teardown that
-restores the firmware's gadget. **Not yet diagnosed:** a game session that hung
-on a "waiting for core…" screen (see §7).
+restores the firmware's gadget. Also landed since: a **session-scoped mGBA core**
+(the pak's build is used only while a session is armed, so the device's own mGBA
+pak is no longer replaced — `launcher/minarch.elf`, `launcher/mgba-manage.sh
+ensure`) and **H700 support**, which runs the same pak on Anbernic H700/BaseOS
+devices and is **experimental**: repeated sessions freeze that vendor kernel, for
+the reasons and with the recovery in §2.11. The remaining open problems, including
+that one, are in §7.
 
 ---
 
@@ -94,6 +99,14 @@ of change this design rules out. `bottom ↔ bottom` *is* possible (both ends ha
 the UDC) but is worse, for the charging reason in §3.
 
 The socket rule is documented in `docs/cable.md` under "Which end is which".
+
+**It is a tg5040 rule.** H700 handhelds (RG34XX and friends) have a *single*
+USB-C port that is both charge and OTG, so there is no host-only top socket and
+nothing to choose: the H700 end presents the gadget on its only port, and the
+other end takes it in its top socket. Everything else about the H700 port — the
+vendor UDC, the `usbc0` role nodes at the same paths, `otg_role` booting as
+`usb_device` — matches the Brick; the differences are the socket count and the
+kernel bug in §2.11.
 
 ### 2.3 The port's mode is changed by *reading* a node, not writing one
 
@@ -229,6 +242,66 @@ valid once a host configures the interface again — and only the remaining errn
 are fatal. Missing `ECONNRESET` from that set is what made a bumped cable kill the
 gadget end while the host end of the same cable simply waited.
 
+### 2.11 On H700 the takeover corrupts the kernel's own heap — and that is not ours to fix
+
+Measured on an Anbernic RG34XX (BaseOS 1.2.1, kernel **4.9.170**): the cable link
+works — the same vendor stack, the UDC comes up, games play at full speed over it
+(59.5 fps, ~0.8 ms round trip). What does not work is doing it *repeatedly*: after
+a couple of arm/stop cycles the device locks up hard. Hold power ~10 s to recover;
+the next boot may stall on the BaseOS splash (power-cycle once more) and an
+unclean shutdown can leave the card dirty (§5).
+
+Three freezes were captured on the kernel's own log, and the shape is the same
+every time: **a corrupted slab allocator, faulting wherever the next allocation
+happens.** In one it was `kernfs_fop_open` (`nextui.elf` opening a sysfs file), in
+another `kbase_context_mmap` in `mali_kbase` (the GPU driver's mmap), in the third
+`ion_cma_allocate` (the app allocating a video buffer at startup):
+
+```
+Unable to handle kernel paging request at virtual address ffc03cd640000000
+CPU: 2 PID: 10445 Comm: netplay.elf Tainted: G           O    4.9.170 #19
+PC is at kmem_cache_alloc+0xd0/0x1a0
+LR is at ion_cma_allocate+0xec/0x20c
+```
+
+Different subsystems, one cause: the gadget takeover itself — creating and
+destroying configfs/functionfs objects to swap the firmware's `ffs.adb` for this
+pak's function, then putting them back — is unsafe in this vendor kernel. There is
+no source for it, so it cannot be fixed here, and there is no ordering or
+verification that avoids it: the pak now verifies every attribute write by reading
+it back, retries the controller bind for up to five seconds, and waits for the
+functionfs instance's endpoint files before offering the controller at all, and
+those changes **did** remove the observable failures from every captured cycle
+(`failed to start g1: -19`, `sunxi_udc_dequeue: driver is null` — the bind now
+succeeds first try) **without** stopping the corruption.
+
+Two markers are red herrings, worth naming so nobody chases them again:
+
+- `configfs-gadget 5100000.udc-controller: failed to start g1: -19` at **~2 s
+  uptime** is the firmware's *own* boot-time bring-up. It happens on every boot,
+  including healthy ones, and does nothing.
+- `sunxi_udc_dequeue: driver is null` accompanied every *crash window* but is a
+  consequence of the churn, not the cause — it disappeared once the writes were
+  ordered and retried, and the heap still corrupted afterwards.
+
+H700 is therefore documented as **experimental** (`README.md`, "USB-C cable on
+H700 (experimental)", and the changelog), with the guidance *one or two sessions
+per boot, then reboot*. The two candidate fixes, neither written:
+
+1. **One takeover per boot.** Take the gadget over once and hold it for the whole
+   boot; sessions then only control the TUN and the data path. `adb` is
+   unavailable for as long as it is held, until a reboot or an explicit hand-back.
+2. **Composite.** Link this pak's function *alongside* the firmware's `ffs.adb`
+   once and leave both in place, so nothing is ever swapped; `adb` keeps working
+   throughout. This needs the joining end to identify our interface specifically
+   instead of taking the first vendor-class interface with two bulk endpoints
+   (§2.7), and it changes what every host sees on that port.
+
+Both reduce how often the buggy path is exercised rather than eliminating it —
+option 1 still does one cycle per boot, option 2 still creates the function and
+link once. **tg5040 has never shown any of this**, across months of use; the
+freezes are specific to this vendor kernel's gadget code.
+
 ---
 
 ## 3. Power: the socket rule decides who pays
@@ -347,6 +420,35 @@ left alone`).
   `Tools/`.
 - **Scratch goes under `.rpiv/tmp/`** (outside the git repos) or `/tmp` on the
   device, and is deleted when the command that needed it is done.
+- **macOS cleans `/tmp`.** Anything kept there disappears mid-session — including
+  a running `cat /dev/kmsg` capture, which is how a crash trace was lost after a
+  three-hour capture was killed by the cleanup. Long-lived tooling and its logs
+  belong in `.rpiv/tmp/np/`, which survives. It cost a whole crash cycle to learn;
+  the same cleanup also removes a background `nohup` that was started from there.
+- **A crash can leave the card dirty, and the kernel then remounts it read-only.**
+  The symptom is every write failing at once — `Tools` stops saving, the app will
+  not arm, and a deploy reports `Read-only file system` — plus, sometimes, the next
+  boot stalling on the BaseOS splash. This is not a dead card; the FAT is being
+  protected:
+
+  ```
+  FAT-fs (mmcblk0p7): Volume was not properly unmounted. Some data may be corrupt. Please run fsck.
+  FAT-fs (mmcblk0p7): error, fat_free_clusters: deleting FAT entry beyond EOF
+  FAT-fs (mmcblk0p7): Filesystem has been set read-only
+  ```
+
+  Repair it from a PC with `fsck_msdos -y <data partition>`, then verify and check
+  that it is writable again. `~/rg34xx-backup-20261001/fix-card-fat.sh` does exactly
+  that (it identifies the card by its `s7` offset, so it cannot hit the wrong
+  disk). The same directory holds a full copy of the card's data and
+  `baseos-rg34xx-1.2.1.img` for a re-flash, which is the fallback if a repair does
+  not hold. **Keep that backup current before any test loop** — repeated hard
+  power-offs are what dirty the FAT, and every forced power-off after a freeze is
+  one more chance.
+- **A read-only card does not block deployment.** The pak's binaries are ordinary
+  files: deploy them from the Mac while the card is out (copy into
+  `Tools/<platform>/Netplay.pak/bin/<platform>/`, then compare md5s). This is
+  faster and more reliable than the network path even when the card is fine.
 
 ---
 
@@ -389,6 +491,49 @@ variant adds it (and that dir has to be harvested from a card or a device, since
 `make compatibility` needs `cores/build-compat.sh`, which is not in this tree,
 and a `my282` toolchain image that is not published).
 
+**Building for h700** needs its own toolchain image and its own NextUI tree
+(`workspace/h700` is not in the LoveRetro checkout):
+
+```sh
+# the h700 tree, at the commit the device firmware was built from (BaseOS ships
+# its own; the RG34XX card said 7de90a16)
+git clone --branch h700 https://github.com/pvaibhav/NextUI.git .rpiv/tmp/NextUI-h700
+
+docker run --rm -u "$(id -u):$(id -g)" \
+  -v "$PWD/nextui-netplay":/work -v "$PWD/.rpiv/tmp/NextUI-h700":/opt/nextui-src \
+  -e PREFIX_LOCAL=/work/.pkgprefix -w /work \
+  ghcr.io/loveretro/h700-toolchain:latest bash -c '
+    cd /opt/nextui-src/workspace/h700/libmsettings && make build
+    cd /work/app && make PLATFORM=h700 NEXTUI=/opt/nextui-src'
+```
+
+**`make dist` does not build binaries — it packages whatever is in `bin/`.** A
+release was once cut with a stale `bin/tg5040` (only h700 had been rebuilt), so the
+pak shipped a daemon and app that did not contain the changes its own changelog
+described. Before any release, rebuild **every** platform in `pak.json`, and then
+prove it from the packaged artefact rather than the build log — extract the zip and
+look for a string that only the new code has:
+
+```sh
+unzip -q -o dist/Netplay.pak.zip 'Netplay.pak/bin/*' -d /tmp/check
+strings /tmp/check/Netplay.pak/bin/tg5040/netplay-cable.elf | grep -c 'took %d ticks to accept'
+```
+
+**Releases** are one pre-release per version, with three assets (base pak, FULL
+pak, compatibility cores) whose names are fixed by `pak.json`:
+
+```sh
+make PLATFORMS="tg5040 h700" MGBA_PLATFORMS="tg5040 h700" dist
+gh release create v<version>-cable --prerelease --title "…" --notes-file <notes> \
+  dist/Netplay.pak.zip dist/Netplay-Full.pak.zip dist/compatibility-cores.zip
+```
+
+Then verify the upload rather than trusting it: `gh release view <tag> --json
+assets` reports a `sha256` digest per asset, which must equal `shasum -a 256` of
+the local file. Notes are written as a file and kept out of the repo
+(`.rpiv/tmp/np/notes-v<version>.md`) so they can be re-edited with `gh release
+edit`.
+
 **Expected test state:** `proto-test` ok, `test-cable.sh` PASS, harness suite OK.
 **`launcher/test.sh` fails 3 assertions at HEAD** (`owned mount not recognised`,
 `armed switcher leaked normal recents`, `game leaked into armed switcher`) —
@@ -417,32 +562,43 @@ been executed.
 
 Still open:
 
-1. **A launch with an armed session and no link waits ~30 s and then reports
+1. **H700 freezes after a couple of cable sessions, and the cause is the vendor
+   kernel rather than the pak.** §2.11 has the three captures, the two red-herring
+   log lines, and the two candidate fixes (one takeover held for the boot; or this
+   pak's function linked alongside the firmware's instead of swapped). Until one is
+   written and validated, H700 cable is documented as experimental with the
+   guidance *one or two sessions per boot*. Validating either candidate costs crash
+   cycles on hardware that has already taken three hard freezes and one filesystem
+   corruption, so budget for that and keep the card backed up (§5) — and note that
+   both only *reduce* how often the buggy path is exercised.
+2. **A launch with an armed session and no link waits ~30 s and then reports
    `Peer unavailable.`** The shim has a timeout, so it is not an infinite hang —
    but the message reaches the player only after half a minute of a
    "Starting instanced link…" overlay, and the state that produced it (an armed
    session whose peer is gone) is silent until then. The earlier "waiting for
    core…" report is almost certainly this same class. Worth a shorter path to the
    same sentence.
-2. **The app's crash recovery has never been executed.** `NS_cableRecoverIfStranded`
-   (its controller-release and unmount/rmdir ordering fixed, its role restore
-   converted to node reads) has only ever been reasoned about. A deliberately
-   killed session is the way to test it. Its **consequence if wrong is bounded**
-   and worth knowing before shipping: a hard kill mid-session leaves the firmware's
-   gadget unbound, so `adb` is dead until the next Netplay launch runs the repair —
-   or until a reboot, which always restores it. Nothing about gameplay or the
-   device's firmware is at risk, which is why this was accepted untested.
-3. **The plan's automated criteria are stale.** `.rpiv/artifacts/plans/2026-09-28_01-18-40_usb-otg-cable-transport.md`
+3. **The app's crash recovery has still not been observed doing its job.** Its two
+   controller writes were rewritten in v3.2.5 to be retried and read back
+   (`netsetup.c`: `ns_cable_release_controller`, `ns_cable_udc_restore`), and both
+   now wait for the functionfs instance's endpoints first — but every stale
+   `usb_restore` seen so far was cleared by the **boot hook**, not by this pass, so
+   the rewritten path is itself unexercised. Its consequence if wrong is bounded
+   and known: a hard kill mid-session leaves the firmware's gadget unbound and
+   `adb` dead until the next Netplay launch or a reboot.
+4. **The plan's automated criteria are stale.** `.rpiv/artifacts/plans/2026-09-28_01-18-40_usb-otg-cable-transport.md`
    still describes writing `otg_role`, creating a `netplay` gadget and a 4-key
    record. `docs/cable.md`'s "Bring-up", "What is verified where" and "Failure
    catalogue" are partly stale for the same reason; its teardown and socket
-   sections are current.
-4. **`MaxPower` is the firmware's 500 mA**; the design wanted 100 and argued for
+   sections are current. `docs/cable.md` and this file also predate the
+   session-scoped mGBA core and the H700 findings — those currently live in
+   `README.md` and the changelog, and belong here.
+5. **`MaxPower` is the firmware's 500 mA**; the design wanted 100 and argued for
    it explicitly. Not changed, because the takeover deliberately leaves the
    firmware's configuration alone; it needs two more record keys to restore.
-5. **No low-battery interlock.** The host end can be asked to source 5 V at 1%,
+6. **No low-battery interlock.** The host end can be asked to source 5 V at 1%,
    which is how a session ends in a dead device rather than a message.
-6. **The UI says nothing about the socket rule or the charger rule.** The
+7. **The UI says nothing about the socket rule or the charger rule.** The
    progress text is the only place a user would look, and "wrong socket" is
    silent (§2.2).
 
