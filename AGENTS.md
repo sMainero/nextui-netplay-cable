@@ -630,6 +630,23 @@ Respect them; they are deliberate.
 
 ## 9. Rules for an agent working here
 
+- **Never commit, and never push, without approval.** No `git commit`, no
+  `git cherry-pick`, no `git rebase`, no `git reset`, no `git push`, and no
+  `git add` in service of any of them, unless the user asked for that specific
+  history change. Reading is always fine (`git status`, `git diff`, `git log`,
+  `git show`, `git branch`). If a task seems to need a commit, propose it and
+  wait — including when the alternative is losing work, which is what a stash is
+  for. Work left uncommitted in the tree is the user's to review, not yours to
+  tidy up, and a commit nobody asked for is worse than an untidy tree.
+- **Do not restructure branches unasked, and verify range membership when you
+  do.** Moving a ref, parking a branch, or resetting one to an earlier commit is
+  a history change like any other, and it is easy to lose a commit that merely
+  happened to sit *inside* the range being dropped: resetting `main` from a
+  feature tip back to the commit before the feature silently took an unrelated
+  test-build commit with it, which only surfaced because the user asked for a
+  re-check. After any such move, prove that **every** commit in the old range is
+  either on the new mainline or on the parked branch — do not assume that the
+  commits *about* the dropped feature are the only ones being dropped.
 - **Ask before writing to a device.** Read-only inspection is always fine;
   changing a port mode, a gadget, a pak file or the power state is not.
 - **A reboot is a human action** (SSH must be re-enabled by hand), so batch work
