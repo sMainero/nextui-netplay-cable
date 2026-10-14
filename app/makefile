@@ -17,12 +17,12 @@ CABLE_TARGET  = netplay-cable.elf
 NEXTUI ?= ../../../NextUI
 
 # The cable link's pure layer is built and tested on the developer's machine:
-# no cross compiler, no NextUI checkout, no device. `proto-test` and `clean`
-# therefore skip every device check below, including the platform ABI include,
-# exactly as shim/makefile does for its `native` target. MAKECMDGOALS is empty
-# when `all` is reached as the default goal.
+# no cross compiler, no NextUI checkout, no device. `proto-test`, `host-cable`
+# and `clean` therefore skip every device check below, including the platform ABI
+# include, exactly as shim/makefile does for its `native` target. MAKECMDGOALS is
+# empty when `all` is reached as the default goal.
 DEVICE_BUILD := 1
-ifneq (,$(filter $(MAKECMDGOALS),proto-test clean))
+ifneq (,$(filter $(MAKECMDGOALS),proto-test host-cable clean))
 DEVICE_BUILD :=
 endif
 
@@ -106,6 +106,23 @@ $(PROTO_PRODUCT): cableproto.c ../testing/$(PROTO_TARGET).c usbnet.h
 	@mkdir -p ../bin/native
 	$(CC) $(PROTO_SOURCES) -o $@ -I. -I../testing $(PROTO_WARN) -O2 -std=gnu99
 
+# A host build of the daemon itself, so testing/test-cable.sh can exercise the
+# lifecycle half (role parsing, the pid lock, the status file, the restore record,
+# teardown) on the machine the tests run on. The device ELF cannot be executed
+# off-device, which is what kept that gate shut. testing/cable-host-stubs.c stands
+# in for the two symbols usbnet.c takes from netsetup.c, so this does not drag in
+# the setup app and its SDL. -O0 and no LTO: this binary is never shipped.
+CABLE_HOST_TARGET  = netplay-cable
+CABLE_HOST_PRODUCT = ../bin/native/$(CABLE_HOST_TARGET)
+
+host-cable: $(CABLE_HOST_PRODUCT)
+
+$(CABLE_HOST_PRODUCT): usbnet.c cableproto.c ../testing/cable-host-stubs.c usbnet.h netsetup.h
+	@mkdir -p ../bin/native
+	$(CC) usbnet.c cableproto.c ../testing/cable-host-stubs.c -o $@ -I. -I../testing \
+		-DPLATFORM='"host"' $(PROTO_WARN) -O0 -std=gnu99 -lpthread
+	@echo "built $@ (host build of the cable daemon, for testing/test-cable.sh)"
+
 PRODUCT = ../bin/$(PLATFORM)/$(TARGET)
 BROKER_PRODUCT = ../bin/$(PLATFORM)/$(BROKER_TARGET)
 CABLE_PRODUCT  = ../bin/$(PLATFORM)/$(CABLE_TARGET)
@@ -120,6 +137,6 @@ all:
 	@echo "built $(CABLE_PRODUCT)"
 
 clean:
-	rm -f ../bin/*/$(TARGET) ../bin/*/$(BROKER_TARGET) ../bin/*/$(CABLE_TARGET) $(PROTO_PRODUCT)
+	rm -f ../bin/*/$(TARGET) ../bin/*/$(BROKER_TARGET) ../bin/*/$(CABLE_TARGET) $(PROTO_PRODUCT) $(CABLE_HOST_PRODUCT)
 
-.PHONY: all proto-test clean
+.PHONY: all proto-test host-cable clean

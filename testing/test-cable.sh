@@ -300,7 +300,18 @@ echo "== the daemon's lifecycle, against a fake configfs tree"
 # The gate is whether it runs, not whether the x bit is set: `make app` produces
 # an executable aarch64 ELF on any host, and a macOS machine would then try to
 # execute it. Asking it for its usage and taking a real answer is the signal.
-CABLE_BIN="${CABLE_BIN:-$PAK/bin/${PLATFORM:-tg5040}/netplay-cable.elf}"
+CABLE_BIN="${CABLE_BIN:-}"
+if [ -z "$CABLE_BIN" ]; then
+	# Prefer a host build of the daemon. The lifecycle half below asks a binary to
+	# run, and bin/<platform>/netplay-cable.elf is a device ELF that no desktop can
+	# execute - which is what kept this gate shut away from a device. `make -C app
+	# host-cable` produces the alternative, and `make test` builds it first.
+	if [ -x "$PAK/bin/native/netplay-cable" ]; then
+		CABLE_BIN="$PAK/bin/native/netplay-cable"
+	else
+		CABLE_BIN="$PAK/bin/${PLATFORM:-tg5040}/netplay-cable.elf"
+	fi
+fi
 cable_runnable=0
 if [ -x "$CABLE_BIN" ] && "$CABLE_BIN" --help > "$ROOT/usage.log" 2>&1; then
 	cable_runnable=1

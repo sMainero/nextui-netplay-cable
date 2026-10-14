@@ -54,8 +54,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#if defined(__linux__)
+#include <sys/eventfd.h>   /* gadget role only; the host role needs no eventfd */
+#endif
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -63,6 +65,31 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+/* Darwin's mount(2) takes four arguments and has no umount2/MNT_DETACH, and
+ * every call below is device-only: configfs, functionfs, and taking them down.
+ * A host build (testing/test-cable.sh) never reaches one - its fake tree stops
+ * the daemon long before - so these exist to compile, and refuse in a way that
+ * would be visible rather than pretend to have mounted something. The device
+ * build is Linux and uses the real calls, unchanged. */
+#if !defined(__linux__)
+#define MNT_DETACH 0
+static int cp_mount_unsupported(const char* source, const char* target,
+                                const char* type, unsigned long flags,
+                                const void* data) {
+	(void)source; (void)target; (void)type; (void)flags; (void)data;
+	errno = ENOSYS;
+	return -1;
+}
+static int cp_umount_unsupported(const char* target, int flags) {
+	(void)target; (void)flags;
+	errno = ENOSYS;
+	return -1;
+}
+#define mount(source, target, type, flags, data) \
+	cp_mount_unsupported(source, target, type, flags, data)
+#define umount2(target, flags) cp_umount_unsupported(target, flags)
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 // transcribed kernel constants
@@ -1659,12 +1686,20 @@ static bool cp_ffs_open_ep0(char* err, int errlen) {
 	}
 
 	/* The eventfd has to exist before the blob is written: the kernel takes it
-	 * out of the descriptor header, so it cannot be attached afterwards. */
+	 * out of the descriptor header, so it cannot be attached afterwards. It is a
+	 * Linux mechanism, so a host build (testing/test-cable.sh) has no gadget role
+	 * at all - the host role, which is what a host can exercise, never uses one.
+	 * See testing/cable-host-stubs.c. */
+#if defined(__linux__)
 	cp_evfd = eventfd(0, EFD_NONBLOCK);
 	if (cp_evfd < 0) {
 		snprintf(err, errlen, "cannot create an eventfd: %s", strerror(errno));
 		return false;
 	}
+#else
+	snprintf(err, errlen, "the gadget role needs a Linux eventfd");
+	return false;
+#endif
 
 	int n = cp_build_descriptors(blob, sizeof(blob), cp_evfd);
 	if (n <= 0) {

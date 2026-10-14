@@ -378,6 +378,7 @@ test:
 	@./testing/test-wifi-platform.sh
 	@./testing/test-log-rotation.sh
 	@./testing/test-wifi-watchdog.sh
+	@$(MAKE) -s -C app host-cable >/dev/null
 	@./testing/test-cable.sh
 	@./launcher/test.sh
 	@PYTHONDONTWRITEBYTECODE=1 python3 tools/test-netplay-harness.py
